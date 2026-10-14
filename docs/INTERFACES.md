@@ -103,7 +103,7 @@ plain HTML works too but is ~2x bigger and needs `self.__next_f.push` joining.
 | model providers | `/models/<slug>/providers` | 380 KB | `"hostModels":[{...}]` — per-endpoint pricing/performance, `intelligenceIndexCostPerTask`, `jsonMode`, `functionCalling`; precision from `slug` suffix |
 | providers board | `/leaderboards/providers` | 2.7 MB | `"rows":[{...}]` 1201 endpoint rows: host + model (incl. `intelligenceIndex` + per-benchmark scores) + pricing (`cacheHitPrice`/`cacheWritePrice`, **no** `cacheHitDiscountPercent`) + performance + `features` (`contextWindowTokens`, `functionCalling`, `jsonMode`, `openaiCompatible`). No precision tag and no `intelligenceIndexCostPerTask` here — those exist only on `hostModels` |
 | homepage | `/` | 1.11 MB | `"sttNonStreaming":{"models":[..]}`, `"sttStreaming":{...}`, `"sts":{...}`; plus `{"evalSlug":..,"models":[{score,costPerTask,..}]}` panels (top 20 per eval: cyber-index, cwe-bench-aa, deepsecbench-aa, cybergym-e2e-aa) |
-| media arena | `/image/leaderboard/text-to-image`, `/image/leaderboard/editing`, `/video/leaderboard/text-to-video`, `/video/leaderboard/image-to-video`, `/video/leaderboard/video-editing`, `/text-to-speech/leaderboard/provider-voice`, `/text-to-speech/leaderboard/controlled-voice`, `/music/leaderboard/instrumental`, `/music/leaderboard/vocals` | 1.0-2.0 MB | arrays of `{"formatted":{..},"values":{name,elo,ciLower,ciUpper,appearances,rank,creator:{name},releaseDate,pricePer1kImages|pricePerMinute|pricePer1mCharacters|voiceCount,openWeightsUrl,url}}` — several arrays per page (filtered variants); **use the longest array containing `values`+`formatted`** |
+| media arena | `/image/leaderboard/text-to-image`, `/image/leaderboard/editing`, `/video/leaderboard/text-to-video`, `/video/leaderboard/image-to-video`, `/video/leaderboard/video-editing`, `/text-to-speech/leaderboard/provider-voice`, `/text-to-speech/leaderboard/controlled-voice`, `/music/leaderboard/instrumental`, `/music/leaderboard/vocals` | 1.0-2.0 MB | arrays of `{"formatted":{..},"values":{name,elo,ciLower,ciUpper,appearances,rank,creator:{name},releaseDate,pricePer1kImages|pricePerMinute|pricePer1mCharacters|voiceCount,openWeightsUrl,url}}` — several arrays per page (per-category variants). Selection is **validated** (`loaders._media_arena`): the array must carry the board's expected keys (`name`+`elo`+its price key) and sit in the page's arena slot — the flight main slot (`32:[[null,[…]]]`) or an object-field slot (`"initialData":[`); per-category subsets (`["<label>",[…]]`) never qualify, and the first slot in document order wins. No match ⇒ a clear error instead of a different arena |
 | speech | `/speech-to-speech/arena/overview` | - | fall back to homepage boards |
 | agents | `/agents/coding-agents`, `/agents/chatbots`, `/agents/search-api` | 0.6 MB | inspect with `flight.find_arrays` (see "unresolved" below) |
 | eval page | `/evaluations/<slug>` | 0.35-0.93 MB | `"initialModels":[` array of chart-selected model records (same 94-key shape as model pages); size varies by eval: gpqa 19, livecodebench 5, aa-briefcase / intelligence-index / terminalbench-4-0 32 — i.e. AA's chart selection, **not** a full leaderboard |
@@ -148,18 +148,31 @@ class Fetched:
     text: str; path: pathlib.Path; fetched_at: float; cached: bool; stale: bool
 
 def get(url: str, name: str, *, refresh: bool = False, rsc: bool = True,
-        ttl: int | None = None, min_bytes: int = 0) -> Fetched
+        ttl: int | None = None, min_bytes: int = 0,
+        headers: Mapping[str, str] | None = None) -> Fetched
 def cache_dir() -> pathlib.Path
+def cache_name(name: str) -> str            # validate/normalise a cache segment (raises ValueError)
 def clear_cache() -> tuple[int, int]        # (files_removed, bytes_freed)
-def cache_age(name: str) -> float | None    # seconds since mtime
+def cache_age(name: str) -> float | None    # seconds since mtime (raises ValueError on an unsafe name)
 ```
 
 - `get` writes atomically (tmp file + `os.replace`), guards concurrent writers
-  with `fcntl.flock` on `<path>.lock`, and **serves stale cache with
-  `stale=True`** instead of raising when the network fails and a cached copy
-  exists (log a warning to stderr). Raises `AAFetchError` only when there is no
-  usable cache.
+  with `fcntl.flock` on `<path>.lock`, single-flights concurrent same-name
+  downloads in-process, and **serves stale cache with `stale=True`** instead of
+  raising when the network fails and a cached copy exists (log a warning to
+  stderr). Raises `AAFetchError` only when there is no usable cache.
+- `name` must be one safe path segment (`[A-Za-z0-9._-]`, ≤120, no leading dot,
+  no `..`, no `/`): a user-controlled slug that reaches a cache name is rejected
+  with `ValueError` **before** any filesystem access (adversarial A42/A43).
 - `min_bytes` guards truncated bodies (leaderboard: 200_000).
+- Each entry has a `<entry>.meta.json` sidecar `{schema, written, url}`: a
+  mismatched stored URL is never used, and a missing/old schema triggers one
+  refetch (still usable offline / on network failure). A poisoned entry
+  therefore self-heals instead of persisting until the TTL expires (A22/A26/A32).
+- Bounds: `AA_MAX_BYTES` (default 48 MB) caps the decoded body (gzip bombs are
+  refused, A28); `AA_HTTP_TIMEOUT` (30 s per attempt) and `AA_HTTP_DEADLINE`
+  (45 s total) bound one `get()`; timeouts are not retried (only connect errors
+  and 5xx, at most once) (A27).
 
 ### flight.py
 
@@ -168,19 +181,25 @@ def payload(text: str) -> str
     # HTML -> concatenated self.__next_f.push chunks; raw RSC -> text unchanged
 def find_array(payload: str, required: Iterable[str], *, min_len: int = 1,
                start: int = 0, last: bool = False) -> list[dict]
-    # first (or last) JSON array of dicts whose EVERY item? no: whose first item
-    # contains all `required` keys; raises KeyError-ish LookupError if absent
+    # first (or last) JSON array whose first *dict* element contains all
+    # `required` keys; raises LookupError if absent
 def find_arrays(payload: str, required: Iterable[str], *, min_len: int = 1) -> list[list[dict]]
+def find_arrays_at(payload: str, required: Iterable[str], *, min_len: int = 1) -> list[tuple[int, list[dict]]]
+    # every match with its byte offset (media-arena selection uses the offset)
 def keyed_object(payload: str, key: str) -> dict | None
 def jsonld(text: str) -> list[dict]
 def text_strip_tags(text: str) -> str
 ```
 
 `find_array` must be robust to arrays nested inside flight rows, and must not
-parse the whole 3 MB file repeatedly at O(n^2): scan for `[{"models"|"data"|...`
-style anchors is **not** required — a single left-to-right scan with
+parse the whole 3 MB file repeatedly at O(n^2): a single left-to-right scan with
 `json.JSONDecoder.raw_decode` per `[` candidate, short-circuiting on the first
-match, is acceptable (measure: must stay under ~1.5 s for the 3 MB legacy page).
+match, is what ships. Anchors may be `[{` **or** `["` — model pages embed
+`"initialModels":["<flight ref>", …]` and the 700-item pool those refs index
+leads with a string, so the probe item is the first *dict* element (probe bounded
+to a 32 KB slice / 32 elements) and the array is decoded in full only once the
+probe carries every required key (audit H4). Measured: full-file scan of the
+3.2 MB legacy page ≈ 0.06-0.25 s.
 
 ### catalog.py
 
@@ -265,12 +284,23 @@ def filter_models(models, *, creator=None, name=None, open_weights=None,
                   released_after=None, exclude_deprecated=True, min_score=None,
                   score_key=None) -> list[Model]
 def sort_models(models, key: str, *, desc: bool | None = None) -> list[Model]
-def value_rank(models, *, score_key="intelligence") -> list[Model]   # adds .value
+def better_desc(key: str) -> bool                                    # True when higher is better
+def value_pairs(models, *, score_key="intelligence",
+                cost_key="cost_per_task") -> list[tuple[Model, float]]
+    # functional score/cost pairs; only usable pairs, never mutates the inputs
+def value_rank(models, *, score_key="intelligence") -> list[Model]   # NEW list of replace(m, value=v) copies
 def pareto(models, *, score_key="intelligence", cost_key="cost_per_task") -> list[Model]
 def search(models, query: str, limit: int = 20) -> list[Model]       # fuzzy, ranked
 def resolve(models, query: str) -> Model                              # raises AmbiguousError(candidates)
 class AmbiguousError(LookupError): .candidates: list[Model]
 ```
+
+`better_desc(key)` is the single source of truth for ranking direction
+(`False` for `catalog.metric(key).better == "low"`). `value_rank` is a
+back-compatible wrapper that returns copies — callers **must not** rely on it
+writing `.value` onto the objects they passed (the server computes its value
+column from `value_pairs`; audit H3). `filter_models` raises `ValueError` for
+non-finite numeric filters instead of silently disabling them (A2).
 
 Fuzzy matching normalizes to `[a-z0-9]` and matches exact slug / release slug /
 short name / name, then substring, ranking by intelligence desc. `resolve` raises
@@ -302,10 +332,17 @@ def provider_board(refresh=False) -> list[Endpoint]
 def home_boards(refresh=False) -> dict[str, list[dict]]     # "stt","stt_streaming","sts","eval:<slug>"
 def media(board: str, refresh=False) -> list[dict]          # board in MEDIA_BOARDS
 def agents(board: str, refresh=False) -> list[dict]
+def open_weights_flag(row: dict) -> bool | None             # public normalizer for speech/agent/media rows
 def eval_models(slug: str, refresh=False) -> list[Model]    # top-N chart set for one eval page
 def eval_catalog(refresh=False) -> list[dict]               # {slug,title,description,tags}
 def sitemap_paths(refresh=False) -> list[str]
 ```
+
+`open_weights_flag(row)` is the single reader for the several open-weights
+spellings AA ships (`openWeights`, `isOpenWeights`, `openWeightsUrl`,
+`modelWeightsSourceUrl`, incl. `{"values": {…}}` wrappers); it returns `None`
+when the row carries no flag at all, which is how `aa_media`'s speech boards know
+to refuse the filter instead of returning an empty board (audit H5).
 
 ```python
 @dataclass(slots=True)
@@ -327,37 +364,99 @@ implementation; if a board has no usable structured data, raise a clear
 
 ## Tool surface (server.py)
 
-Tools (all return compact markdown text; all accept `refresh: bool = False`):
+Tools (all return compact markdown text). `refresh: bool = False` is accepted by
+every data-reading tool: `aa_leaderboard`, `aa_model`, `aa_pareto`, `aa_compare`,
+`aa_benchmark_leaderboard`, `aa_providers`, `aa_media`, `aa_agents`, `aa_search`,
+`aa_raw`. `aa_benchmarks` and `aa_reference` read static/memoised registry data
+and take **no** `refresh` (the benchmark catalog is refreshed by the tools that
+fetch live coverage: `aa_benchmark_leaderboard`, `aa_leaderboard`, `aa_pareto`).
 
 1. `aa_leaderboard` — rank/filter model variants.
    `mode: rank|value|frontier`, `sort`, `fields`, `top=10`, filters
    (`creator`, `name`, `open_weights`, `reasoning`, `min_intelligence`,
    `max_cost_per_task`, `min_speed`, `max_ttft`, `min_context`, `released_after`),
-   `include_deprecated=False`.
+   `include_deprecated=False`, `refresh=False`. `mode=value` labels the ratio
+   column after `sort` (e.g. `Omniscience/$`); `mode=frontier` **delegates to
+   `aa_pareto`** (`x=cost_per_task`) so both surfaces share one frontier + knee
+   implementation.
 2. `aa_model` — one model digest. `query`, `sections` (subset of
-   `identity,indexes,benchmarks,pricing,speed,cost,openness,modalities`), `include_raw=False`.
-3. `aa_compare` — `queries` (2-6), `metrics` (optional friendly list), `compact=True`.
-4. `aa_benchmarks` — catalog: every benchmark with slug/label/unit/coverage/desc/tags;
-   optional `query` filter, `verbose=False`.
-5. `aa_benchmark_leaderboard` — rank models on one benchmark. `benchmark`,
-   `top=15`, `fields`, filters as in (1), `include_estimates=True`; auto-selects
+   `identity,indexes,benchmarks,pricing,speed,cost,openness,modalities`),
+   `refresh=False` (there is no `include_raw`; use `aa_raw kind=model`).
+3. `aa_pareto` — the always-available trade-off frontier: `score` (any rankable
+   with per-model numbers; default `intelligence`) vs `x`
+   (`cost_per_task` default, `index_total_cost`, `out_tokens_per_task`,
+   `time_per_task`, `context_tokens`, `params_b`, `ttft`, `price_in`, `price_out`),
+   `top=15`, `creator`, `open_weights`, `min_intelligence`, `min_context`,
+   `include_deprecated=False`, `include_all=False`, `refresh=False`.
+   Columns `Model | Slug | Creator | <score> | <x> | <ratio>`, ordered by `x`
+   ascending, with the axis labels/units, a coverage line and the knee (the last
+   frontier point before the cost/score ratio passes 5× the cheapest point's).
+   `index_total_cost` / `time_per_task` are model-page fields (rich overlay);
+   a benchmark AA publishes only on an eval chart / homepage panel is joined onto
+   the leaderboard rows by slug, and the header says so.
+4. `aa_compare` — `queries` (2-12), `metrics` (`""` default rows | `all` |
+   `benchmarks` | a comma list of keys/labels/aliases), `view: table|diff`,
+   `compact=True`, `spec` (YAML or JSON: `models`/`metrics`/`view`/`compact`/
+   `filters`), `refresh=False`. `view=diff` prints each metric's value plus its
+   delta vs the first model; the reply ends with a copy-pasteable `spec:` block.
+   A model missing from the rich overlay gets its own model page fetched once and
+   merged; the reply is bounded (~6 kB) with an explicit truncation note.
+5. `aa_benchmarks` — the search index over everything rankable
+   (`catalog.rankables`): `query` (tokenised AND-match), `domain` (expands through
+   `catalog.DOMAINS`), `tag`, `verbose=False`. Columns
+   `Thing | Kind | Unit | Coverage | How to query` (+ `Measures` at ≤10 rows or
+   `verbose`); `How to query` is the exact tool call for that thing. Unknown
+   `domain`/`tag` error with the valid list; zero hits suggest the closest labels.
+6. `aa_benchmark_leaderboard` — rank models on one benchmark. `benchmark`,
+   `top=15`, `fields`, `creator`, `open_weights`, `min_intelligence`,
+   `include_estimates=True`, `refresh=False`; auto-selects
    source (leaderboard array > eval page chart set > homepage panel) and states
-   coverage honestly.
-6. `aa_providers` — `model` (endpoint detail) OR board filters
-   (`host`, `model`, `open_weights`, `min_context`, `sort`, `top=15`).
-7. `aa_media` — `board`, `top=15`, `open_weights=None`, `fields`.
-8. `aa_agents` — `board`, `top=15`.
-9. `aa_search` — `query`, `creator=None`, `open_weights=None`, `top=15` → name/creator/slug/intel/cost.
-10. `aa_reference` — `topic: overview|indexes|benchmarks|pricing|speed|providers|media|fields|sources|all`.
-11. `aa_raw` — `kind: model|leaderboard|providers|providers_board|media|agents|home|eval|catalog`,
-    `query=None`, `fields=None`, `top=1` → raw JSON (token-expensive escape hatch).
+   coverage honestly. Lower-is-better metrics (refusal/hallucination rates) rank
+   lowest-first and the header note says `lower is better`.
+7. `aa_providers` — `model` (endpoint detail) OR board filters
+   (`host`, `model`, `open_weights`, `min_context`, `sort`, `top=15`),
+   `fields`, `refresh=False`.
+8. `aa_media` — `board`, `top=15`, `open_weights=None`, `fields`, `refresh=False`.
+   Speech boards are `speech_to_text`, `speech_to_text_streaming`,
+   `speech_to_speech` (aliases: `realtime_voice`, `realtime-voice`, `realtime voice`);
+   their `open_weights` filter is refused when the panel carries no such flag.
+9. `aa_agents` — `board`, `top=15`, `refresh=False`.
+10. `aa_search` — `query`, `creator=None`, `open_weights=None`, `top=15`,
+    `refresh=False` → name/creator/slug/intel/cost.
+11. `aa_reference` — `topic: overview|indexes|benchmarks|pricing|speed|providers|media|fields|sources|all`.
+12. `aa_raw` — `kind: model|leaderboard|providers|providers_board|media|agents|home|eval|catalog`,
+    `query=None`, `fields=None`, `top=1` (capped at 5), `refresh=False` → raw JSON
+    (token-expensive escape hatch). `kind=eval` validates `query` as an evaluation
+    slug (rejects a model slug with the expected `gpqa-diamond` shape).
 
-Resources: `aa://reference/metrics`, `aa://reference/fields`, `aa://benchmarks`,
-`aa://sources`. Prompts: `best_model_for_task`, `compare_models`.
+Resources (15): `aa://benchmarks` (JSON registry), `aa://rankables` (every
+rankable thing as JSON), `aa://rankables.yaml` (the same index as YAML),
+`aa://comparisons/spec` (a YAML template for `aa_compare spec=`), `aa://sources`
+(provenance/cache), `aa://reference/metrics` (indexes+benchmarks+pricing+speed
+combined), plus one per `reference.TOPICS` entry — `aa://reference/overview`,
+`indexes`, `benchmarks`, `pricing`, `speed`, `providers`, `media`, `fields`,
+`sources`. Each is generated from `reference.py` / `catalog.py` / the server's own
+spec template, the same sources the tools serve.
+Prompts (2): `best_model_for_task` (routes value/trade-off questions to
+`aa_pareto`), `compare_models` (mentions `metrics=all`, `view=diff` and the
+`spec=` round-trip).
 
 Every tool must raise `ToolError`-equivalent (FastMCP: raise `ValueError`/
 `RuntimeError` with actionable text) on bad input, never return a bare empty table
 without explanation.
+
+Boundary rules (server.py: `_tool` wrapper):
+
+- arguments are validated before the tool runs: control characters and lone
+  surrogates are rejected with a `ValueError` naming the argument, strings are
+  capped (256 chars; 2000 for `fields`/`sections`/`metrics`) and non-finite
+  floats (NaN/Infinity) are rejected for numeric filters;
+- every reply is bounded: table cells are sanitized (markdown metacharacters
+  neutralized, 120 chars each), oversized tables drop rows with one note, and
+  every reply is capped at 200 kB;
+- error text never echoes more than 60 chars of a caller-supplied value, and a
+  parse/load failure names the cache file and suggests `refresh=true`
+  (or `AA_OFFLINE=1` with a good copy).
 
 ## Fixtures (offline tests)
 

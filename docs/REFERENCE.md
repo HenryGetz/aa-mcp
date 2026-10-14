@@ -17,19 +17,37 @@ Tool routing:
 | Question | Tool |
 |---|---|
 | smartest / best / cheapest / fastest models now | `aa_leaderboard` |
-| best value (intelligence per $/task), Pareto frontier, budget caps | `aa_leaderboard` `mode=value` / `mode=frontier` |
+| best value (intelligence per $/task), budget caps | `aa_leaderboard` `mode=value` |
+| Pareto frontier / trade-offs: Intelligence Index vs. Cost per Index Task (default), vs. Output Tokens per Task (`x=out_tokens_per_task`), vs. Cost to Run the AA Intelligence Index (`x=index_total_cost`); also context, params, TTFT, price | `aa_pareto` (`x=`, `score=`) — `aa_leaderboard mode=frontier` is the same code path |
 | anything about ONE model (specs, scores, price, license, context, cutoff) | `aa_model` |
-| model A vs B vs C | `aa_compare` |
-| which benchmark exists / what it measures / coverage | `aa_benchmarks` |
+| model A vs B (up to 12 models, any benchmark, any metric, reproducible spec) | `aa_compare` (`metrics=all`, `view=diff`, `spec=` YAML) |
+| media/speech model A vs B (image/video/voice/music arenas) | `aa_compare` (arena names resolve; pass a board key such as `text_to_speech` to pin an ambiguous name) |
+| which things can be ranked, and which one fits a task domain | `aa_benchmarks` (`query=`, `domain=`, `tag=`) — every row shows the exact tool call in `How to query` |
 | who leads benchmark X / a model's score on X | `aa_benchmark_leaderboard` |
 | which provider serves a model, at what price, precision, TTFT | `aa_providers` |
 | provider landscape across models | `aa_providers` (no `model`, use `host`) |
 | image / video / TTS / music leaderboards | `aa_media` |
 | speech-to-text / realtime voice | `aa_media` (`speech_to_text`, `speech_to_text_streaming`, `speech_to_speech`) |
 | AA coding agents / chatbots / search API boards | `aa_agents` |
-| unsure of a model's exact name or slug | `aa_search` (always resolve names first) |
+| unsure of a model's exact name or slug (incl. media/speech) | `aa_search` (resolves language models and arena entries; always resolve names first) |
 | definitions, field names, provenance | `aa_reference` |
 | raw JSON for anything not covered | `aa_raw` (token-expensive, last resort) |
+
+The three site trade-off views are one code path: `aa_pareto` = Intelligence Index
+vs. Cost per Index Task; `aa_pareto x=out_tokens_per_task` = Intelligence Index vs.
+Output Tokens per Task; `aa_pareto x=index_total_cost` = Intelligence Index vs. Cost
+to Run the AA Intelligence Index (whole suite). `score=` takes any rankable, and
+`aa_benchmarks domain=<name>` finds the ones that fit a task.
+
+`aa_benchmarks query=<word>` expands a single word that names a task domain (e.g.
+`security`) to that whole domain and flags it `(domain match)` in the header; a
+multi-word query stays a tokenised AND search. `aa_compare` fills every metric AA
+publishes — including chart-set / homepage-panel scores (the cyber boards, AA-3D,
+…), stating the source in the footer — and footers the gaps (a per-model
+`missing on requested metrics: <model> <n>` count, plus the per-metric detail
+while the gap is small, or "<model> has no published pricing or speed on AA"). The echoed `spec:` reproduces the effective call (view/metrics/compact
+included); `compact` selects the core rows for the default metric set and is a
+documented no-op when `metrics=` is given.
 
 Trust these, do not re-derive:
 
@@ -115,7 +133,10 @@ eval page — not a full leaderboard; the tool states this):
 - Security boards (homepage, top 20): AA Cyber Index, CWE-Bench-AA,
   DeepSecBench-AA, CyberGym-E2E-AA.
 
-Index membership (v4.3.2) is marked per benchmark in `aa_benchmarks`.
+Index membership (v4.3.2) is marked per benchmark in `aa_benchmarks`. The
+`Coverage` column is computed live from the source chain the ranking tools use
+(700-row leaderboard → rich overlay → eval chart set / homepage panel), so a
+benchmark AA fetches live is never labelled "not fetched".
 
 ## pricing
 
@@ -160,16 +181,21 @@ image-editing, text-to-video, image-to-video, video-editing, text-to-speech
 $/1k images, $/min and $/1M characters respectively. Speech boards: speech-to-text
 (word error rate, lower is better), streaming speech-to-text (WER + time to final
 transcript), speech-to-speech realtime voice (STS Index, 0-100, higher is better).
-`aa_agents` covers AA's coding-agent, chatbot and search-API boards.
+`aa_agents` covers AA's coding-agent, chatbot and search-API boards. Speech board
+keys are `speech_to_text`, `speech_to_text_streaming` and `speech_to_speech`
+(also accepted as `realtime_voice` / "real-time voice").
+`aa_search` and `aa_compare` resolve these media/speech models too: compare two arena entries (pass a board key such as `text_to_speech` as a `queries` entry, or prefix a name with `text_to_speech: `, to pin an ambiguous name) — a footer names the board and warns that scores from different boards are not comparable.
 
 ## fields
 
 Field aliases accepted by every `fields=`/`metrics=`/`sort=` parameter (canonical
 name first): intelligence (intel), estimated, coding, agentic, omniscience,
 omniscience_accuracy, omniscience_non_hallucination, openness, capabilities.<name>,
-cost_per_task (cost, $/task), price_in, price_out, cache_read, cache_write,
-cache_hit_discount, blended_*, tps, ttft, ttfa, e2e, reasoning_time,
-out_tokens_per_task, context_tokens (ctx), params_b, active_params_b, release_date,
+cost_per_task (alias cost; shown as $/Task), index_total_cost (whole-suite index cost,
+`aa_pareto x=index_total_cost`), price_in, price_out, cache_read,
+cache_write, cache_hit_discount, blended_*, tps, ttft, ttfa, e2e, reasoning_time,
+out_tokens_per_task, time_per_task (mean per-eval time per index task),
+context_tokens (ctx), params_b, active_params_b, release_date,
 knowledge_cutoff, license, weights_url, is_open_weights (open), is_reasoning,
 effort, deprecated, size_class, modalities_in, modalities_out, creator, slug, name
 plus every benchmark key listed in `benchmarks` (e.g. gpqa, hle, mmmuPro,

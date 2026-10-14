@@ -8,9 +8,11 @@ canonical objects.  The parsing half of each loader is exposed as a pure
 without touching the network.
 
 The loaders hold no request state: they are safe to call concurrently from the
-MCP server's thread pool.  The only module-level mutable state is a tiny memo of
-the 700-row leaderboard keyed by the cache file's fetch time, which trades one
-payload parse for lock-free reads on the hottest path.
+MCP server's thread pool.  The only module-level mutable state is a set of small
+memos of parsed payloads (the 700-row leaderboard plus the media/model/provider/
+agents/home/eval surfaces), each keyed by the cache file's path and mtime.  They
+trade one payload parse for lock-free reads on the hottest paths and are bounded
+so they cannot grow without limit.
 
 URL convention: :data:`SOURCE_URLS`, :data:`MEDIA_BOARDS` and
 :data:`AGENT_BOARDS` hold human-readable **site-relative paths** (``/leaderboards/models``);
@@ -23,53 +25,56 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
+import threading
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import catalog, fetch, flight, normalize, source
+from . import catalog, fetch, flight, normalize, select, source
 from .fetch import AAFetchError
 from .normalize import Model
 
 log = logging.getLogger("aa_mcp.loaders")
 
 __all__ = [
-    "Endpoint",
-    "MEDIA_BOARDS",
     "AGENT_BOARDS",
-    "SOURCE_URLS",
     "BASE_URL",
-    "url",
-    "leaderboard",
-    "model",
-    "data_source",
-    "provider_endpoints",
-    "provider_board",
-    "home_boards",
-    "media",
+    "MEDIA_BOARDS",
+    "SOURCE_URLS",
+    "Endpoint",
     "agents",
-    "eval_models",
+    "data_source",
     "eval_catalog",
-    "sitemap_paths",
-    "parse_leaderboard",
+    "eval_models",
+    "home_boards",
+    "leaderboard",
+    "media",
+    "model",
+    "open_weights_flag",
+    "parse_agents",
     "parse_chart",
+    "parse_eval_catalog",
+    "parse_home_boards",
+    "parse_leaderboard",
     "parse_legacy_model",
+    "parse_media",
+    "parse_provider_board",
+    "parse_provider_endpoints",
     "parse_rich_dataset",
+    "parse_sitemap",
+    "provider_board",
+    "provider_endpoints",
     "rich_dataset",
     "rich_seed",
-    "rich_models",
-    "parse_media",
-    "parse_home_boards",
-    "parse_agents",
-    "parse_eval_catalog",
-    "parse_sitemap",
-    "parse_provider_endpoints",
-    "parse_provider_board",
+    "sitemap_paths",
+    "url",
 ]
 
 _DEFAULT_BASE_URL = "https://artificialanalysis.ai"
@@ -96,8 +101,6 @@ SOURCE_URLS: dict[str, str] = {
     "model_providers": "/models/{slug}/providers",
     "providers_board": "/leaderboards/providers",
     "home": "/",
-    "media": "/{arena}/leaderboard/{board}",
-    "agents": "/agents/{board}",
     "eval": "/evaluations/{slug}",
     "eval_catalog": "/evaluations",
     "sitemap": "/sitemap.xml",
@@ -263,6 +266,158 @@ def _cost_per_task(perf: dict | None) -> float | None:
 
 
 # --------------------------------------------------------------------------- #
+# cache-aware errors and plausibility checks
+# --------------------------------------------------------------------------- #
+
+#: Intelligence Index sanity band: values outside it come from a corrupt entry.
+_INTELLIGENCE_RANGE = (-100.0, 100.0)
+#: minimum share of records that must carry an intelligence score.
+_MIN_SCORED = 0.5
+
+
+def _refresh_note(path, url: str) -> str:
+    return (
+        f"the payload cached at {path} is unusable — "
+        f"retry with refresh=true to refetch {url}"
+    )
+
+
+def _parse_error(exc: BaseException, path, url: str) -> AAFetchError:
+    """Wrap a parse failure so the message names the cache file and the fix."""
+    return AAFetchError(f"{exc}\n{_refresh_note(path, url)}", url=url, path=path)
+
+
+def _implausible(model: Model) -> str | None:
+    if model.intelligence is not None and not (
+        math.isfinite(model.intelligence)
+        and _INTELLIGENCE_RANGE[0] <= model.intelligence <= _INTELLIGENCE_RANGE[1]
+    ):
+        return f"intelligence {model.intelligence!r}"
+    if model.cost_per_task is not None and not (
+        math.isfinite(model.cost_per_task) and model.cost_per_task >= 0
+    ):
+        return f"cost_per_task {model.cost_per_task!r}"
+    if model.context_tokens is not None and model.context_tokens <= 0:
+        return f"context_tokens {model.context_tokens!r}"
+    return None
+
+
+def _validate(
+    models: Sequence[Model], *, path, url: str, min_scored: float = 0.0
+) -> None:
+    """Reject implausible records instead of serving them (cache = untrusted).
+
+    A single edited field in a cached payload used to make the leaderboard report
+    Intel 999.0 / $0.01 as #1 with no warning (audit A32).
+    """
+    for model in models:
+        bad = _implausible(model)
+        if bad is not None:
+            raise AAFetchError(
+                f"{path}: implausible value in record {model.slug!r} ({bad}); "
+                + _refresh_note(path, url),
+                url=url,
+                path=path,
+            )
+    if min_scored and models:
+        scored = sum(1 for m in models if m.intelligence is not None)
+        if scored < min_scored * len(models):
+            raise AAFetchError(
+                f"{path}: only {scored}/{len(models)} records carry an intelligence "
+                "score; " + _refresh_note(path, url),
+                url=url,
+                path=path,
+            )
+
+
+# --------------------------------------------------------------------------- #
+# parsed-payload memos
+# --------------------------------------------------------------------------- #
+
+#: Sentinel for "no memo entry"; parsed values are never ``None``.
+_MISS = object()
+
+#: Bound for the per-slug/per-board memos.  A small LRU keeps the rich ~700-model
+#: chart sets and endpoint lists from accumulating across dozens of slugs.
+_MEMO_MAXSIZE = 24
+
+
+class _PayloadMemo:
+    """Bounded LRU of parsed payloads keyed by ``(cache file path, mtime)``.
+
+    Same invalidation rule as :data:`_LEADERBOARD_MEMO`: an entry is only served
+    when the cache file the caller just read still carries the recorded mtime, so
+    a rewrite (or a ``refresh=True`` refetch) misses and is re-parsed.
+
+    The table is an immutable tuple rebound in a single assignment, so a
+    concurrent reader always sees a complete snapshot — never a half-built one.
+    Readers are lock-free; writers serialize on a lock and eviction is by
+    least-recent use (a hit promotes its key).
+    """
+
+    __slots__ = ("_entries", "_lock", "_maxsize")
+
+    def __init__(self, maxsize: int) -> None:
+        self._maxsize = maxsize
+        self._lock = threading.Lock()
+        self._entries: tuple[tuple[tuple[str, float], Any], ...] = ()
+
+    def get(self, key: tuple[str, float]) -> Any:
+        entries = self._entries  # one atomic read of the published snapshot
+        for index, (stored, value) in enumerate(entries):
+            if stored == key:
+                if index + 1 != len(entries):
+                    self._promote(key)
+                return value
+        return _MISS
+
+    def put(self, key: tuple[str, float], value: Any) -> None:
+        with self._lock:
+            entries = tuple(pair for pair in self._entries if pair[0] != key)
+            self._entries = (entries + ((key, value),))[-self._maxsize:]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries = ()
+
+    def _promote(self, key: tuple[str, float]) -> None:
+        with self._lock:
+            entries = self._entries
+            for index, pair in enumerate(entries):
+                if pair[0] == key:
+                    if index + 1 != len(entries):
+                        self._entries = entries[:index] + entries[index + 1:] + (pair,)
+                    return
+
+
+# One memo per loader family.  Per-slug/per-board families are bounded by
+# ``_MEMO_MAXSIZE``; the single-page boards hold exactly one entry.
+_MEDIA_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
+_MODEL_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
+_PROVIDER_ENDPOINTS_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
+_AGENTS_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
+_EVAL_MODELS_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
+_PROVIDER_BOARD_MEMO = _PayloadMemo(1)
+_HOME_MEMO = _PayloadMemo(1)
+_EVAL_CATALOG_MEMO = _PayloadMemo(1)
+
+
+def _clear_memos() -> None:
+    """Drop every parsed-payload memo (test hook; production never needs it)."""
+    for memo in (
+        _MEDIA_MEMO,
+        _MODEL_MEMO,
+        _PROVIDER_ENDPOINTS_MEMO,
+        _AGENTS_MEMO,
+        _EVAL_MODELS_MEMO,
+        _PROVIDER_BOARD_MEMO,
+        _HOME_MEMO,
+        _EVAL_CATALOG_MEMO,
+    ):
+        memo.clear()
+
+
+# --------------------------------------------------------------------------- #
 # leaderboard / model pages
 # --------------------------------------------------------------------------- #
 
@@ -280,11 +435,15 @@ def _release_index(payload: str) -> dict[str, dict]:
     *variant* slugs (e.g. ``claude-opus-5-5-high``).
     """
     try:
-        records = flight.find_array(payload, ("releaseDate", "deprecated", "creator"))
+        found = flight.find_array(payload, ("releaseDate", "deprecated", "creator"))
     except LookupError:
         return {}
     index: dict[str, dict] = {}
-    for record in records:
+    # arrays may lead with flight-reference strings (the scan probes the first
+    # *dict* element), so only dict records can be indexed.
+    for record in found:
+        if not isinstance(record, dict):
+            continue
         slug = record.get("slug")
         if slug:
             index[slug] = record
@@ -344,11 +503,7 @@ def _initial_models_items(payload: str) -> list | None:
 
 def _rich_records(payload: str) -> list[dict] | None:
     """The >100-entry chart-shaped array (the rich ~700-model dataset), if present."""
-    try:
-        arrays = flight.find_arrays(payload, _CHART_REQUIRED)
-    except LookupError:  # pragma: no cover - defensive
-        return None
-    candidates = [a for a in arrays if len(a) > _RICH_MIN]
+    candidates = [a for a in flight.find_arrays(payload, _CHART_REQUIRED) if len(a) > _RICH_MIN]
     if not candidates:
         return None
     return max(candidates, key=len)
@@ -402,7 +557,6 @@ def parse_chart(text: str) -> list[Model]:
     return [normalize.from_chart(rec) for rec in records]
 
 
-
 def parse_legacy_model(text: str) -> Model | None:
     """Parse the ``currentModel`` object from a legacy/deprecated model page."""
     record = flight.keyed_object(flight.payload(text), "currentModel")
@@ -439,6 +593,14 @@ def _rich_ttl() -> int:
 
 def _rich_cache_path() -> Path:
     return fetch.cache_dir() / "rich_dataset.json"
+
+
+def _rich_source_url() -> str:
+    """The page the cached rich dataset came from (for error messages)."""
+    seed = rich_seed()
+    if seed:
+        return url(SOURCE_URLS["model"].format(slug=seed))
+    return url(SOURCE_URLS["leaderboard"])
 
 
 def _rich_seed_path() -> Path:
@@ -478,7 +640,7 @@ def parse_rich_dataset(text: str) -> list[Model]:
         seen.add(slug)
         try:
             models.append(normalize.from_chart(record))
-        except ValueError:
+        except (TypeError, ValueError):
             continue
     return models
 
@@ -509,7 +671,7 @@ def _discover_rich_seed() -> list[str]:
                 key=lambda m: m.release_date,
                 reverse=True,
             )
-        except Exception as exc:  # noqa: BLE001 - discovery must not raise
+        except Exception as exc:
             log.warning("rich seed discovery: leaderboard unavailable (%s)", exc)
             releases = []
         for model in releases:
@@ -528,7 +690,9 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
     """The cross-model rich dataset, disk-cached and memoized (``AA_RICH_TTL``).
 
     Offline returns whatever is cached (or ``[]``) without touching the network.
-    Never raises.
+    A cached dataset whose records are implausible (out-of-range index, negative
+    cost, a majority without a score) raises :class:`~aa_mcp.fetch.AAFetchError`
+    naming the cache file instead of being served (audit A32).
     """
     global _RICH_MEMO
     path = _rich_cache_path()
@@ -541,6 +705,8 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
         if isinstance(records, list)
         else []
     )
+    if models:
+        _validate(models, path=path, url=_rich_source_url(), min_scored=_MIN_SCORED)
     if models and not refresh:
         try:
             age = max(0.0, time.time() - path.stat().st_mtime)
@@ -554,10 +720,9 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
         return models
 
     for slug in _discover_rich_seed():
+        source_url = url(SOURCE_URLS["model"].format(slug=slug))
         try:
-            got = fetch.get(
-                url(SOURCE_URLS["model"].format(slug=slug)), f"model_{slug}", refresh=refresh
-            )
+            got = fetch.get(source_url, f"model_{slug}", refresh=refresh)
         except AAFetchError as exc:
             log.warning("rich seed probe %s failed (%s)", slug, exc)
             continue
@@ -575,30 +740,22 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
         if not extracted:
             continue
         try:
+            models = [normalize.from_chart(r) for r in extracted]
+        except (TypeError, ValueError):  # pragma: no cover - normalize is total for dicts
+            continue
+        _validate(models, path=got.path, url=source_url, min_scored=_MIN_SCORED)
+        try:
             _write_json_atomic(path, extracted)
             _write_json_atomic(_rich_seed_path(), {"slug": slug, "ts": time.time()})
         except OSError as exc:  # pragma: no cover - cache write failure must not break
             log.warning("could not persist rich dataset: %s", exc)
         log.warning("rich dataset discovered via slug %s (%d models)", slug, len(extracted))
-        models = [normalize.from_chart(r) for r in extracted]
         _RICH_MEMO = (str(path), models)
         return models
 
     log.warning("rich dataset not found in %d probe(s)", _RICH_PROBES)
     _RICH_MEMO = (str(path), [])
     return []
-
-
-def rich_models(slug: str, refresh: bool = False) -> dict[str, Model]:
-    """The rich record for ``slug`` from its own page's dataset (empty if absent)."""
-    got = fetch.get(
-        url(SOURCE_URLS["model"].format(slug=slug)), f"model_{slug}", refresh=refresh
-    )
-    for model in parse_rich_dataset(got.text):
-        if model.slug == slug:
-            return {slug: model}
-    return {}
-
 
 
 def data_source() -> str:
@@ -609,14 +766,19 @@ def data_source() -> str:
 def _leaderboard_rsc(refresh: bool = False) -> list[Model]:
     """The 700-row RSC leaderboard (memoized on the cache file's fetch time)."""
     global _LEADERBOARD_MEMO
+    source_url = url(SOURCE_URLS["leaderboard"])
     got = fetch.get(
-        url(SOURCE_URLS["leaderboard"]), "leaderboard", refresh=refresh, min_bytes=200_000
+        source_url, "leaderboard", refresh=refresh, min_bytes=200_000
     )
     key = (str(got.path), got.fetched_at)
     memo = _LEADERBOARD_MEMO
     if memo is not None and memo[0] == key:
         return memo[1]
-    models = parse_leaderboard(got.text)
+    try:
+        models = parse_leaderboard(got.text)
+    except LookupError as exc:
+        raise _parse_error(exc, got.path, source_url) from exc
+    _validate(models, path=got.path, url=source_url, min_scored=_MIN_SCORED)
     _LEADERBOARD_MEMO = (key, models)
     return models
 
@@ -716,24 +878,32 @@ def model(slug: str, refresh: bool = False) -> dict[str, Model]:
             return out
 
     got = fetch.get(url(path), name, refresh=refresh)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _MODEL_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
     out = {}
     legacy: Model | None = None
     try:
         chart = parse_chart(got.text)
     except LookupError:
         chart = []
+    _validate(chart, path=got.path, url=url(path))
     for record in chart:
         out.setdefault(record.slug, record)
     if slug not in out:
         legacy = parse_legacy_model(got.text)
         if legacy is not None:
+            _validate([legacy], path=got.path, url=url(path))
             out.setdefault(legacy.slug, legacy)
     if slug not in out:
         raise ValueError(
             f"{url(path)}: model {slug!r} was missing from the embedded chart set "
             f"({len(out)} records) and the page carried no matching 'currentModel' "
-            "object (legacy/deprecated page)."
+            f"object (legacy/deprecated page). {_refresh_note(got.path, url(path))}"
         )
+    _MODEL_MEMO.put(key, out)
     return out
 
 
@@ -854,19 +1024,41 @@ def parse_provider_board(text: str) -> list[Endpoint]:
 def provider_endpoints(slug: str, refresh: bool = False) -> list[Endpoint]:
     """All serving endpoints for one model, cheapest ``cost_per_task`` first."""
     path = SOURCE_URLS["model_providers"].format(slug=slug)
-    got = fetch.get(url(path), f"providers_{slug}", refresh=refresh)
-    return parse_provider_endpoints(got.text)
+    source_url = url(path)
+    got = fetch.get(source_url, f"providers_{slug}", refresh=refresh)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _PROVIDER_ENDPOINTS_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
+    try:
+        endpoints = parse_provider_endpoints(got.text)
+    except LookupError as exc:
+        raise _parse_error(exc, got.path, source_url) from exc
+    _PROVIDER_ENDPOINTS_MEMO.put(key, endpoints)
+    return endpoints
 
 
 def provider_board(refresh: bool = False) -> list[Endpoint]:
     """The 1201-row provider leaderboard."""
+    source_url = url(SOURCE_URLS["providers_board"])
     got = fetch.get(
-        url(SOURCE_URLS["providers_board"]),
+        source_url,
         "providers_board",
         refresh=refresh,
         min_bytes=200_000,
     )
-    return parse_provider_board(got.text)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _PROVIDER_BOARD_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
+    try:
+        endpoints = parse_provider_board(got.text)
+    except LookupError as exc:
+        raise _parse_error(exc, got.path, source_url) from exc
+    _PROVIDER_BOARD_MEMO.put(key, endpoints)
+    return endpoints
 
 
 # --------------------------------------------------------------------------- #
@@ -925,8 +1117,21 @@ def parse_home_boards(text: str) -> dict[str, list[dict]]:
 
 def home_boards(refresh: bool = False) -> dict[str, list[dict]]:
     """Homepage speech boards and per-eval top panels."""
-    got = fetch.get(url(SOURCE_URLS["home"]), "home", refresh=refresh, min_bytes=100_000)
-    return parse_home_boards(got.text)
+    source_url = url(SOURCE_URLS["home"])
+    got = fetch.get(source_url, "home", refresh=refresh, min_bytes=100_000)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _HOME_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
+    boards = parse_home_boards(got.text)
+    if not any(boards.values()):
+        raise ValueError(
+            f"{source_url}: no speech board or eval panel found in the payload — "
+            f"{_refresh_note(got.path, source_url)}"
+        )
+    _HOME_MEMO.put(key, boards)
+    return boards
 
 
 # --------------------------------------------------------------------------- #
@@ -934,68 +1139,168 @@ def home_boards(refresh: bool = False) -> dict[str, list[dict]]:
 # --------------------------------------------------------------------------- #
 
 
-def _media_price(values: dict) -> tuple[float | None, str | None]:
+#: media board key -> the row keys that identify that board's arena (identity,
+#: score and the price metric that board is ranked on).
+_MEDIA_BOARD_KEYS: dict[str, tuple[str, ...]] = {
+    "text_to_image": ("name", "elo", "pricePer1kImages"),
+    "image_editing": ("name", "elo", "pricePer1kImages"),
+    "text_to_video": ("name", "elo", "pricePerMinute"),
+    "image_to_video": ("name", "elo", "pricePerMinute"),
+    "video_editing": ("name", "elo", "pricePerMinute"),
+    "text_to_speech": ("name", "elo", "pricePer1mCharacters"),
+    "text_to_speech_controlled": ("name", "elo", "pricePer1mCharacters"),
+    "music_instrumental": ("name", "elo"),
+    "music_with_vocals": ("name", "elo"),
+}
+_DEFAULT_MEDIA_KEYS = ("name", "elo")
+
+
+def _flag(value) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip().lower() not in ("", "false", "0", "no")
+    return bool(value)
+
+
+def open_weights_flag(row) -> bool | None:
+    """The open-weights flag of a scraped row, in any of its shapes.
+
+    Media arena rows wrap their fields as ``{"values": {…}}``; homepage speech
+    rows and agent rows carry them flat, and the key spelling varies
+    (``openWeights``, ``isOpenWeights``, ``openWeightsUrl``, …). ``None`` means
+    the row says nothing about licensing.
+    """
+    if not isinstance(row, Mapping):
+        return None
+    for key in ("openWeights", "isOpenWeights"):
+        if key in row and row[key] is not None:
+            return _flag(row[key])
+    if "openWeightsUrl" in row:
+        # arena rows always carry the key: null means "no open weights"
+        return _flag(row["openWeightsUrl"]) if row["openWeightsUrl"] is not None else False
+    for key in ("weightsUrl", "modelWeightsSourceUrl"):
+        if row.get(key):
+            return True
+    values = row.get("values")
+    if isinstance(values, Mapping):
+        return open_weights_flag(values)
+    return None
+
+
+def _media_price(values: Mapping) -> tuple[float | None, str | None]:
     for key, unit in _PRICE_UNITS.items():
-        if values.get(key) is not None:
-            return _num(values.get(key)), unit
+        value = _clean(values.get(key))
+        if value is not None:
+            return _num(value), unit
     for key, value in values.items():
-        if key.startswith("pricePer") and value is not None:
+        if key.startswith("pricePer") and _clean(value) is not None:
             return _num(value), "/" + key[len("pricePer"):].replace("1m", "1M ").strip()
     return None, None
 
 
-def _media_open_weights(values: dict) -> bool | None:
-    if "openWeights" in values:
-        return _opt_bool(values.get("openWeights"))
-    if "openWeightsUrl" in values:
-        return bool(values.get("openWeightsUrl"))
-    return None
-
-
 def _media_row(item: dict) -> dict:
-    values = item.get("values") or {}
-    formatted = item.get("formatted") or {}
-    creator = values.get("creator")
-    if isinstance(creator, dict):
-        creator = creator.get("name")
-    rank = formatted.get("rank")
+    """Flatten one arena row; every field is optional and ref-tolerant."""
+    values = item.get("values")
+    values = values if isinstance(values, Mapping) else {}
+    formatted = item.get("formatted")
+    formatted = formatted if isinstance(formatted, Mapping) else {}
+    creator = _clean(values.get("creator"))
+    if isinstance(creator, Mapping):
+        creator = _clean(creator.get("name"))
+    rank = _clean(formatted.get("rank"))
     if rank is None:
-        rank = values.get("storedRank")
+        rank = _clean(values.get("storedRank"))
     if rank is None:
-        rank = values.get("rank")
+        rank = _clean(values.get("rank"))
     price, price_unit = _media_price(values)
     extra = {
         key: values[key]
         for key in _EXTRA_KEYS
-        if values.get(key) is not None
+        if values.get(key) is not None and not _is_ref(values[key])
     }
     return {
-        "name": values.get("name") or formatted.get("name"),
+        "name": _clean(values.get("name")) or _clean(formatted.get("name")),
         "creator": creator,
         "elo": _num(values.get("elo")),
         "ci_lower": _num(values.get("ciLower")),
         "ci_upper": _num(values.get("ciUpper")),
         "appearances": _int(values.get("appearances")),
         "rank": _int(rank),
-        "release_date": values.get("releaseDate") or formatted.get("released"),
+        "release_date": _clean(values.get("releaseDate"))
+        or _clean(formatted.get("released")),
         "price": price,
         "price_unit": price_unit,
-        "open_weights": _media_open_weights(values),
-        "url": values.get("url"),
+        "open_weights": open_weights_flag(item),
+        "url": _clean(values.get("url")),
         "extra": extra,
     }
+
+
+def _arena_keys(rows: list[dict]) -> set[str]:
+    """Union of the ``values`` keys every row of an arena carries."""
+    keys: set[str] = set()
+    for item in rows:
+        values = item.get("values")
+        if isinstance(values, Mapping):
+            keys |= values.keys()
+    return keys
+
+
+def _arena_slot(payload: str, index: int) -> bool:
+    """Whether the array at ``index`` sits in an arena slot of the payload.
+
+    A board's own arena is either the value of a flight row
+    (``32:[[null,[<rows>]]]``) or the value of an object field
+    (``"initialData":[<rows>]`` — how the music pages ship it).  The
+    per-category subsets are *elements* of a surrounding array
+    (``["<category>",[<rows>]]``) and never match.
+    """
+    prefix = payload[:index].rstrip()
+    return prefix.endswith(("[null,", '":'))
+
+
+def _media_arena(payload: str, board: str) -> list[dict]:
+    """The arena array that belongs to ``board``.
+
+    Selection is validated in two steps — the rows must carry the board's
+    expected keys *and* the array must sit in an arena slot — and then takes the
+    first slot in document order, which is the page's own board. Later slots hold
+    *other* boards' arenas (the TTS capture carries five, the video capture two:
+    ``AA-Video-T2V v2.1`` and ``AA-Video-T2V-Silent v2.1``), and a payload whose
+    own arena is missing is a clear error rather than a smaller board (A34).
+    """
+    label = board or "media page"
+    candidates = flight.find_arrays_at(payload, ("values", "formatted"))
+    if not candidates:
+        raise ValueError(
+            f"{label}: no arena array carrying 'values' + 'formatted' "
+            "keys was found in the payload"
+        )
+    required = _MEDIA_BOARD_KEYS.get(board, _DEFAULT_MEDIA_KEYS)
+    matching = [
+        (index, rows) for index, rows in candidates if set(required) <= _arena_keys(rows)
+    ]
+    if not matching:
+        raise ValueError(
+            f"{label}: {len(candidates)} arena-like array(s) found, none carrying the "
+            f"expected row keys {sorted(required)} — refusing to serve a different arena"
+        )
+    slots = [(index, rows) for index, rows in matching if _arena_slot(payload, index)]
+    if not slots:
+        raise ValueError(
+            f"{label}: the board's arena is missing from the payload; the "
+            f"{len(matching)} remaining array(s) with keys {sorted(required)} are "
+            "per-category subsets — refusing to serve one of them as the board"
+        )
+    _index, rows = slots[0]
+    return rows
 
 
 def parse_media(text: str, board: str = "") -> list[dict]:
     """Parse one media arena page into flat rows sorted by Elo (best first)."""
     payload = flight.payload(text)
-    arrays = flight.find_arrays(payload, ("values", "formatted"))
-    if not arrays:
-        raise ValueError(
-            f"{board or 'media page'}: no arena array carrying 'values' + 'formatted' "
-            "keys was found in the payload"
-        )
-    arena = max(arrays, key=len)
+    arena = _media_arena(payload, board)
     rows = [_media_row(item) for item in arena if isinstance(item, dict)]
     rows.sort(key=lambda r: (r["elo"] is None, -(r["elo"] or 0.0)))
     return rows
@@ -1010,8 +1315,19 @@ def media(board: str, refresh: bool = False) -> list[dict]:
             f"unknown media board {board!r}; expected one of "
             f"{', '.join(sorted(MEDIA_BOARDS))}"
         ) from None
-    got = fetch.get(url(path), f"media_{board}", refresh=refresh)
-    return parse_media(got.text, board)
+    source_url = url(path)
+    got = fetch.get(source_url, f"media_{board}", refresh=refresh)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _MEDIA_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
+    try:
+        rows = parse_media(got.text, board)
+    except ValueError as exc:
+        raise ValueError(f"{exc} — {_refresh_note(got.path, source_url)}") from exc
+    _MEDIA_MEMO.put(key, rows)
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -1044,7 +1360,7 @@ def _clean(value):
 def _named_array(payload: str, name: str) -> list | None:
     """The array decoded from the first ``"<name>":[...]`` in the payload."""
     decoder = json.JSONDecoder()
-    for match in re.finditer(r'"%s"\s*:\s*\[' % re.escape(name), payload):
+    for match in re.finditer(rf'"{re.escape(name)}"\s*:\s*\[', payload):
         try:
             value, _ = decoder.raw_decode(payload, payload.index("[", match.start()))
         except ValueError:
@@ -1233,10 +1549,7 @@ def _agent_arrays(payload: str, board: str) -> list[list[dict]]:
         order.append(_AGENT_BOARD_KEYS[board])
     order.extend(keys for keys in _AGENT_GENERIC_KEYS if keys not in order)
     for keys in order:
-        try:
-            arrays = [a for a in flight.find_arrays(payload, keys) if a and isinstance(a[0], dict)]
-        except LookupError:  # pragma: no cover - defensive
-            arrays = []
+        arrays = [a for a in flight.find_arrays(payload, keys) if a and isinstance(a[0], dict)]
         if arrays:
             return arrays
     return []
@@ -1276,7 +1589,7 @@ def parse_agents(text: str, board: str = "") -> list[dict]:
         if pools:
             pool = max(pools, key=len)
     records: list[dict] = []
-    for item, index in zip(main, indices):
+    for item, index in zip(main, indices, strict=False):
         if isinstance(item, dict):
             records.append(item)
         elif index is not None and pool is not None and index < len(pool):
@@ -1298,13 +1611,20 @@ def agents(board: str, refresh: bool = False) -> list[dict]:
             f"unknown agents board {board!r}; expected one of "
             f"{', '.join(sorted(AGENT_BOARDS))}"
         ) from None
-    got = fetch.get(url(path), f"agents_{board}", refresh=refresh)
+    source_url = url(path)
+    got = fetch.get(source_url, f"agents_{board}", refresh=refresh)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _AGENTS_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
     rows = parse_agents(got.text, board)
     if not rows:
         raise ValueError(
-            f"{url(path)}: no structured leaderboard data found in the "
-            "payload (the surface may be client-rendered)"
+            f"{source_url}: no structured leaderboard data found in the "
+            f"payload (the surface may be client-rendered) — {_refresh_note(got.path, source_url)}"
         )
+    _AGENTS_MEMO.put(key, rows)
     return rows
 
 
@@ -1314,27 +1634,41 @@ def agents(board: str, refresh: bool = False) -> list[dict]:
 
 
 def eval_models(slug: str, refresh: bool = False) -> list[Model]:
-    """Top-N chart set for one ``/evaluations/<slug>`` page, best first."""
+    """Top-N chart set for one ``/evaluations/<slug>`` page, best first.
+
+    "Best" follows :attr:`catalog.Metric.better`: lower-is-better evaluations
+    (hallucination/refusal rates) are ranked lowest-first (audit H2).
+    """
     path = SOURCE_URLS["eval"].format(slug=slug)
-    got = fetch.get(url(path), f"eval_{slug}", refresh=refresh)
+    source_url = url(path)
+    got = fetch.get(source_url, f"eval_{slug}", refresh=refresh)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _EVAL_MODELS_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
     try:
         models = parse_chart(got.text)
-    except LookupError:
-        models = []
+    except LookupError as exc:
+        raise _parse_error(exc, got.path, source_url) from exc
     if not models:
         raise ValueError(
-            f"{url(path)}: no 'initialModels' chart set found "
-            "in the payload"
+            f"{source_url}: no 'initialModels' chart set found in the payload — "
+            f"{_refresh_note(got.path, source_url)}"
         )
+    _validate(models, path=got.path, url=source_url)
     bench = catalog.benchmark(slug)
     if bench is not None:
-        key = bench.key
+        bench_key = bench.key
+        best_first = select.better_desc(bench_key)
         models.sort(
             key=lambda m: (
-                m.evals.get(key) is None,
-                -(m.evals.get(key) or 0.0),
+                m.evals.get(bench_key) is None,
+                -(m.evals.get(bench_key) or 0.0) if best_first
+                else (m.evals.get(bench_key) or 0.0),
             )
         )
+    _EVAL_MODELS_MEMO.put(key, models)
     return models
 
 
@@ -1417,8 +1751,21 @@ def parse_eval_catalog(html_text: str) -> list[dict]:
 
 def eval_catalog(refresh: bool = False) -> list[dict]:
     """Every evaluation card from the plain-HTML ``/evaluations`` index."""
-    got = fetch.get(url(SOURCE_URLS["eval_catalog"]), "eval_catalog", refresh=refresh, rsc=False)
-    return parse_eval_catalog(got.text)
+    source_url = url(SOURCE_URLS["eval_catalog"])
+    got = fetch.get(source_url, "eval_catalog", refresh=refresh, rsc=False)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _EVAL_CATALOG_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
+    cards = parse_eval_catalog(got.text)
+    if not cards and got.text.strip():
+        raise ValueError(
+            f"{source_url}: no evaluation cards found in the payload — "
+            f"{_refresh_note(got.path, source_url)}"
+        )
+    _EVAL_CATALOG_MEMO.put(key, cards)
+    return cards
 
 
 # --------------------------------------------------------------------------- #
@@ -1442,9 +1789,5 @@ def parse_sitemap(text: str) -> list[str]:
 
 def sitemap_paths(refresh: bool = False) -> list[str]:
     """Model/evaluation surface paths from ``/sitemap.xml`` (diagnostics only)."""
-    try:
-        got = fetch.get(url(SOURCE_URLS["sitemap"]), "sitemap", refresh=refresh, rsc=False)
-    except AAFetchError as exc:  # pragma: no cover - network error path
-        log.warning("sitemap fetch failed: %s", exc)
-        raise
+    got = fetch.get(url(SOURCE_URLS["sitemap"]), "sitemap", refresh=refresh, rsc=False)
     return parse_sitemap(got.text)

@@ -20,7 +20,29 @@ aa-mcp = "aa_mcp.server:main"
 Homepage = "https://github.com/HenryGetz/aa-mcp"
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.9"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# E4/E7/E9 rather than all of "E": the codebase deliberately uses long descriptive
+# lines and aligned literals in the table/reference text.
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+  # Typography is deliberate: "700 × 94", "Intel × Cost", en-dashes in labels.
+  "RUF001", "RUF002", "RUF003",
+  # Explicit list concatenation reads better than unpacking in the column builders.
+  "RUF005",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert freely and spin up loopback servers.
+"tests/*" = ["SIM117"]
+"eval/*" = ["SIM117"]
+# Scripts insert the repo on sys.path before importing the package.
+"scripts/*" = ["SIM117", "E402"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aa_mcp"]

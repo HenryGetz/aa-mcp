@@ -13,10 +13,11 @@ import json
 import re
 import threading
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
-from aa_mcp import fetch, flight, loaders, source
+from aa_mcp import catalog, fetch, flight, loaders, source
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -29,6 +30,9 @@ def _force_rsc_source(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("AA_BASE_URL", raising=False)
     monkeypatch.delenv("AA_OFFLINE", raising=False)
     monkeypatch.setattr(source, "_probe_cache", None)
+    # The parsed-payload memos are process-global; the fake fetch hands every
+    # payload the same (path, mtime) key, so each test must start from empty.
+    loaders._clear_memos()
     yield
 
 
@@ -154,7 +158,9 @@ def _jsonld_leader(text: str) -> tuple[str, int]:
     "board, fixture, count",
     [
         ("text_to_image", "media_t2i.rsc", 102),
-        ("text_to_video", "media_t2v.rsc", 32),
+        # the page's own arena is AA-Video-T2V v2.1 (FAQ: "Wan 3.0 … 1173"); the
+        # payload also carries the 32-row AA-Video-T2V-Silent v2.1 (A34/A8).
+        ("text_to_video", "media_t2v.rsc", 29),
         ("text_to_speech", "media_tts.rsc", 97),
     ],
 )
@@ -255,7 +261,7 @@ def test_eval_catalog_matches_reference() -> None:
 
     assert len(cards) == 33
     assert [c["slug"] for c in cards] == [r["slug"] for r in reference]
-    for card, ref in zip(cards, reference):
+    for card, ref in zip(cards, reference, strict=False):
         assert card["title"] == ref["title"]
         assert card["tags"] == ref["tags"]
         assert card["description"]
@@ -345,7 +351,10 @@ def test_loader_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(chart) == 27 and "claude-fable-5-1" in chart
 
     legacy = loaders.model("glm-4-5v")
-    assert set(legacy) == {"glm-4-5v"}
+    # the legacy page's initialModels array is 28 flight references into its
+    # 700-record pool (audit H4); 27 resolve from the pool, 1 is currentModel.
+    assert len(legacy) == 28 and "glm-4-5v" in legacy
+    assert legacy["glm-4-5v"].slug == "glm-4-5v"
 
     assert len(loaders.provider_endpoints("claude-opus-5-5")) == 1
     assert len(loaders.provider_board()) == 1201
@@ -374,14 +383,91 @@ def test_leaderboard_memo_is_keyed_by_fetch_time(monkeypatch: pytest.MonkeyPatch
 
 
 # --------------------------------------------------------------------------- #
+# parsed-payload memos (warm path)
+# --------------------------------------------------------------------------- #
+
+def test_parsed_payload_memos_serve_the_same_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_fetch(monkeypatch)
+    # each loader family returns its memoized parse on a warm (same key) call
+    assert loaders.media("text_to_image") is loaders.media("text_to_image")
+    assert loaders.model("claude-fable-5-1") is loaders.model("claude-fable-5-1")
+    assert loaders.provider_endpoints("claude-opus-5-5") is \
+        loaders.provider_endpoints("claude-opus-5-5")
+    assert loaders.provider_board() is loaders.provider_board()
+    assert loaders.home_boards() is loaders.home_boards()
+    assert loaders.agents("coding_agents") is loaders.agents("coding_agents")
+    assert loaders.eval_models("gpqa-diamond") is loaders.eval_models("gpqa-diamond")
+    assert loaders.eval_catalog() is loaders.eval_catalog()
+
+
+def test_refresh_bypasses_the_memo(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_fetch(monkeypatch)
+    media_first = loaders.media("text_to_image")
+    model_first = loaders.model("claude-fable-5-1")
+    assert loaders.media("text_to_image") is media_first
+    assert loaders.model("claude-fable-5-1") is model_first
+    # refresh=True must re-parse rather than serve the memoized object
+    assert loaders.media("text_to_image", refresh=True) is not media_first
+    assert loaders.model("claude-fable-5-1", refresh=True) is not model_first
+
+
+def test_per_slug_memo_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = json.dumps({"initialModels": [
+        {"slug": "m", "name": "M", "gpqa": 0.5, "intelligenceIndex": 40.0}]})
+
+    def fake_get(url: str, name: str, **kwargs):
+        return fetch.Fetched(text=page, path=Path("/fake-cache") / name,
+                             fetched_at=1.0, cached=True, stale=False)
+
+    monkeypatch.setattr(loaders.fetch, "get", fake_get)
+    for i in range(40):
+        loaders.eval_models(f"bench-{i}")
+    # 40 distinct slugs parsed, but only the last ``maxsize`` are retained
+    assert len(loaders._EVAL_MODELS_MEMO._entries) == loaders._MEMO_MAXSIZE
+
+
+def test_payload_memo_is_an_lru_with_a_miss_sentinel() -> None:
+    memo = loaders._PayloadMemo(2)
+    memo.put(("a", 1.0), 1)
+    memo.put(("b", 1.0), 2)
+    assert memo.get(("a", 1.0)) == 1          # a hit promotes "a" to most-recent
+    memo.put(("c", 1.0), 3)                   # evicts "b", the least-recently used
+    assert memo.get(("a", 1.0)) == 1
+    assert memo.get(("c", 1.0)) == 3
+    assert memo.get(("b", 1.0)) is loaders._MISS
+    assert memo.get(("nope", 0.0)) is loaders._MISS
+
+
+def test_payload_memo_publication_is_thread_safe() -> None:
+    memo = loaders._PayloadMemo(8)
+    errors: list[BaseException] = []
+
+    def worker(n: int) -> None:
+        try:
+            for i in range(500):
+                memo.put((f"k{n % 16}", float(i)), i)
+                memo.get((f"k{(n + i) % 16}", float(i)))
+        except BaseException as exc:  # pragma: no cover - a race would surface here
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+    assert len(memo._entries) <= 8
+
+
+# --------------------------------------------------------------------------- #
 # real transport test (loopback http.server; exercises fetch.get for real)
 # --------------------------------------------------------------------------- #
 
 
 class _FixtureHandler(http.server.BaseHTTPRequestHandler):
-    routes: dict[str, bytes] = {}
+    routes: ClassVar[dict[str, bytes]] = {}
 
-    def do_GET(self) -> None:  # noqa: N802 - http.server API
+    def do_GET(self) -> None:
         body = self.routes.get(self.path)
         if body is None:
             self.send_error(404)
@@ -542,7 +628,7 @@ import gzip  # noqa: E402
 
 
 def _rich_page() -> str:
-    records = json.loads(gzip.open(FIXTURES / "rich_dataset.json.gz", "rb").read())
+    records = _rich_fixture_records()
     refs = json.loads((FIXTURES / "initial_models_refs.json").read_text(encoding="utf-8"))
     current = json.loads((FIXTURES / "rich_current_model.json").read_text(encoding="utf-8"))
     return json.dumps({"currentModel": current, "initialModels": refs,
@@ -572,7 +658,7 @@ def test_parse_rich_dataset_counts() -> None:
 
 
 def test_parse_rich_dataset_fixture_has_90_plus_keys() -> None:
-    records = json.loads(gzip.open(FIXTURES / "rich_dataset.json.gz", "rb").read())
+    records = _rich_fixture_records()
     dicts = [r for r in records if isinstance(r, dict)]
     assert len(dicts) >= 600
     assert max(len(r) for r in dicts) >= 90
@@ -584,7 +670,7 @@ def test_parse_rich_dataset_absent_on_plain_page() -> None:
 
 
 def test_rich_dataset_offline_uses_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    records = json.loads(gzip.open(FIXTURES / "rich_dataset.json.gz", "rb").read())
+    records = _rich_fixture_records()
     cache = tmp_path / "cache"
     cache.mkdir()
     (cache / "rich_dataset.json").write_text(json.dumps(records), encoding="utf-8")
@@ -797,3 +883,257 @@ def test_precision_none_when_absent() -> None:
          "slug": "gmi_m", "jsonMode": True, "pricing": {}, "performance": {}},
     ]})
     assert loaders.parse_provider_endpoints(page)[0].precision is None
+
+
+# --------------------------------------------------------------------------- #
+# Wave A: cache-aware errors, plausibility, arena identity, open-weights flags
+# --------------------------------------------------------------------------- #
+
+def _cache_fetch(monkeypatch: pytest.MonkeyPatch, text: str, name: str) -> Path:
+    """Serve ``text`` as the payload cached under ``name`` (no network)."""
+    path = Path("/fake-cache") / name
+
+    def fake_get(url: str, name: str, **kwargs):
+        return fetch.Fetched(text=text, path=path, fetched_at=1_700_000_000.0,
+                             cached=True, stale=False)
+
+    monkeypatch.setattr(loaders.fetch, "get", fake_get)
+    return path
+
+
+def test_unparseable_leaderboard_names_cache_and_refresh(monkeypatch) -> None:
+    path = _cache_fetch(monkeypatch, "<html>bot wall</html>", "leaderboard.rsc")
+    with pytest.raises(fetch.AAFetchError) as ei:
+        loaders.leaderboard()
+    message = str(ei.value)
+    assert "refresh=true" in message
+    assert str(path) in message
+    assert ei.value.path == path
+
+
+def test_poisoned_leaderboard_row_is_rejected(monkeypatch) -> None:
+    # A32: one edited field made Intel 999.0 the #1 model with no warning.
+    text = '0:[{"slug":"poisoned","name":"Poisoned","intelligenceIndex":999.0}]'
+    _cache_fetch(monkeypatch, text, "leaderboard.rsc")
+    with pytest.raises(fetch.AAFetchError) as ei:
+        loaders.leaderboard()
+    assert "999.0" in str(ei.value)
+    assert "refresh=true" in str(ei.value)
+
+
+@pytest.mark.parametrize("field, value", [
+    ("intelligenceIndex", -500.0),
+    ("intelligenceIndexCostPerTask", -1.5),
+    ("contextWindowTokens", 0),
+])
+def test_implausible_leaderboard_values_are_rejected(monkeypatch, field, value) -> None:
+    record = {"slug": "bad", "name": "Bad", "intelligenceIndex": 40.0}
+    record[field] = value
+    _cache_fetch(monkeypatch, "0:[" + json.dumps(record) + "]", "leaderboard.rsc")
+    with pytest.raises(fetch.AAFetchError) as ei:
+        loaders.leaderboard()
+    assert "refresh=true" in str(ei.value)
+
+
+def test_mostly_unscored_leaderboard_cache_is_rejected(monkeypatch) -> None:
+    records = [{"slug": f"m{i}", "name": f"M{i}",
+                "intelligenceIndex": 40.0 if i == 0 else None} for i in range(10)]
+    _cache_fetch(monkeypatch, "0:" + json.dumps(records), "leaderboard.rsc")
+    with pytest.raises(fetch.AAFetchError) as ei:
+        loaders.leaderboard()
+    assert "intelligence" in str(ei.value) and "refresh=true" in str(ei.value)
+
+
+def _rich_fixture_records():
+    """The 700-record fixture's raw extraction (records *and* flight refs)."""
+    with gzip.open(FIXTURES / "rich_dataset.json.gz", "rb") as fh:
+        return json.loads(fh.read())
+
+def test_poisoned_rich_dataset_cache_is_rejected(monkeypatch, tmp_path) -> None:
+    records = _rich_fixture_records()
+    for record in records:
+        if isinstance(record, dict) and record.get("slug") == "claude-opus-5-5":
+            record["intelligenceIndex"] = 999.0
+            record["intelligenceIndexCostPerTask"] = {"cost": {"total": 0.01}}
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "rich_dataset.json").write_text(json.dumps(records), encoding="utf-8")
+    (cache / "rich_seed.json").write_text(json.dumps({"slug": "step-5", "ts": 0}),
+                                         encoding="utf-8")
+    monkeypatch.setenv("AA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("AA_OFFLINE", "1")
+    monkeypatch.setattr(loaders, "_RICH_MEMO", None)
+    with pytest.raises(fetch.AAFetchError) as ei:
+        loaders.rich_dataset()
+    message = str(ei.value)
+    assert "rich_dataset.json" in message and "refresh=true" in message
+    assert "claude-opus-5-5" in message
+
+
+def test_intact_rich_dataset_cache_is_served(monkeypatch, tmp_path) -> None:
+    records = _rich_fixture_records()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "rich_dataset.json").write_text(json.dumps(records), encoding="utf-8")
+    monkeypatch.setenv("AA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("AA_OFFLINE", "1")
+    monkeypatch.setattr(loaders, "_RICH_MEMO", None)
+    assert len(loaders.rich_dataset()) >= 600
+
+
+@pytest.mark.parametrize("loader, name, payload", [
+    (lambda: loaders.home_boards(), "home", "<html>bot wall</html>"),
+    (lambda: loaders.eval_catalog(), "eval_catalog", "<html>bot wall</html>"),
+    (lambda: loaders.provider_board(), "providers_board", "<html>bot wall</html>"),
+    (lambda: loaders.provider_endpoints("claude-opus-5-5"), "providers_claude-opus-5-5",
+     "<html>bot wall</html>"),
+    (lambda: loaders.agents("coding_agents"), "agents_coding_agents",
+     "<html>bot wall</html>"),
+    (lambda: loaders.eval_models("gpqa-diamond"), "eval_gpqa-diamond",
+     "<html>bot wall</html>"),
+])
+def test_every_loader_reports_the_cache_file_and_refresh(monkeypatch, loader, name, payload):
+    path = _cache_fetch(monkeypatch, payload, name)
+    with pytest.raises((ValueError, fetch.AAFetchError)) as ei:
+        loader()
+    message = str(ei.value)
+    assert "refresh=true" in message and str(path) in message
+
+
+# --------------------------------------------------------------------------- #
+# ranking direction for lower-is-better benchmarks (audit H2)
+# --------------------------------------------------------------------------- #
+
+def test_eval_models_ranks_lower_is_better_first(monkeypatch) -> None:
+    # omniscienceHallucinationRate is catalogued better="low"; the same shape as
+    # catalog.benchmark(slug).key for a refusal-rate eval page (audit H2).
+    page = json.dumps({"initialModels": [
+        {"slug": "worst", "name": "Worst", "omniscienceHallucinationRate": 0.9,
+         "intelligenceIndex": 40.0},
+        {"slug": "best", "name": "Best", "omniscienceHallucinationRate": 0.1,
+         "intelligenceIndex": 30.0},
+        {"slug": "mid", "name": "Mid", "omniscienceHallucinationRate": 0.5,
+         "intelligenceIndex": 20.0},
+    ]})
+    key = "omniscienceHallucinationRate"
+    assert catalog.benchmark(key).key == key
+    assert catalog.metric(key).better == "low"
+    _cache_fetch(monkeypatch, page, f"eval_{key}")
+    models = loaders.eval_models(key)
+    assert [m.slug for m in models] == ["best", "mid", "worst"]
+
+
+def test_eval_models_ranks_higher_is_better_first(monkeypatch) -> None:
+    page = json.dumps({"initialModels": [
+        {"slug": "low", "name": "Low", "gpqa": 0.2},
+        {"slug": "high", "name": "High", "gpqa": 0.8},
+    ]})
+    _cache_fetch(monkeypatch, page, "eval_gpqa-diamond")
+    assert [m.slug for m in loaders.eval_models("gpqa-diamond")] == ["high", "low"]
+
+
+# --------------------------------------------------------------------------- #
+# media arena identity (audit A34)
+# --------------------------------------------------------------------------- #
+
+def test_media_counts_follow_the_pages_own_arena() -> None:
+    # media_t2v.rsc carries AA-Video-T2V v2.1 (the board this page is for) and
+    # AA-Video-T2V-Silent v2.1; the page's own arena is the first flight row and
+    # its JSON-LD answer says "Wan 3.0 ... Elo score of 1173".
+    rows = loaders.parse_media(_text("media_t2v.rsc"), "text_to_video")
+    assert len(rows) == 29
+    assert rows[0]["name"] == "Wan 3.0"
+    assert abs(rows[0]["elo"] - 1173) < 1
+    # ... not the Silent arena (top Elo 1134)
+    assert rows[0]["elo"] > 1160
+
+
+def test_tampered_media_page_does_not_fall_back_to_a_subset() -> None:
+    payload = flight.payload(_text("media_t2i.rsc"))
+    index, rows = flight.find_arrays_at(payload, ("values", "formatted"))[0]
+    assert len(rows) == 102
+    _value, end = json.JSONDecoder().raw_decode(payload, index)
+    # the mutation the attack report used: the board's arena disappears
+    tampered = payload[:index] + "[]" + payload[end:]
+    with pytest.raises(ValueError) as ei:
+        loaders.parse_media(tampered, "text_to_image")
+    assert "refusing to serve" in str(ei.value)
+
+
+def test_media_arena_must_carry_the_boards_keys() -> None:
+    page = '32:[[null,[{"values":{"name":"X","elo":1.0},"formatted":{}}]]]'
+    with pytest.raises(ValueError) as ei:
+        loaders.parse_media(page, "text_to_video")   # needs pricePerMinute
+    assert "expected row keys" in str(ei.value)
+
+
+def test_media_category_subset_is_not_the_board() -> None:
+    page = ('0:["x",[["knowledge",[{"values":{"name":"N","elo":1200.0,'
+            '"pricePer1kImages":3},"formatted":{"rank":1}}]]]]')
+    with pytest.raises(ValueError) as ei:
+        loaders.parse_media(page, "text_to_image")
+    assert "arena is missing" in str(ei.value)
+
+
+def test_media_loader_wraps_parse_failure_with_cache_note(monkeypatch) -> None:
+    path = _cache_fetch(monkeypatch, "not-an-rsc-payload", "media_text_to_image")
+    with pytest.raises(ValueError) as ei:
+        loaders.media("text_to_image")
+    assert "refresh=true" in str(ei.value) and str(path) in str(ei.value)
+
+
+def test_music_style_initial_data_slot_is_an_arena() -> None:
+    # the music pages ship the arena as an object field: "initialData":[...]
+    page = ('0:{"initialData":[{"values":{"name":"M","elo":1000.0},'
+            '"formatted":{"rank":1}},{"values":{"name":"N","elo":900.0},'
+            '"formatted":{"rank":2}}]}')
+    rows = loaders.parse_media(page, "music_instrumental")
+    assert [r["name"] for r in rows] == ["M", "N"]
+
+
+def test_media_row_tolerates_bad_shapes() -> None:
+    page = ('0:[[null,[{"values":"nope","formatted":[]},'
+            '{"values":{"name":"$L1","creator":"$L2","url":"$L3",'
+            '"pricePer1kImages":"$L4","elo":5.0,"openWeightsUrl":null},'
+            '"formatted":{"rank":"$L5"}}]]]')
+    rows = loaders.parse_media(page, "text_to_image")
+    assert len(rows) == 2
+    # rows are Elo-sorted, so the scored row comes first
+    scored, blank = rows
+    assert scored["name"] is None            # unresolved refs never surface
+    assert scored["creator"] is None
+    assert scored["url"] is None
+    assert scored["rank"] is None
+    assert scored["price"] is None and scored["price_unit"] is None
+    assert scored["elo"] == 5.0
+    assert scored["open_weights"] is False   # openWeightsUrl present but null
+    assert blank["elo"] is None
+    assert blank["name"] is None             # values was a string, not a mapping
+
+
+# --------------------------------------------------------------------------- #
+# open-weights normalizer (audit H5)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("row, expected", [
+    ({"openWeights": True}, True),
+    ({"openWeights": False}, False),
+    ({"openWeights": "false"}, False),
+    ({"isOpenWeights": True}, True),
+    ({"openWeightsUrl": "https://example/weights"}, True),
+    ({"openWeightsUrl": None}, False),
+    ({"weightsUrl": "https://example/w"}, True),
+    ({"name": "no flag here"}, None),
+    ({"values": {"openWeightsUrl": "https://example/w"}}, True),
+    ({"values": {"name": "x"}}, None),
+    ("not a mapping", None),
+])
+def test_open_weights_flag_shapes(row, expected) -> None:
+    assert loaders.open_weights_flag(row) is expected
+
+
+def test_open_weights_flag_none_for_homepage_speech_rows() -> None:
+    boards = loaders.parse_home_boards(_text("home.rsc"))
+    stt = boards["stt"]
+    assert stt
+    assert all(loaders.open_weights_flag(row) is None for row in stt)

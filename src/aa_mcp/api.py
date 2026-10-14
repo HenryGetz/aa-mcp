@@ -31,9 +31,9 @@ __all__ = [
     "API_BASE",
     "MODELS_FREE_URL",
     "ApiAuthError",
-    "parse_models_free",
-    "parse_model_item",
     "fetch_models_free",
+    "parse_model_item",
+    "parse_models_free",
 ]
 
 

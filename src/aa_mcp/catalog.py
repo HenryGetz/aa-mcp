@@ -14,17 +14,22 @@ import re
 from dataclasses import dataclass
 
 __all__ = [
-    "Metric",
-    "Benchmark",
-    "METRICS",
     "BENCHMARKS",
-    "UNTRACKED_BENCHMARKS",
+    "DOMAINS",
     "FIELD_ALIASES",
+    "METRICS",
+    "RANKABLES",
+    "UNTRACKED_BENCHMARKS",
     "VALUE_SOURCE",
-    "metric",
+    "Benchmark",
+    "Metric",
+    "Rankable",
     "benchmark",
-    "format_value",
     "field_names",
+    "format_value",
+    "metric",
+    "rankable",
+    "rankables",
 ]
 
 
@@ -76,8 +81,8 @@ _B = [
      "AA-Omniscience hallucination rate (chart/model-page field); lower is better.",
      ("knowledge", "hallucination"), False),
     ("gpqa", "GPQA Diamond", "gpqa-diamond", "%",
-     "GPQA Diamond: hardest 198 graduate-level physics/chem/biology questions "
-     "(PhD experts ~65%, non-experts ~34%).", ("science", "reasoning"), False),
+     ("GPQA Diamond: hardest 198 graduate-level physics/chem/biology questions "
+      "(PhD experts ~65%, non-experts ~34%)."), ("science", "reasoning"), False),
     ("hle", "HLE", "humanitys-last-exam", "%",
      "Humanity's Last Exam: 2,500 expert-vetted frontier questions.",
      ("reasoning", "intelligence-index"), True),
@@ -226,7 +231,6 @@ _SOURCE_HINTS: dict[str, str] = {
     "briefcaseBreakdown": "rich",
     "briefcaseElo": "rich",
     "cweBench": "rich",
-    "cyberIndex": "rich",
     "cybergymE2e": "rich",
     "deepsecBench": "rich",
     "enterpriseOpsGym": "rich",
@@ -253,6 +257,7 @@ _SOURCE_HINTS: dict[str, str] = {
     "analystAgentPassAtK": "chart",
     "automationBenchBreakdown": "chart",
     "cweBenchRefusalRate": "chart",
+    "cyberIndex": "chart",
     "cybergymE2eRefusalRate": "chart",
     "deepsecBenchRefusalRate": "chart",
     "enterpriseOpsGymSuccessRateByDomain": "chart",
@@ -320,6 +325,12 @@ _M = [
     ("active_params_b", "Active", "int", "identity", "Active parameters for MoE models (billions).", None),
     ("size_class", "Size", "str", "identity", "AA parameter/size class.", None),
     ("license", "License", "str", "identity", "License name (open-weights models).", None),
+    ("weights_url", "Weights", "str", "identity",
+     "Where the model weights are published (open-weights models).", None),
+    ("modalities_in", "Mod In", "str", "identity",
+     "Input modalities (text/image/speech/video).", None),
+    ("modalities_out", "Mod Out", "str", "identity",
+     "Output modalities (text/image/speech/video).", None),
     ("is_open_weights", "Open", "bool", "identity", "Whether weights are openly available.", None),
     ("is_reasoning", "Reasoning", "bool", "identity", "Whether the model is a reasoning model.", None),
     ("effort", "Effort", "str", "identity", "Reasoning effort label (low..max).", None),
@@ -377,6 +388,10 @@ for _key, _label, _kind, _group, _desc, _better in _M:
 # Benchmark metrics (scalar data fields living in Model.evals / .indices).
 _UNIT_KIND = {"%": "pct", "Elo": "elo", "index": "index", "s": "sec",
               "tok/s": "tps", "USD/task": "usd", "mixed": "str"}
+#: Benchmark metrics where a *lower* value is the better result. Audited against
+#: `BENCHMARKS` (2026-10-14): the only benchmark descriptions that say "lower is
+#: better" are these four, plus the `METRICS` cost/TTFT/verbosity family above.
+#: test_catalog.py::test_lower_is_better_marks_match_descriptions enforces it.
 _LOWER_IS_BETTER = {
     "omniscienceHallucinationRate",
     "cweBenchRefusalRate",
@@ -458,6 +473,7 @@ _SHORTHANDS = {
     "n": "name",
     "model": "name",
     "released": "release_date",
+    "reasoning_time": "reasoning_s",
     "date": "release_date",
     "elo": "briefcaseElo",
 }
@@ -588,6 +604,9 @@ def format_value(key: str, value) -> str:
     """Format ``value`` for display according to the metric ``key``'s kind."""
     if value is None:
         return "-"
+    if isinstance(value, (tuple, list, set, frozenset)):
+        # identity fields hold tuples (modalities, tags): "text+image", not a repr
+        return "+".join(str(item) for item in value) or "-"
     m = metric(key)
     kind = m.kind if m else None
     if kind is None:
@@ -616,9 +635,425 @@ def format_value(key: str, value) -> str:
         if kind == "tokens":
             return _compact_tokens(float(value))
         if kind == "int":
-            return f"{int(round(float(value))):,}"
+            return f"{round(float(value)):,}"
         if kind == "bool":
             return "yes" if value else "no"
     except (TypeError, ValueError):
         return str(value)
     return str(value)
+
+
+# --------------------------------------------------------------------------- #
+# the searchable rankable index (Wave C)
+# --------------------------------------------------------------------------- #
+#
+# One flat index over *everything an agent can rank models on* — every benchmark,
+# composite index, derived metric and arena board — so a task-domain search finds
+# the right surface without one tool per benchmark. ``how`` is the actionable hint
+# (which tool + argument); ``DOMAINS`` expands a task domain into the tags/tokens
+# that select the relevant entries.
+
+@dataclass(frozen=True, slots=True)
+class Rankable:
+    key: str
+    label: str
+    kind: str                  # "benchmark" | "index" | "derived" | "arena" | "view"
+    unit: str
+    tags: tuple[str, ...]
+    how: str
+    surface: str               # "leaderboard" | "rich" | "chart" | "api" | "board"
+    desc: str
+    aliases: tuple[str, ...] = ()
+
+
+#: benchmark unit -> Rankable unit
+_BENCH_UNIT = {"%": "%", "Elo": "Elo", "index": "index", "mixed": "text",
+               "s": "s", "tok/s": "tok/s", "USD/task": "USD/task"}
+
+#: canonical full names for the composites whose short label is ambiguous in search
+_LABEL_OVERRIDES = {
+    "intelligence": "Artificial Analysis Intelligence Index",
+    "coding": "Artificial Analysis Coding Index",
+    "agentic": "Artificial Analysis Agentic Index",
+    "openness": "Artificial Analysis Openness Index",
+    "omniscience": "AA-Omniscience Index",
+    "cyberIndex": "Artificial Analysis Cyber Index",
+}
+
+#: extra spellings a user is likely to type (incl. version-suffixed names)
+_EXTRA_ALIASES = {
+    "intelligence": ("Artificial Analysis Intelligence Index", "AA Intelligence Index",
+                     "Intelligence Index"),
+    "coding": ("Artificial Analysis Coding Index", "Coding Index"),
+    "agentic": ("Artificial Analysis Agentic Index", "Agentic Index"),
+    "openness": ("Artificial Analysis Openness Index", "Openness Index"),
+    "omniscience": ("AA-Omniscience Index", "Omniscience Index"),
+    "cyberIndex": ("Artificial Analysis Cyber Index", "Cyber Index"),
+    "itbenchSre": ("ITBench-AA", "ITBench AA", "ITBench"),
+    "terminalBench40": ("Terminal-Bench 4.0", "TerminalBench 4.0"),
+    "terminalBenchScience": ("Terminal-Bench-Science 0.1", "Terminal-Bench Science 0.1"),
+    "frontierCode": ("FrontierCode 1.1", "FrontierCode v1.1"),
+    "aa3dElo": ("AA-3D", "AA 3D", "AA-3D Elo"),
+}
+
+
+def _dedupe(items) -> tuple[str, ...]:
+    out: list[str] = []
+    for it in items:
+        it = (it or "").strip()
+        if it and it not in out:
+            out.append(it)
+    return tuple(out)
+
+
+RANKABLES: dict[str, Rankable] = {}
+
+# benchmarks + composite indexes (kind follows the benchmark's unit)
+for _key, _b in BENCHMARKS.items():
+    _kind = "index" if _b.unit == "index" else "benchmark"
+    _label = _LABEL_OVERRIDES.get(_key, _b.label)
+    _aliases = _dedupe((_b.key, _b.label, _b.slug, *_EXTRA_ALIASES.get(_key, ())))
+    # ``aa_leaderboard sort=`` only ranks keys whose values come from the
+    # leaderboard / rich dataset; every chart-set / panel / API-only key must go
+    # through ``aa_benchmark_leaderboard``, whose source chain reaches them
+    # (round-5 audit: the cyberIndex hint pointed at the leaderboard and errored).
+    _how = (f"aa_leaderboard sort={_key}"
+            if _kind == "index" and _b.source_hint in ("leaderboard", "rich")
+            else f"aa_benchmark_leaderboard benchmark={_key}")
+    RANKABLES[_key] = Rankable(
+        key=_key, label=_label, kind=_kind,
+        unit=_BENCH_UNIT.get(_b.unit, "text"),
+        tags=_dedupe(_b.tags), how=_how, surface=_b.source_hint,
+        desc=_b.desc,
+        aliases=tuple(a for a in _aliases if a != _label),
+    )
+
+# derived metrics (kind="derived"): label, unit, tags, how
+_DERIVED = [
+    ("tps", "Speed (output tokens/s)", "tok/s", ("speed",), "aa_leaderboard sort=tps"),
+    ("ttft", "Time to First Token", "s", ("speed",), "aa_leaderboard sort=ttft"),
+    ("ttfa", "Time to First Answer Token", "s", ("speed",), "aa_leaderboard sort=ttfa"),
+    ("e2e", "End-to-End Response Time", "s", ("speed",), "aa_leaderboard sort=e2e"),
+    ("cost_per_task", "Cost per Task", "USD/task", ("cost", "pricing"),
+     "aa_pareto x=cost_per_task"),
+    ("index_total_cost", "Cost to Run the Intelligence Index (whole suite)", "USD",
+     ("cost", "pricing"), "aa_pareto x=index_total_cost"),
+    ("time_per_task", "Time per Intelligence Index Task", "s", ("speed", "cost"),
+     "aa_pareto x=time_per_task"),
+    ("out_tokens_per_task", "Output Tokens per Intelligence Index Task", "tokens",
+     ("speed", "cost"), "aa_pareto x=out_tokens_per_task"),
+    ("price_in", "Input Price (USD per 1M tokens)", "USD/1M", ("cost", "pricing"),
+     "aa_leaderboard sort=price_in"),
+    ("price_out", "Output Price (USD per 1M tokens)", "USD/1M", ("cost", "pricing"),
+     "aa_leaderboard sort=price_out"),
+    ("cache_read", "Cache Read Price (USD per 1M tokens)", "USD/1M", ("cost", "pricing"),
+     "aa_leaderboard sort=cache_read"),
+    ("cache_write", "Cache Write Price (USD per 1M tokens)", "USD/1M", ("cost", "pricing"),
+     "aa_leaderboard sort=cache_write"),
+    ("context_tokens", "Context Window", "tokens", ("long-context",),
+     "aa_leaderboard sort=context_tokens"),
+    ("params_b", "Total Parameters (B)", "params", ("model-size",),
+     "aa_leaderboard sort=params_b"),
+    ("active_params_b", "Active Parameters (B)", "params", ("model-size",),
+     "aa_leaderboard sort=active_params_b"),
+    ("release_date", "Release Date", "date", ("date",),
+     "aa_leaderboard sort=release_date"),
+]
+
+#: derived key -> extra spellings
+_DERIVED_ALIASES = {
+    "tps": ("Speed", "Output Speed", "Tokens per Second"),
+    "cost_per_task": ("Cost per Index Task",),
+    "index_total_cost": ("Cost to Run the Intelligence Index", "Cost to Run",
+                         "Index Total Cost"),
+    "time_per_task": ("Time per Task", "Time per Intelligence Index Task"),
+    "out_tokens_per_task": ("Output Tokens per Task", "Output Tokens per Index Task"),
+    "ttft": ("Time to First Token",),
+    "ttfa": ("Time to First Answer Token",),
+    "e2e": ("End-to-End",),
+    "price_in": ("Input Price", "Input $/M"),
+    "price_out": ("Output Price", "Output $/M"),
+    "cache_read": ("Cache Read Price", "Cache Read $/M"),
+    "cache_write": ("Cache Write Price", "Cache Write $/M"),
+    "context_tokens": ("Context", "Context Length"),
+    "params_b": ("Parameters", "Total Parameters"),
+    "active_params_b": ("Active Parameters",),
+    "release_date": ("Released", "Release"),
+}
+
+_DERIVED_DESC = {
+    "index_total_cost": ("Cost to run the whole AA Intelligence Index suite for the "
+                         "model (sum of the per-evaluation task costs)."),
+    "time_per_task": "Wall-clock time to complete one AA Intelligence Index task.",
+}
+
+for _key, _label, _unit, _tags, _how in _DERIVED:
+    _m = METRICS.get(_key)
+    _desc = _DERIVED_DESC.get(_key) or (_m.desc if _m else _label)
+    _aliases = _dedupe((_key, _key.replace("_", "-"), _key.replace("_", " "), _label,
+                        *_DERIVED_ALIASES.get(_key, ())))
+    RANKABLES[_key] = Rankable(
+        key=_key, label=_label, kind="derived", unit=_unit, tags=_dedupe(_tags),
+        how=_how, surface="leaderboard", desc=_desc,
+        aliases=tuple(a for a in _aliases if a != _label),
+    )
+
+# arena boards (kind="arena"): key, label, tags, extra aliases
+_ARENA = [
+    ("text_to_image", "Text-to-Image Arena Elo", ("media", "image", "vision"),
+     ("Text-to-Image", "T2I", "Image Arena")),
+    ("image_editing", "Image Editing Arena Elo", ("media", "image", "vision"),
+     ("Image Editing", "Image Edit")),
+    ("text_to_video", "Text-to-Video Arena Elo", ("media", "video"),
+     ("Text-to-Video", "T2V")),
+    ("image_to_video", "Image-to-Video Arena Elo", ("media", "video"),
+     ("Image-to-Video", "I2V")),
+    ("video_editing", "Video Editing Arena Elo", ("media", "video"), ("Video Editing",)),
+    ("text_to_speech", "Text-to-Speech Arena Elo", ("media", "speech", "audio"),
+     ("Provider Voice Arena Preference Elo", "Provider Voice", "Text-to-Speech", "TTS")),
+    ("text_to_speech_controlled", "Controlled Voice Arena Elo",
+     ("media", "speech", "audio"), ("Controlled Voice", "Text-to-Speech Controlled")),
+    ("music_instrumental", "Instrumental Music Arena Elo", ("media", "music", "audio"),
+     ("Instrumental Music", "Music Instrumental")),
+    ("music_with_vocals", "Music with Vocals Arena Elo", ("media", "music", "audio"),
+     ("Music with Vocals", "Vocal Music")),
+    ("speech_to_text", "Speech-to-Text Arena Elo", ("media", "speech", "audio"),
+     ("Speech-to-Text", "STT", "Transcription")),
+    ("speech_to_text_streaming", "Streaming Speech-to-Text Arena Elo",
+     ("media", "speech", "audio"), ("Streaming Speech-to-Text", "STT Streaming")),
+    ("speech_to_speech", "Speech-to-Speech Arena Elo", ("media", "speech", "audio"),
+     ("Artificial Analysis Speech to Speech Index", "Speech to Speech Index",
+      "Speech-to-Speech", "Realtime Voice", "realtime_voice", "STS")),
+]
+
+for _key, _label, _tags, _aliases in _ARENA:
+    RANKABLES[_key] = Rankable(
+        key=_key, label=_label, kind="arena", unit="Elo", tags=_dedupe(_tags),
+        how=f"aa_media board={_key}", surface="board",
+        desc=f"Human-preference Elo for the {_label.replace(' Arena Elo', '')} arena board.",
+        aliases=tuple(a for a in _dedupe((_key, *_aliases)) if a != _label),
+    )
+
+# site comparison views (kind="view"): the "Intelligence Index vs. X" plots the user
+# asked to be able to reach *always*. Each points at the ``aa_pareto`` axis call.
+# key, label, pareto x-axis, tags, extra aliases
+_VIEWS = [
+    ("intelligence_vs_cost_per_task",
+     "Intelligence Index vs. Cost per Task", "cost_per_task", ("view", "cost"),
+     ("Intelligence Index vs Cost per Task", "Intelligence Index versus Cost per Task",
+      "Intelligence Index vs. Cost per Index Task", "Intelligence vs. Cost per Task",
+      "Intelligence Index vs. Cost")),
+    ("intelligence_vs_index_total_cost",
+     "Intelligence Index vs. Cost to Run Artificial Analysis Intelligence Index",
+     "index_total_cost", ("view", "cost"),
+     ("Intelligence Index vs. Cost to Run AA Intelligence Index",
+      "Intelligence Index vs Cost to Run Artificial Analysis Intelligence Index",
+      "Intelligence Index vs. Cost to Run the AA Intelligence Index",
+      "Intelligence Index versus Cost to Run Artificial Analysis Intelligence Index",
+      "Cost to Run Artificial Analysis Intelligence Index",
+      "Cost to Run AA Intelligence Index", "Intelligence Index vs. Cost to Run")),
+    ("intelligence_vs_out_tokens_per_task",
+     "Intelligence Index vs. Output Tokens per Intelligence Index Task",
+     "out_tokens_per_task", ("view", "speed", "cost"),
+     ("Intelligence Index vs. Output Tokens per Task",
+      "Intelligence Index vs Output Tokens per Intelligence Index Task",
+      "Intelligence Index versus Output Tokens per Intelligence Index Task",
+      "Intelligence Index vs. Output Tokens")),
+    ("intelligence_vs_speed",
+     "Intelligence Index vs. Speed", "tps", ("view", "speed"),
+     ("Intelligence Index vs Speed", "Intelligence Index versus Speed",
+      "Speed vs. Intelligence Index", "Intelligence Index vs. Tokens per Second")),
+]
+
+for _key, _label, _axis, _tags, _aliases in _VIEWS:
+    RANKABLES[_key] = Rankable(
+        key=_key, label=_label, kind="view", unit="index", tags=_dedupe(_tags),
+        how=f"aa_pareto x={_axis}", surface="chart",
+        desc=(f"Site comparison view: plots the AA Intelligence Index against "
+              f"{RANKABLES[_axis].label}."),
+        aliases=tuple(a for a in _dedupe((_key, *_aliases)) if a != _label),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# domain expansion
+# --------------------------------------------------------------------------- #
+
+#: canonical task domain -> tags/tokens it covers. A token matches a rankable when
+#: it equals one of its tags (or key), or, with a trailing ``*``, is a prefix of the
+#: key. Aliased spellings (``vision``/``multimodal``, ``business``/``finance``, …)
+#: are separate keys so an agent can ask either way.
+DOMAINS: dict[str, tuple[str, ...]] = {
+    "coding": ("coding",),
+    "math": ("math",),
+    "science": ("science",),
+    "security": ("cyber", "security", "cweBench*", "deepsec*", "cybergym*", "wildguard*"),
+    "agentic": ("agentic",),
+    "tool-use": ("tool-use",),
+    "long-context": ("long-context",),
+    "instruction-following": ("instruction-following",),
+    "knowledge": ("knowledge",),
+    "reasoning": ("reasoning",),
+    "safety": ("safety", "guardrail"),
+    "multimodal": ("vision", "media", "image", "video", "audio", "speech", "music"),
+    "vision": ("vision",),
+    "speech": ("speech",),
+    "media": ("media", "image", "video", "audio", "speech", "music"),
+    "music": ("music",),
+    "video": ("video",),
+    "business": ("business", "finance", "capabilities.financeAndAccounting*",
+                 "capabilities.strategyAndOps*"),
+    "finance": ("finance", "capabilities.financeAndAccounting*"),
+    "legal": ("legal", "capabilities.legal*"),
+    "medical": ("medical", "healthcare", "capabilities.healthcareAndMedical*"),
+    "engineering": ("engineering", "capabilities.engineering*"),
+    "economics": ("economics", "capabilities.economics*"),
+    "cost": ("cost", "pricing"),
+    "speed": ("speed",),
+    "openness": ("openness",),
+}
+
+_DOMAIN_KEYS = {_norm(_d): _d for _d in DOMAINS}
+
+
+def _resolve_domain(domain: str) -> str | None:
+    d = domain.strip()
+    if d in DOMAINS:
+        return d
+    return _DOMAIN_KEYS.get(_norm(d))
+
+
+def _domain_token_matches(token: str, r: Rankable) -> bool:
+    t = token.lower()
+    if t.endswith("*"):
+        prefix = t[:-1]
+        return (r.key.lower().startswith(prefix)
+                or any(tag.lower().startswith(prefix) for tag in r.tags))
+    return t == r.key.lower() or t in {tag.lower() for tag in r.tags}
+
+
+def _tokens(text: str) -> list[str]:
+    """Lowercased alphanumeric tokens (same split as ``select.search``)."""
+    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+
+
+def _haystack(r: Rankable) -> set[str]:
+    fields = [r.key, r.label, r.desc, *r.tags, *r.aliases]
+    return set(_tokens(" ".join(fields)))
+
+
+#: kind preference among otherwise-equal query matches (views/arenas first)
+_KIND_ORDER = {"view": 0, "arena": 0, "index": 1, "benchmark": 1, "derived": 1}
+
+
+def _query_sort_key(r: Rankable, query: str, qtokens: list[str]) -> tuple:
+    """Deterministic rank for tokenised query results (see :func:`rankables`)."""
+    names = {_norm(r.key), _norm(r.label), *(_norm(a) for a in r.aliases)}
+    exact = 0 if _norm(query) in names else 1
+    named = set(_tokens(" ".join((r.key, r.label, *r.aliases, *r.tags))))
+    tier = 0 if all(t in named for t in qtokens) else 1
+    numeric = 0 if r.unit not in ("text",) else 1
+    return (exact, tier, numeric, _KIND_ORDER.get(r.kind, 9), r.label.lower(), r.key)
+
+
+def query_domain(query: str) -> str | None:
+    """The canonical task domain a single-word ``query`` names, else ``None``.
+
+    ``query="security"`` is a domain name, so a bare word is not a useful
+    AND-token (it only matches the one entry whose text spells it out); it is
+    expanded through :data:`DOMAINS` exactly like ``domain="security"``. A
+    multi-word query (``"cyber index"``) keeps the tokenised AND behaviour.
+    """
+    text = str(query).strip()
+    if not text or any(ch.isspace() for ch in text):
+        return None
+    return _resolve_domain(text)
+
+
+def rankables(*, domain: str = "", tag: str = "", query: str = "") -> list[Rankable]:
+    """Search the rankable index by task ``domain``, ``tag`` and/or free ``query``.
+
+    ``query`` is an AND-match over key/label/aliases/desc/tags, except that a
+    single word naming a known domain expands to that whole domain (see
+    :func:`query_domain`); ``domain`` expands through :data:`DOMAINS`; ``tag`` is
+    an exact tag match. All three combine. An unknown ``domain``/``tag`` yields an
+    empty list.
+
+    Ordering is deterministic. Tokenised ``query`` results sort by, in order:
+
+    1. exact label/alias/key match first;
+    2. entries matched on their name/tags before those matched only via ``desc``;
+    3. numeric units before ``text`` containers (so a breakdown row never
+       outranks the value it breaks down);
+    4. ``view``/``arena`` before ``benchmark``/``index``/``derived`` among
+       otherwise-equal matches (an arena/view only appears when the query names
+       it, so this never floats an unrelated one to the top);
+    5. label, then key, for a total order.
+
+    Domain/tag-only results sort by ``(kind, key)``.
+    """
+    out = list(RANKABLES.values())
+    if domain:
+        canon = _resolve_domain(domain)
+        tokens = DOMAINS.get(canon) if canon else None
+        if not tokens:
+            return []
+        out = [r for r in out if any(_domain_token_matches(t, r) for t in tokens)]
+    if tag:
+        want = tag.strip().lower()
+        out = [r for r in out if want in {t.lower() for t in r.tags}]
+    if query:
+        canon = query_domain(query)
+        if canon:
+            tokens = DOMAINS[canon]
+            out = [r for r in out if any(_domain_token_matches(t, r) for t in tokens)]
+        else:
+            qtokens = _tokens(query)
+            if qtokens:
+                out = [r for r in out if all(t in _haystack(r) for t in qtokens)]
+                return sorted(out, key=lambda r: _query_sort_key(r, query, qtokens))
+    return sorted(out, key=lambda r: (r.kind, r.key))
+
+
+# --------------------------------------------------------------------------- #
+# rankable lookup (canonical key, alias, version-tolerant, metric()/BENCHMARKS)
+# --------------------------------------------------------------------------- #
+
+_RANK_ALIAS: dict[str, str] = {}
+for _k, _r in RANKABLES.items():
+    for _a in (_k, _r.label, *_r.aliases):
+        if _a:
+            _RANK_ALIAS.setdefault(_norm(_a), _k)
+
+
+def _strip_version(text: str) -> str:
+    """Drop a trailing version suffix (``v4``, ``4.0``, ``2.1``, ``0.1``)."""
+    return re.sub(r"[ _-]*v?\d+(?:\.\d+)*$", "", text.strip(), flags=re.IGNORECASE)
+
+
+_RANK_ALIAS_STRIPPED: dict[str, str] = {}
+for _k, _r in RANKABLES.items():
+    for _a in (_k, _r.label, *_r.aliases):
+        if _a:
+            _s = _norm(_strip_version(_a))
+            if _s:
+                _RANK_ALIAS_STRIPPED.setdefault(_s, _k)
+
+
+def rankable(key_or_alias: str) -> Rankable | None:
+    """Resolve any key/label/alias (or metric/benchmark key) to a :class:`Rankable`."""
+    if not key_or_alias:
+        return None
+    raw = key_or_alias.strip()
+    if raw in RANKABLES:
+        return RANKABLES[raw]
+    k = _RANK_ALIAS.get(_norm(raw))
+    if k:
+        return RANKABLES[k]
+    k = _RANK_ALIAS_STRIPPED.get(_norm(_strip_version(raw)))
+    if k:
+        return RANKABLES[k]
+    k = _resolve_key(raw)          # fall back to metric() / BENCHMARKS vocabulary
+    if k and k in RANKABLES:
+        return RANKABLES[k]
+    return None

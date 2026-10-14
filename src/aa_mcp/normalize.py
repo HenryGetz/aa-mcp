@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, fields
 
-__all__ = ["Model", "from_leaderboard", "from_chart", "from_legacy", "merge"]
+__all__ = ["Model", "from_chart", "from_leaderboard", "from_legacy", "merge"]
 
 
 @dataclass(slots=True)
@@ -217,7 +217,7 @@ def _pricing(rec) -> dict[str, float | None]:
 def from_leaderboard(rec: dict) -> Model:
     """Build a :class:`Model` from a ``/leaderboards/models`` row."""
     if not isinstance(rec, dict):
-        raise ValueError(f"from_leaderboard expects a mapping, got {type(rec).__name__}")
+        raise TypeError(f"from_leaderboard expects a mapping, got {type(rec).__name__}")
     slug = rec.get("slug") or ""
     name = rec.get("name") or slug
     creator, creator_slug = _creator(rec)
@@ -341,7 +341,7 @@ def _speed_chart(rec) -> dict[str, float | None]:
 def from_chart(rec: dict) -> Model:
     """Build a :class:`Model` from a model-page / eval-page chart record."""
     if not isinstance(rec, dict):
-        raise ValueError(f"from_chart expects a mapping, got {type(rec).__name__}")
+        raise TypeError(f"from_chart expects a mapping, got {type(rec).__name__}")
     slug = rec.get("slug") or ""
     name = rec.get("name") or slug
     creator, creator_slug = _creator(rec)
@@ -400,7 +400,7 @@ def from_chart(rec: dict) -> Model:
 def from_legacy(rec: dict) -> Model:
     """Build a :class:`Model` from a legacy ``currentModel`` object."""
     if not isinstance(rec, dict):
-        raise ValueError(f"from_legacy expects a mapping, got {type(rec).__name__}")
+        raise TypeError(f"from_legacy expects a mapping, got {type(rec).__name__}")
     slug = rec.get("slug") or ""
     name = rec.get("name") or slug
     creator, creator_slug = _creator(rec)

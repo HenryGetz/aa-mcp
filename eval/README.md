@@ -29,15 +29,23 @@ for token efficiency.
 - `questions_round2.md` — adversarial: ambiguous names, missing data, cross-source
   contradictions, cost/cache reasoning (12).
 - `questions_round3.md` — post-fix confirmation + cross-tool consistency (6).
+- `questions_round4.md` — comparison parity: the site's comparison pages, Pareto views,
+  domain search, YAML spec round-trip, and an attempt to find an unanswerable question (6).
+- `questions_round5.md` — final acceptance: the user's own list of 16 named benchmarks/views
+  plus comparison-URL parity and the completeness bar (20).
 
 ## Reports
 
 | file | what it is |
 |---|---|
 | `reports/fidelity.md` | independent field-by-field audit of the parsers against raw payloads (~85 KB, per-field verdict tables) |
+| `reports/audit_quality.md` | read-only code review: 20 prioritized findings with file:line, evidence and smallest fix |
+| `reports/adversarial.md` | hostile-usage report: 44 attacks (degenerate input, corrupt cache, gzip bomb, hanging upstream, concurrency, payload tampering) with repro commands and severities |
 | `runs/round1_a.md`, `round1_b.md` | round-1 agent reports (call logs + friction) |
 | `runs/round2_a.md`, `round2_b.md` | round-2 agent reports |
 | `runs/round3_q.md` | round-3 confirmation report |
+| `runs/round4_e.md` | round-4 comparison-parity report |
+| `runs/round5_f.md` | round-5 final acceptance report |
 
 ## Issues found and fixed through this loop
 
@@ -57,10 +65,16 @@ for token efficiency.
 | 3 | `aa_search "opus max"` returned nothing | tokenized AND matching in `select.search`/`filter_models` |
 | 3 | `aa_benchmarks {"query":"BFCL"}` returned fuzzy near-matches | explicit "AA does not track …" answers for 11 untracked benchmarks |
 | 3 | coverage labelled `chart set only` where 343 models are scored | live coverage labels driven by each benchmark's best surface |
+| quality audit | `aa_media` speech boards raised `NameError`; lower-is-better benchmarks ranked backwards; `value_rank` mutated shared models; the flight scan missed arrays starting with a reference; speech `open_weights` read a non-existent key | all fixed + regression tests (`tests/test_server.py`, `tests/test_flight.py`) |
+| adversarial | path traversal via `aa_raw kind=eval` wrote outside the cache dir; a 2 MB scraped name produced a ~500k-token reply; unbounded gzip decode; 121 s hang on a dead upstream; cache trusted blindly; 8 parallel cold calls fetched 2-4× | cache-name sanitisation + path containment; per-cell/response caps and markdown escaping; `AA_MAX_BYTES` decode cap; bounded timeouts without retry storms; cache metadata + plausibility validation; in-process single-flight |
+| 4 | comparison returned blank cells with no explanation and could not see chart-set scores (cyber/CWE) | per-cell missing footer, per-model coverage line, chart/panel score join in `aa_compare` and `aa_model` |
+| 5 | `Rankable.how` hints could be wrong (cyber index pointed at a call that errors); breakdown benchmarks raised `TypeError`; media/speech models were uncomparable | hints audited + static consistency test; honest error for container benchmarks; arena models resolvable and comparable |
 
 ## Reproducing the measurements quoted in the README
 
 ```bash
-.venv/bin/python eval/client.py bench        # ≈4.3k tokens for 13 calls, ≈330/call
-uv run pytest -q                             # 226 offline tests, no network
+.venv/bin/python eval/client.py bench        # per-call token cost for the whole surface
+.venv/bin/python scripts/surface_sweep.py    # ~220 live calls, every tool × every enum
+uv run pytest -q                             # offline tests, no network
+uvx ruff check .                             # lint (CI runs this)
 ```

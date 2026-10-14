@@ -299,6 +299,6 @@ def test_every_eval_numeric_benchmark_is_reachable(eval_records):
 
 @pytest.mark.parametrize("fn", [normalize.from_chart, normalize.from_legacy,
                                 normalize.from_leaderboard])
-def test_non_dict_records_raise_value_error(fn):
-    with pytest.raises(ValueError):
+def test_non_dict_records_raise_type_error(fn):
+    with pytest.raises(TypeError):
         fn("$e:props:children:0:props:currentModel")

@@ -136,8 +136,9 @@ def test_value_rank(models):
 
 def test_value_rank_skips_zero_cost():
     m = mk("free", intelligence=10, cost=0.0)
-    select.value_rank([m])
-    assert m.value is None
+    out = select.value_rank([m])
+    assert out[0].value is None
+    assert m.value is None              # the input object is never written to
 
 
 def test_pareto_frontier(models):
@@ -245,3 +246,87 @@ def test_filter_name_tokenizes_like_search():
     rows = select.filter_models(_TOKEN_MODELS, name="opus max")
     assert [m.slug for m in rows] == ["claude-opus-5-5"]
     assert select.filter_models(_TOKEN_MODELS, name="zzz") == []
+
+
+# --------------------------------------------------------------------------- #
+# Wave A: functional value pairs (audit H3) + finite numeric filters (A2)
+# --------------------------------------------------------------------------- #
+
+def test_value_rank_does_not_mutate_inputs(models):
+    before = [m.value for m in models]
+    out = select.value_rank(models, score_key="intelligence")
+    assert [m.value for m in models] == before          # inputs untouched
+    assert all(m is not orig for m, orig in zip(out, models, strict=False))   # copies, not aliases
+    by = {m.slug: m.value for m in out}
+    assert by["a-fast"] == pytest.approx(60.0)
+    assert by["b-cheap"] == pytest.approx(400.0)
+    assert by["d-old"] is None
+    assert any(m.value is not None for m in out)
+
+
+def test_value_pairs_is_functional_and_stable(models):
+    first = select.value_pairs(models, score_key="intelligence")
+    assert [id(m) for m, _ in first] == [
+        id(m) for m in models if m.intelligence is not None and m.cost_per_task
+    ]
+    values = {m.slug: v for m, v in first}
+    assert values["a-fast"] == pytest.approx(60.0)
+    assert values["b-cheap"] == pytest.approx(400.0)
+    assert values["c-open"] == pytest.approx(14.0)
+    # an intervening call with a different score key must not change the result
+    select.value_pairs(models, score_key="omniscience")
+    select.value_rank(models, score_key="omniscience")
+    second = select.value_pairs(models, score_key="intelligence")
+    assert [(m.slug, v) for m, v in second] == [(m.slug, v) for m, v in first]
+    assert all(m.value is None for m in models)          # nothing was written back
+
+
+def test_value_pairs_honours_cost_key(models):
+    pairs = select.value_pairs(models, score_key="tps", cost_key="ttft")
+    values = {m.slug: v for m, v in pairs}
+    assert values["a-fast"] == pytest.approx(100.0)
+    assert values["b-cheap"] == pytest.approx(100.0)
+    assert values["c-open"] == pytest.approx(5.0)
+
+
+def test_value_pairs_skips_missing_and_zero_cost():
+    ms = [mk("free", intelligence=10, cost=0.0),
+          mk("priceless", intelligence=10, cost=None),
+          mk("unscored", intelligence=None, cost=1.0),
+          mk("ok", intelligence=10, cost=2.0)]
+    assert [(m.slug, v) for m, v in select.value_pairs(ms)] == [("ok", 5.0)]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"min_intelligence": float("nan")},
+    {"max_cost_per_task": float("nan")},
+    {"min_speed": float("inf")},
+    {"max_ttft": float("-inf")},
+    {"min_context": float("nan")},
+    {"min_score": float("nan")},
+])
+def test_non_finite_filters_raise(models, kwargs):
+    key = next(iter(kwargs))
+    with pytest.raises(ValueError) as ei:
+        select.filter_models(models, **kwargs)
+    assert key in str(ei.value)
+
+
+def test_finite_filters_still_work(models):
+    assert [m.slug for m in select.filter_models(models, min_intelligence=50)] == [
+        "a-fast", "c-open",
+    ]
+
+
+def test_better_desc_follows_catalog_direction():
+    assert select.better_desc("intelligence") is True
+    assert select.better_desc("cost_per_task") is False
+    assert select.better_desc("omniscienceHallucinationRate") is False
+    assert select.better_desc("not-a-metric") is True
+
+
+def test_lookup_finds_attribute_backed_identity_fields():
+    m = mk("attr", intelligence=10, cost=1.0)
+    assert select.lookup(m, "modalities_in") == ()
+    assert select.lookup(m, "weights_url") is None
+    assert select.lookup(m, "context_tokens") is None

@@ -48,7 +48,7 @@ BENCH_PANEL: list[tuple[str, dict]] = [
 ]
 
 
-def _server_params(argv_env: list[str]) -> "object":
+def _server_params(argv_env: list[str]) -> object:
     from mcp import StdioServerParameters
 
     env = dict(os.environ)
@@ -101,6 +101,17 @@ def _result_text(result) -> str:
 def cmd_tools(session) -> str:
     listing = asyncio.run(session)
     return listing
+
+
+def _clean(obj):
+    """Drop lone surrogates so a hostile argument cannot break the JSON wire."""
+    if isinstance(obj, str):
+        return obj.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(obj, dict):
+        return {k: _clean(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_clean(v) for v in obj]
+    return obj
 
 
 def main() -> int:
@@ -175,7 +186,7 @@ def main() -> int:
         return 0
 
     if a.cmd == "prompt":
-        args = json.loads(a.args)
+        args = _clean(json.loads(a.args))
 
         async def go(session):
             res = await session.get_prompt(a.name, args)
@@ -185,7 +196,7 @@ def main() -> int:
         return 0
 
     if a.cmd == "call":
-        args = json.loads(a.args)
+        args = _clean(json.loads(a.args))
 
         async def go(session):
             t0 = time.time()
@@ -211,7 +222,7 @@ def main() -> int:
                 result = await session.call_tool(tool, args)
                 text = _result_text(result)
                 err = bool(result.is_error)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 text, err, result = f"EXC {type(exc).__name__}: {exc}", True, None
             ms = round((time.time() - t0) * 1000)
             rec = {"kind": "bench", "tool": tool, "args": args, "ms": ms,

@@ -21,7 +21,7 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from aa_mcp import reference  # noqa: E402
+from aa_mcp import reference
 
 TARGET = REPO / "docs" / "REFERENCE.md"
 

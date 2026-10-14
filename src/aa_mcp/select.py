@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import math
+from dataclasses import replace
+
 from . import catalog
 from .catalog import VALUE_SOURCE
 from .normalize import Model
 
 __all__ = [
-    "filter_models",
-    "sort_models",
-    "value_rank",
-    "pareto",
-    "search",
-    "resolve",
     "AmbiguousError",
+    "better_desc",
+    "filter_models",
+    "pareto",
+    "resolve",
+    "search",
+    "sort_models",
+    "value_pairs",
+    "value_rank",
 ]
 
 
@@ -64,6 +69,25 @@ def lookup(model: Model, key: str):
     return None
 
 
+def better_desc(key: str) -> bool:
+    """Whether higher is better for ``key`` (unknown metrics: higher).
+
+    Rank lower-is-better evaluations (hallucination/refusal rates, cost, TTFT)
+    the right way round: ``pairs.sort(key=…, reverse=better_desc(key))``.
+    """
+    m = catalog.metric(key)
+    return not (m is not None and m.better == "low")
+
+
+def _finite(value, name: str):
+    """Reject ``NaN``/``inf`` filters: they compare False and silently no-op."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {value!r}")
+    return value
+
+
 # --------------------------------------------------------------------------- #
 # filter / sort
 # --------------------------------------------------------------------------- #
@@ -85,6 +109,23 @@ def filter_models(
     min_score=None,
     score_key=None,
 ) -> list[Model]:
+    numeric = {
+        key: _finite(value, key)
+        for key, value in (
+            ("min_intelligence", min_intelligence),
+            ("max_cost_per_task", max_cost_per_task),
+            ("min_speed", min_speed),
+            ("max_ttft", max_ttft),
+            ("min_context", min_context),
+            ("min_score", min_score),
+        )
+    }
+    min_intelligence = numeric["min_intelligence"]
+    max_cost_per_task = numeric["max_cost_per_task"]
+    min_speed = numeric["min_speed"]
+    max_ttft = numeric["max_ttft"]
+    min_context = numeric["min_context"]
+    min_score = numeric["min_score"]
     cn = _norm(creator) if creator else None
     name_tokens = _tokens(name) if name else None
     out: list[Model] = []
@@ -140,11 +181,10 @@ def sort_models(models, key: str, *, desc: bool | None = None) -> list[Model]:
 
     ``None`` values always sort last, regardless of direction. When ``desc`` is
     omitted it follows the metric's ``better`` hint (high -> descending,
-    low -> ascending).
+    low -> ascending, via :func:`better_desc`).
     """
     if desc is None:
-        m = catalog.metric(key)
-        desc = not (m is not None and m.better == "low")
+        desc = better_desc(key)
 
     present: list[tuple] = []
     missing: list[Model] = []
@@ -162,18 +202,43 @@ def sort_models(models, key: str, *, desc: bool | None = None) -> list[Model]:
 # value / frontier
 # --------------------------------------------------------------------------- #
 
-def value_rank(models, *, score_key: str = "intelligence") -> list[Model]:
-    """Populate ``model.value`` with ``score / cost_per_task`` where meaningful."""
-    out = []
+def value_pairs(
+    models,
+    *,
+    score_key: str = "intelligence",
+    cost_key: str = "cost_per_task",
+) -> list[tuple[Model, float]]:
+    """``[(model, score / cost)]`` for every model where that ratio is meaningful.
+
+    Functional and non-mutating: the models passed in are never touched, so two
+    calls with the same arguments return the same pairs no matter what else ran
+    in between (``Model`` objects are memoized and shared across tool calls).
+    """
+    pairs: list[tuple[Model, float]] = []
     for m in models:
         score = lookup(m, score_key)
-        cost = m.cost_per_task
-        if score is not None and cost is not None and cost > 0:
-            m.value = score / cost
-        else:
-            m.value = None
-        out.append(m)
-    return out
+        cost = lookup(m, cost_key)
+        if score is None or cost is None or cost <= 0:
+            continue
+        pairs.append((m, score / cost))
+    return pairs
+
+
+def value_rank(
+    models,
+    *,
+    score_key: str = "intelligence",
+    cost_key: str = "cost_per_task",
+) -> list[Model]:
+    """Copies of ``models`` with ``.value`` set to ``score / cost_per_task``.
+
+    Callers must not rely on mutation: the returned list holds *new* objects
+    (:func:`dataclasses.replace`) and the inputs keep ``value`` untouched, so the
+    frontier "knee" cannot be reordered by a previous call (audit H3).
+    **Deprecated** in favour of :func:`value_pairs` for new code.
+    """
+    scores = {id(m): value for m, value in value_pairs(models, score_key=score_key, cost_key=cost_key)}
+    return [replace(m, value=scores.get(id(m))) for m in models]
 
 
 def pareto(

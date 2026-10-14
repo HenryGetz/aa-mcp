@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import threading
 import time
 
 import pytest
@@ -55,8 +56,14 @@ def test_leaderboard_array_by_required_keys():
 
 def test_find_array_min_len_and_lookup_error():
     p = flight.payload(_read("model_page_legacy.rsc"))
+    # the legacy page's ref arrays lead with a club of "…:models:<N>" strings;
+    # the first *dict* element is what the scan probes (audit H4).
+    chart = flight.find_array(p, ["chartDefaultSelected", "releaseDate", "suffix"])
+    assert len(chart) == 700
+    assert isinstance(chart[0], str) and chart[1]["slug"]
+    assert len(flight.find_array(p, ["intelligenceIndex"])) == 700
     with pytest.raises(LookupError):
-        flight.find_array(p, ["intelligenceIndex"], min_len=5)
+        flight.find_array(p, ["intelligenceIndex"], min_len=5000)
     with pytest.raises(LookupError):
         flight.find_array(p, ["definitelyNotAKey"])
 
@@ -198,3 +205,80 @@ def test_jsonld_raw_rsc_fallback():
 def test_text_strip_tags():
     assert flight.text_strip_tags("<p>Hello&nbsp;  <b>world</b></p>") == "Hello world"
     assert flight.text_strip_tags("") == ""
+
+
+# --------------------------------------------------------------------------- #
+# content-addressed memos
+# --------------------------------------------------------------------------- #
+
+def test_payload_memo_only_wraps_the_html_join():
+    flight._clear_memos()
+    raw_a = _read("leaderboard.rsc")
+    raw_b = _read("leaderboard.rsc")
+    assert raw_a is not raw_b
+    # raw RSC passes straight through, so each caller keeps its own object
+    assert flight.payload(raw_a) is raw_a
+    assert flight.payload(raw_b) is raw_b
+
+    chunk = '0:[{"a":1}]'
+    html = "<script>self.__next_f.push(" + json.dumps([1, chunk]) + ")</script>"
+    joined = flight.payload(html)
+    assert joined == chunk
+    assert flight.payload(html) is joined   # the HTML join is memoised
+
+
+def test_scan_memo_is_content_addressed():
+    flight._clear_memos()
+    # same length, same keys, different content: the entries must not be shared
+    p1 = '0:[{"k":1,"v":"a"}]'
+    p2 = '0:[{"k":2,"v":"a"}]'
+    assert len(p1) == len(p2)
+    assert flight.find_array(p1, ["k", "v"])[0]["k"] == 1
+    assert flight.find_array(p2, ["k", "v"])[0]["k"] == 2
+
+
+def test_scan_memo_reuses_the_decoded_array_and_rescans_on_change():
+    flight._clear_memos()
+    page = '0:[{"k":1,"v":"a"}]'
+    first = flight.find_array(page, ["k", "v"])
+    assert flight.find_array(page, ["k", "v"]) is first          # served from the memo
+    # a payload whose content changed (refresh) must be re-scanned
+    changed = '0:[{"k":9,"v":"a"}]'
+    assert flight.find_array(changed, ["k", "v"])[0]["k"] == 9
+
+
+def test_find_array_and_find_arrays_share_one_decoded_copy():
+    flight._clear_memos()
+    page = '0:[{"k":1,"v":"a"}]'
+    arrays = flight.find_arrays(page, ["k", "v"])
+    assert flight.find_array(page, ["k", "v"]) is arrays[0]
+    assert len(flight._SCAN_MEMO._entries) == 1
+
+
+def test_scan_memo_is_bounded():
+    flight._clear_memos()
+    for i in range(flight._MEMO_MAXSIZE * 3):
+        flight.find_arrays(f'0:[{{"k":{i}}}]', ["k"])
+    assert len(flight._SCAN_MEMO._entries) <= flight._MEMO_MAXSIZE
+
+
+def test_memo_publication_is_thread_safe():
+    memo = flight._Memo(8, 1024 * 1024)
+    errors: list[BaseException] = []
+
+    def worker(n: int) -> None:
+        try:
+            for i in range(500):
+                memo.put((n % 16, i), [i], 16)
+                memo.get((n % 16, i))
+        except BaseException as exc:  # pragma: no cover - a race would surface here
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert not errors
+    assert len(memo._entries) <= 8
+    assert memo._bytes <= 1024 * 1024

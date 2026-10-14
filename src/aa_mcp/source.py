@@ -28,7 +28,7 @@ _lock = threading.Lock()
 _probe_cache: tuple[bool, str] | None = None
 _downgrade_logged = False
 
-__all__ = ["api_key", "active_source", "probe_api", "source_label"]
+__all__ = ["active_source", "api_key", "probe_api", "source_label"]
 
 
 def api_key() -> str | None:
@@ -62,7 +62,7 @@ def probe_api(refresh: bool = False) -> tuple[bool, str]:
             _probe_cache = (False, f"auth:{getattr(exc, 'status', 401)}")
         except AAFetchError as exc:
             _probe_cache = (False, f"error:{exc}")
-        except Exception as exc:  # noqa: BLE001 - probe must never escape
+        except Exception as exc:
             _probe_cache = (False, f"error:{exc}")
         return _probe_cache
 
