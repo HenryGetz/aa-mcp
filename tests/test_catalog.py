@@ -193,3 +193,44 @@ def test_newly_registered_benchmark_metrics():
         assert bench is not None, key
         metric = catalog.metric(key)
         assert metric is not None and metric.kind == kind and metric.better == better
+
+
+# --------------------------------------------------------------------------- #
+# T8: benchmark source hints + untracked benchmarks
+# --------------------------------------------------------------------------- #
+
+
+def test_source_hint_classification():
+    expect = {
+        "gpqa": "leaderboard",
+        "intelligence": "leaderboard",
+        "livecodebench": "rich",
+        "briefcaseElo": "rich",
+        "aime25": "rich",
+        "capabilities.legal": "rich",
+        "coding": "api",
+        "agentic": "api",
+        "mmluPro": "chart",
+        "wildguardtest": "chart",
+    }
+    for key, hint in expect.items():
+        assert catalog.BENCHMARKS[key].source_hint == hint, key
+
+
+def test_source_hint_values_are_known_and_counted():
+    from collections import Counter
+
+    hints = Counter(b.source_hint for b in catalog.BENCHMARKS.values())
+    assert set(hints) <= {"leaderboard", "rich", "api", "chart"}
+    assert hints["leaderboard"] == 20
+    assert hints["api"] == 2
+    assert hints["rich"] + hints["chart"] + hints["leaderboard"] + hints["api"] == len(catalog.BENCHMARKS)
+
+
+def test_untracked_benchmarks_notes_are_factual():
+    for key in ("mathvista", "docvqa", "bfcl", "berkeley function calling",
+                "human eval", "humaneval", "mbpp", "chatbot arena",
+                "lmsys arena", "mt-bench", "alpaca eval"):
+        note = catalog.UNTRACKED_BENCHMARKS[key]
+        assert note.startswith("AA does not track")
+        assert len(note) > 40

@@ -68,8 +68,10 @@ Register with an MCP client (omp, Claude Code, Codex, …):
 | `aa_reference` | metric definitions, index composition, field names, provenance |
 | `aa_raw` | raw JSON escape hatch for anything the tables do not cover |
 
-Resources: `aa://reference/metrics`, `aa://reference/fields`, `aa://benchmarks`,
-`aa://sources`. Prompts: `best_model_for_task`, `compare_models`.
+Resources: `aa://reference/metrics` (full definitions), one per topic
+(`overview`, `indexes`, `benchmarks`, `pricing`, `speed`, `providers`, `media`,
+`fields`, `sources`), `aa://benchmarks` (catalog JSON) and `aa://sources`.
+Prompts: `best_model_for_task`, `compare_models`.
 
 ### Token discipline
 
@@ -79,11 +81,45 @@ Resources: `aa://reference/metrics`, `aa://reference/fields`, `aa://benchmarks`,
   unless the agent asks for it.
 - `aa_raw` warns when used.
 
-Example (real output):
+Measured live (13-call panel covering every tool): **≈4.3k tokens total, ≈330 per
+call**, e.g. a 5-row leaderboard is ~180 tokens, a full model digest ~470, a media
+board ~160, the 67-entry benchmark catalog ~1.1k.
+
+Example — `aa_leaderboard {"mode":"value","top":5}` (verbatim):
 
 ```text
-<!-- filled from the live smoke test -->
+# 5 of 109 scored by value (700 tracked) · value = Intel per $/task, active only · 49m ago · aa:rsc + rich dataset
+| Model | Slug | Creator | Intel | $/Task | tok/s | TTFT | Ctx | Intel/$ |
+|---|---|---|---|---|---|---|---|---|
+| GPT-6 Luna (Low) | gpt-6-luna-low | OpenAI | 21.5 | $0.0045 | 121.9 | 2.6s | 1.0M | 4766.0 |
+| GPT-6 Luna (Medium) | gpt-6-luna-medium | OpenAI | 29.9 | $0.02 | - | - | 1.0M | 1712.3 |
+| GPT-6 Luna (Non-reasoning) | gpt-6-luna-non-reasoning | OpenAI | 18.5 | $0.01 | 111.2 | 0.9s | 1.0M | 1627.8 |
+| Granite 4.2 3B | granite-4-2-3b | IBM | 9.1 | $0.0060 | 215.4 | 0.5s | 131k | 1513.0 |
+| Claude Haiku 5.5 (Low) | claude-haiku-5-5-low | Anthropic | 29.5 | $0.02 | 151.6 | 9.1s | 1.0M | 1204.1 |
+— 514 rows skipped: no measured cost per task (AA has cost per task for 186/700 variants)
 ```
+
+## Coverage and limits
+
+Covered: 700 model variants × ~50 leaderboard metrics **merged with** a 700 × 94
+dataset (capability indexes, AA-Briefcase/GDPval Elo, AIME, LiveCodeBench, GDP.pdf,
+AutomationBench, Harvey LAB, MLCR, cost breakdowns, per-eval costs, licenses, effort
+labels); per-model digests with prompt-type speed breakdowns; 1,201 provider endpoints
+across 64 hosts with prices, quantization, latency and feature flags; 9 media arenas
+plus speech-to-text / streaming / realtime voice; AA's coding-agent, chatbot and
+search-API boards; a 67-entry benchmark catalog with descriptions, units and live
+coverage.
+
+Deliberately out of scope (and the server says so instead of guessing):
+
+- Benchmarks AA does not track (MathVista, DocVQA, BFCL) — no data exists.
+- Cross-model *signature* leaderboards for benchmarks AA only exposes as a chart
+  subset: the tool labels these `not a full leaderboard` and reports real coverage.
+- Coding/Agentic indexes need the JSON API (`AA_API_KEY`).
+- Performance-over-time history and raw per-provider measurements are Commercial-tier
+  API features; not implemented.
+- Image/video/music *model detail* pages (per-family specs beyond arena rows) and
+  hardware/inference-stack pages are not exposed.
 
 ## Environment
 

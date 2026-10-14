@@ -216,6 +216,8 @@ def _pricing(rec) -> dict[str, float | None]:
 
 def from_leaderboard(rec: dict) -> Model:
     """Build a :class:`Model` from a ``/leaderboards/models`` row."""
+    if not isinstance(rec, dict):
+        raise ValueError(f"from_leaderboard expects a mapping, got {type(rec).__name__}")
     slug = rec.get("slug") or ""
     name = rec.get("name") or slug
     creator, creator_slug = _creator(rec)
@@ -338,6 +340,8 @@ def _speed_chart(rec) -> dict[str, float | None]:
 
 def from_chart(rec: dict) -> Model:
     """Build a :class:`Model` from a model-page / eval-page chart record."""
+    if not isinstance(rec, dict):
+        raise ValueError(f"from_chart expects a mapping, got {type(rec).__name__}")
     slug = rec.get("slug") or ""
     name = rec.get("name") or slug
     creator, creator_slug = _creator(rec)
@@ -351,6 +355,9 @@ def from_chart(rec: dict) -> Model:
         evals["briefcaseElo"] = briefcase_elo
 
     indices = {"omniscience": _num(rec.get("omniscience"))}
+    openness = rec.get("openness")
+    if isinstance(openness, dict):
+        indices["openness"] = _num(openness.get("opennessIndex"))
     indices.update(_capability_indices(rec))
 
     total, breakdown, per_eval = _cost_fields(rec)
@@ -392,6 +399,8 @@ def from_chart(rec: dict) -> Model:
 
 def from_legacy(rec: dict) -> Model:
     """Build a :class:`Model` from a legacy ``currentModel`` object."""
+    if not isinstance(rec, dict):
+        raise ValueError(f"from_legacy expects a mapping, got {type(rec).__name__}")
     slug = rec.get("slug") or ""
     name = rec.get("name") or slug
     creator, creator_slug = _creator(rec)

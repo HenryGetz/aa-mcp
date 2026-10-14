@@ -204,3 +204,44 @@ def test_resolve_candidates_capped(models):
     with pytest.raises(select.AmbiguousError) as ei:
         select.resolve(many, "model")
     assert len(ei.value.candidates) == 8
+
+
+# --------------------------------------------------------------------------- #
+# T8: tokenized search / name filter
+# --------------------------------------------------------------------------- #
+
+_TOKEN_MODELS = [
+    mk("claude-opus-5-5", name="Claude Opus 5.5 (Max, Default Fallback)",
+       short="Claude Opus 5.5 (max with fallback)", creator="Anthropic", intelligence=57.6),
+    mk("claude-opus-5-5-xhigh", name="Claude Opus 5.5 (Xhigh, Default Fallback)",
+       creator="Anthropic", intelligence=56.0),
+    mk("gemini-4-argon", name="Gemini 4 Argon (high)", creator="Google", intelligence=61.0),
+    mk("kimi-k3", name="Kimi K3 (Max)", creator="Moonshot", intelligence=43.6),
+]
+
+
+def test_search_tokenizes_multi_word_query():
+    hits = select.search(_TOKEN_MODELS, "opus max")
+    assert hits and hits[0].slug == "claude-opus-5-5"
+    # every token must match; the Xhigh variant has no "max"
+    assert all(m.slug != "claude-opus-5-5-xhigh" for m in hits)
+
+
+def test_search_resolves_noncontiguous_name():
+    hits = select.search(_TOKEN_MODELS, "gemini 4 argon")
+    assert [m.slug for m in hits] == ["gemini-4-argon"]
+
+
+def test_search_unknown_token_returns_nothing():
+    assert select.search(_TOKEN_MODELS, "zzz") == []
+
+
+def test_search_single_token_unchanged():
+    assert select.search(_TOKEN_MODELS, "opus")[0].slug == "claude-opus-5-5"
+    assert select.search(_TOKEN_MODELS, "kimi-k3")[0].slug == "kimi-k3"
+
+
+def test_filter_name_tokenizes_like_search():
+    rows = select.filter_models(_TOKEN_MODELS, name="opus max")
+    assert [m.slug for m in rows] == ["claude-opus-5-5"]
+    assert select.filter_models(_TOKEN_MODELS, name="zzz") == []

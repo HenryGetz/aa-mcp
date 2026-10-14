@@ -15,6 +15,7 @@ import functools
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Any, Iterable, Sequence
@@ -36,8 +37,27 @@ _OFFLINE_ON = ("1", "true", "yes", "on")
 # --------------------------------------------------------------------------- #
 
 
-def _split(csv: str) -> list[str]:
-    return [part.strip() for part in (csv or "").split(",") if part.strip()]
+def _split(csv: Any) -> list[str]:
+    """Split a comma string, a JSON-ish array string, or an actual list.
+
+    ``fields``/``sections``/``metrics`` accept ``"a,b"``, ``'["a","b"]'`` and
+    ``["a", "b"]`` so a caller never has to guess the parameter type.
+    """
+    if csv is None:
+        return []
+    if isinstance(csv, (list, tuple, set)):
+        return [str(part).strip() for part in csv if str(part).strip()]
+    text = str(csv).strip()
+    if not text:
+        return []
+    if text[0] in "[(":
+        try:
+            seq = json.loads(text.replace("'", '"'))
+        except ValueError:
+            seq = None
+        if isinstance(seq, (list, tuple)):
+            return [str(part).strip() for part in seq if str(part).strip()]
+    return [part.strip() for part in text.split(",") if part.strip()]
 
 
 def _txt(value: Any) -> str:
@@ -103,22 +123,34 @@ def _lb_cache() -> tuple[str, bool]:
 
 
 def _header(
-    total: int | None,
-    shown: int,
+    total: int | None = None,
+    shown: int = 0,
     note: str = "",
     *,
+    count: str | None = None,
     name: str = "",
     api: bool = False,
     source_label: str | None = None,
 ) -> str:
+    """One-line header. ``count`` overrides the ``shown/total`` left-hand text.
+
+    The default ``15/700`` shape reads as "15 of 700", so callers that know the
+    match count pass ``count=`` (e.g. ``"15 shown of 270 matching (700 tracked)"``).
+    """
     as_of: float | None = None
     if name:
         as_of, stale = _fresh(name, api=api)
         if stale and as_of is not None:
             note = (f"{note} · stale: {render.ago(as_of)}").strip(" ·")
             as_of = None
-    return render.header(total, shown, note=note,
-                         source=source_label or _source_key(), as_of=as_of)
+    body = count if count is not None else (
+        str(shown) if total is None else f"{shown}/{total}")
+    left = f"{body} · {note}" if note else body
+    parts = [f"# {left.strip(' ·')}"]
+    if as_of is not None:
+        parts.append(render.ago(as_of))
+    parts.append(f"aa:{source_label or _source_key()}")
+    return " · ".join(parts)
 
 
 def _close(query: str, pool: Iterable[str], n: int = 5) -> list[str]:
@@ -130,6 +162,34 @@ def _close(query: str, pool: Iterable[str], n: int = 5) -> list[str]:
     return hits
 
 
+#: server-side aliases that catalog.py does not carry (capability + speech forms)
+_EXTRA_ALIASES: dict[str, str] = {
+    "caplegal": "capabilities.legal",
+    "legalindex": "capabilities.legal",
+    "legalcapability": "capabilities.legal",
+    "capmedical": "capabilities.healthcareAndMedical",
+    "medicalindex": "capabilities.healthcareAndMedical",
+    "healthcareindex": "capabilities.healthcareAndMedical",
+    "healthcaremedicalindex": "capabilities.healthcareAndMedical",
+    "capfinance": "capabilities.financeAndAccounting",
+    "financeindex": "capabilities.financeAndAccounting",
+    "financeaccountingindex": "capabilities.financeAndAccounting",
+    "capstrategy": "capabilities.strategyAndOps",
+    "strategyindex": "capabilities.strategyAndOps",
+    "strategyopsindex": "capabilities.strategyAndOps",
+    "capengineer": "capabilities.engineering",
+    "capengineering": "capabilities.engineering",
+    "engineeringindex": "capabilities.engineering",
+    "capeconomic": "capabilities.economics",
+    "capeconomics": "capabilities.economics",
+    "economicsindex": "capabilities.economics",
+}
+
+
+def _norm_alias(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text).lower())
+
+
 def _metric_key(name: str, what: str = "metric") -> str:
     m = catalog.metric(name)
     if m is not None:
@@ -137,7 +197,10 @@ def _metric_key(name: str, what: str = "metric") -> str:
     b = catalog.benchmark(name)
     if b is not None:
         return b.key
-    pool = list(catalog.METRICS) + list(catalog.FIELD_ALIASES)
+    extra = _EXTRA_ALIASES.get(_norm_alias(name))
+    if extra is not None:
+        return extra
+    pool = list(catalog.METRICS) + list(catalog.FIELD_ALIASES) + list(_EXTRA_ALIASES)
     near = ", ".join(_close(name, pool))
     raise ValueError(
         f"unknown {what} {name!r} — closest: {near}\n"
@@ -181,17 +244,28 @@ def _tool(fn):
             raise ToolError(str(exc)) from exc
         except ValueError as exc:
             raise ToolError(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001 - last-resort boundary, never leak a traceback
+            raise ToolError(
+                f"{fn.__name__} failed: {type(exc).__name__}: {exc}\n"
+                "— retry once; if it persists, report the tool name and arguments"
+            ) from exc
 
     return wrapper
 
 
-def _cols(default: Sequence[tuple[str, str]], fields: str,
-          extra: Iterable[str] = ()) -> list[tuple[str, str]]:
-    """Column list from ``fields`` (metric aliases, plus any non-metric ``extra``)."""
+def _cols(default: Sequence[tuple[str, str]], fields: Any,
+          extra: Iterable[str] = (),
+          identity: Sequence[tuple[str, str]] = ()) -> list[tuple[str, str]]:
+    """Column list from ``fields`` (metric aliases, plus any non-metric ``extra``).
+
+    ``identity`` columns (Model/Slug/Host/...) are always rendered first, even
+    when ``fields`` names only metrics, so a requested table is never anonymous.
+    """
     if not fields:
         return list(default)
     extra = set(extra)
     out: list[tuple[str, str]] = []
+    keys: set[str] = set()
     for name in _split(fields):
         try:
             key = _metric_key(name, "field")
@@ -199,9 +273,13 @@ def _cols(default: Sequence[tuple[str, str]], fields: str,
             if name not in extra:
                 raise
             key = name
+        if key in keys:
+            continue
+        keys.add(key)
         metric = catalog.metric(key)
         out.append((key, metric.label if metric else name.replace("_", " ").title()))
-    return out
+    prefix = [(k, label) for k, label in identity if k not in keys]
+    return prefix + out
 
 
 def _model_cells(model: Model, cols: Sequence[tuple[str, str]]) -> list[str]:
@@ -229,11 +307,26 @@ def _trim(headers: Sequence[str], rows: Sequence[Sequence[str]]
 
 
 def _table_block(head: str, headers: Sequence[str], rows: Sequence[Sequence[str]],
-                 empty: str = "no values to show for the selected columns") -> str:
-    """Header + a markdown table with all-null columns removed."""
-    headers, rows = _trim(headers, rows)
-    if not headers:
+                 *, trim: bool = True, empty: str = "no values to show") -> str:
+    """Header + a markdown table.
+
+    ``trim`` drops all-null columns — but only for *default* column sets; an
+    explicit ``fields=`` list is always rendered (with ``-`` for nulls) so a
+    caller can tell "no data" from "wrong field name".
+    """
+    headers = list(headers)
+    rows = [list(row) for row in rows]
+    if not rows:
         return f"{head}\n— {empty}"
+    if trim:
+        headers, rows = _trim(headers, rows)
+        if not headers:
+            return f"{head}\n— {empty}"
+    else:
+        all_null = [headers[i] for i in range(len(headers))
+                    if all(str(row[i]).strip() in ("", "-") for row in rows)]
+        if all_null:
+            head += f"\n— no data for: {', '.join(all_null)} (shown as -)"
     return f"{head}\n{render.table(headers, rows)}"
 
 
@@ -293,6 +386,113 @@ def _missing_notes(
     return lines
 
 
+def _rich_models(refresh: bool = False) -> list[Model]:
+    """The optional 699-model rich dataset (loaders.rich_dataset), or ``[]``.
+
+    Defensive: the loader may not exist yet (another agent's slice) or may fail;
+    callers simply fall back to the leaderboard/chart sources.
+    """
+    fn = getattr(loaders, "rich_dataset", None)
+    if not callable(fn):
+        return []
+    try:
+        return list(fn(refresh=refresh) or [])
+    except Exception:  # pragma: no cover - best-effort enrichment
+        return []
+
+
+def _mtime(*names: str) -> tuple:
+    """Cache-file mtimes for the given cache names (``None`` when absent)."""
+    out = []
+    for name in names:
+        stamp = None
+        for ext in (".rsc", ".html", ".json"):
+            path = fetch.cache_dir() / f"{name}{ext}"
+            try:
+                if path.exists():
+                    stamp = path.stat().st_mtime
+                    break
+            except OSError:
+                continue
+        out.append(stamp)
+    return tuple(out)
+
+
+#: memo: (key, merged models, rich overlay contributed?)
+_MODELS_MEMO: tuple[tuple, list[Model], bool] | None = None
+
+
+def _models_state(refresh: bool = False) -> tuple[list[Model], bool]:
+    """``(models, rich_used)`` — the 700 leaderboard rows with the rich overlay merged.
+
+    The leaderboard row is the base and the rich record (same slug) is merged over
+    it, so rich-only fields (license, effort, params, capabilities.*, aime25,
+    livecodebench, per-eval cost) become available while leaderboard-only fields
+    (isOpenWeights, omniscience*, itbenchSre, the speed snapshot) are kept.
+    Memoised on the cache mtimes so a tool call does not re-merge 700 records.
+    """
+    global _MODELS_MEMO
+    lb_name, _api = _lb_cache()
+    lb = loaders.leaderboard(refresh=refresh)
+    key = (len(lb), _mtime(lb_name, "rich_dataset"))
+    memo = _MODELS_MEMO
+    if memo is not None and not refresh and memo[0] == key:
+        return memo[1], memo[2]
+
+    rich = _rich_models(refresh)
+    if rich:
+        overlay = {m.slug: m for m in rich}
+        merged = [normalize.merge(m, overlay[m.slug]) if m.slug in overlay else m
+                  for m in lb]
+        used = True
+    else:
+        merged = list(lb)
+        used = False
+    _MODELS_MEMO = (key, merged, used)
+    return merged, used
+
+
+def _models(refresh: bool = False) -> list[Model]:
+    return _models_state(refresh)[0]
+
+
+def _models_rich(refresh: bool = False) -> bool:
+    return _models_state(refresh)[1]
+
+
+def _prov_label(rich_used: bool, source_key: str | None = None) -> str:
+    base = source_key or _source_key()
+    return f"{base} + rich dataset" if rich_used else base
+
+
+
+def _is_index_key(key: str) -> bool:
+    return key.startswith("capabilities.") or key in ("coding", "agentic")
+
+
+def _no_rank_text(key: str, label: str) -> str:
+    if _is_index_key(key):
+        return (
+            f"{label!r}: AA exposes this index per model only on the scrape source "
+            "(model pages) and through the JSON API (AA_API_KEY) — there is no "
+            "cross-model ranking to sort by.\n"
+            "— read one model with aa_model <slug>, or set AA_API_KEY; "
+            "aa_benchmark_leaderboard has no slug for these."
+        )
+    if catalog.benchmark(key) is None:
+        return (
+            f"{label!r} has no values in the 700-row leaderboard — it lives on the "
+            "model page only.\n"
+            "— read it with aa_model <slug>."
+        )
+    return (
+        f"{label!r} has no values in the 700-row leaderboard — it is chart-set / "
+        "model-page only.\n"
+        "— rank it with aa_benchmark_leaderboard benchmark=<slug>, or read one model "
+        "with aa_model <slug>."
+    )
+
+
 def _resolve_slug(query: str, models: Sequence[Model]) -> Model:
     try:
         return select.resolve(models, query)
@@ -316,6 +516,12 @@ _LB_COLS = [
     ("intelligence", "Intel"), ("cost_per_task", "$/Task"),
     ("tps", "tok/s"), ("ttft", "TTFT"), ("context_tokens", "Ctx"),
 ]
+#: fields accepted in `fields=` that are not leaderboard metrics (shown as `-`)
+_LB_EXTRA = ("precision",)
+#: identity columns always rendered, before any requested `fields=`
+_LB_IDENTITY = [("name", "Model"), ("slug", "Slug")]
+_BENCH_IDENTITY = [("name", "Model"), ("slug", "Slug")]
+_PROV_IDENTITY = [("host", "Host"), ("model_name", "Model")]
 
 
 def _leaderboard(
@@ -343,7 +549,8 @@ def _leaderboard(
     n = top if isinstance(top, int) and top > 0 else 10
     sort_key = _metric_key(sort, "sort")
 
-    all_models = loaders.leaderboard(refresh=refresh)
+    all_models = _models(refresh)
+    rich_used = _models_rich(refresh)
     models = select.filter_models(
         all_models,
         creator=creator or None,
@@ -365,11 +572,19 @@ def _leaderboard(
         released_after=released_after, include_deprecated=include_deprecated,
     )
     label = catalog.metric(sort_key).label
-    note = f"models · {label}, {where}"
     cache_name, api = _lb_cache()
+    explicit = any((creator, name, open_weights is not None, reasoning is not None,
+                    min_intelligence is not None, max_cost_per_task is not None,
+                    min_speed is not None, max_ttft is not None,
+                    min_context is not None, released_after))
 
     if not models:
         return f"# no models match {where} — drop one filter"
+
+    # A sort key the merged source cannot supply must explain itself, never
+    # silently reorder (the rich overlay already covers capability/Elo fields).
+    if not any(select.lookup(m, sort_key) is not None for m in models):
+        raise ValueError(_no_rank_text(sort_key, label))
 
     footnotes: list[str] = _missing_notes(all_models, [
         ("intelligence", "intelligence", min_intelligence is not None),
@@ -380,11 +595,12 @@ def _leaderboard(
     ])
     if mode == "value":
         ranked = select.value_rank(models, score_key=sort_key)
-        ranked.sort(key=lambda m: m.value if m.value is not None else float("-inf"),
-                    reverse=True)
+        ranked = [m for m in ranked if m.value is not None]
+        ranked.sort(key=lambda m: m.value, reverse=True)
         models = ranked
-        cols = _cols(_LB_COLS + [("value", "Intel/$")], fields)
-        note = f"models · value = {label} per $/task, {where}"
+        cols = _cols(_LB_COLS + [("value", "Intel/$")], fields, _LB_EXTRA, _LB_IDENTITY)
+        note = f"value = {label} per $/task, {where}"
+        footnotes += _missing_notes(all_models, [("cost_per_task", "cost per task", True)])
     elif mode == "frontier":
         frontier = select.pareto(models, score_key=sort_key)
         if not frontier:
@@ -394,15 +610,26 @@ def _leaderboard(
                                             else (m.intelligence or 0) / (m.cost_per_task or 1)))
         select.value_rank(frontier, score_key=sort_key)
         models = frontier
-        cols = _cols(_LB_COLS, fields)
-        note = f"models · Pareto {label} vs $/task (cost ascending), {where}"
+        cols = _cols(_LB_COLS, fields, _LB_EXTRA, _LB_IDENTITY)
+        note = f"Pareto {label} vs $/task (cost ascending), {where}"
+        footnotes += _missing_notes(all_models, [("cost_per_task", "cost per task", True)])
         footnotes.append(
             f"knee ≈ {knee.name}: {_fmt('cost_per_task', knee.cost_per_task)}/task, "
             f"intel {_fmt('intelligence', knee.intelligence)}"
         )
     else:
         models = select.sort_models(models, sort_key)
-        cols = _cols(_LB_COLS, fields)
+        cols = _cols(_LB_COLS, fields, _LB_EXTRA, _LB_IDENTITY)
+        note = f"{label}, {where}"
+
+    if not fields:
+        keys = {c[0] for c in cols}
+        if sort_key not in keys:
+            bench = catalog.BENCHMARKS.get(sort_key)
+            metric = catalog.metric(sort_key)
+            col_label = bench.label if bench is not None else (
+                metric.label if metric else sort_key)
+            cols.append((sort_key, col_label))
 
     if not fields and n > 15:
         cols = [c for c in cols if c[0] != "creator"]
@@ -416,9 +643,23 @@ def _leaderboard(
             "per-prompt-type breakdown (short/medium/long/100k)"
         )
 
-    head = _header(len(all_models), len(shown), note, name=cache_name, api=api)
+    matching = len(models)
+    if mode == "value":
+        count = (f"{len(shown)} of {matching} scored by value "
+                 f"({len(all_models)} tracked)")
+    elif mode == "frontier":
+        count = (f"{len(shown)} of {matching} frontier models "
+                 f"({len(all_models)} tracked)")
+    elif explicit:
+        count = (f"{len(shown)} shown of {matching} matching "
+                 f"({len(all_models)} tracked)")
+    else:
+        count = f"{len(shown)} of {matching} scored ({len(all_models)} tracked)"
+    head = _header(count=count, note=note, name=cache_name, api=api,
+                   source_label=_prov_label(rich_used))
     out = [_table_block(head, [label for _, label in cols],
-                        [_model_cells(m, cols) for m in shown])]
+                        [_model_cells(m, cols) for m in shown], trim=not fields)]
+    footnotes = list(dict.fromkeys(footnotes))
     if footnotes:
         out.append(render.note(footnotes))
     return "\n".join(part for part in out if part)
@@ -505,8 +746,8 @@ def _model_capabilities(m: Model) -> str | None:
         return None
     body = render.table(["Capability index", "Score"], rows)
     if not _api_available():
-        body += ("\n— capability indexes need AA_API_KEY (JSON API); scores shown "
-                 "come from the model page")
+        body += ("\n— capability scores from the model page (rich dataset); "
+                 "AA_API_KEY adds the Coding/Agentic indexes and cross-model ranking")
     return body
 
 
@@ -670,7 +911,7 @@ def _model_modalities(m: Model) -> str:
 
 
 def _model(query: str, sections: str = "", refresh: bool = False) -> str:
-    models = loaders.leaderboard(refresh=refresh)
+    models = _models(refresh)
     base = _resolve_slug(query, models)
     slug = base.slug
     record = loaders.model(slug, refresh=refresh).get(slug)
@@ -679,19 +920,23 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
     chosen = _split(sections)
     if not chosen:
         chosen = ["identity", "indexes", "benchmarks", "pricing", "speed"]
+    section_aliases = {"specs": "identity", "spec": "identity",
+                       "specification": "identity", "specifications": "identity"}
+    chosen = [section_aliases.get(s.strip().lower(), s.strip().lower()) for s in chosen]
     if "all" in chosen:
         chosen = list(_SECTIONS)
     bad = [s for s in chosen if s not in _SECTIONS]
     if bad:
         raise ValueError(
-            f"unknown section(s) {', '.join(bad)} — valid: {', '.join(_SECTIONS)}, all"
+            f"unknown section(s) {', '.join(bad)} — valid: {', '.join(_SECTIONS)}, "
+            "all (alias: specs = identity)"
         )
 
     as_of, stale = _fresh(f"model_{slug}")
     head = f"# {model.name} · {_txt(model.creator)} · aa.{slug}"
     if as_of is not None:
         head += f" · {'stale: ' + render.ago(as_of) if stale else render.ago(as_of)}"
-    head += f" · aa:{_source_key()}"
+    head += f" · aa:{_prov_label(_models_rich(refresh))}"
 
     blocks = [head, _model_facts(model)]
     if "indexes" in chosen:
@@ -734,17 +979,34 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
 # --------------------------------------------------------------------------- #
 
 _COMPARE_ROWS = [
-    ("intelligence", "Intelligence"), ("cost_per_task", "$/task"),
-    ("price_in", "In $/1M"), ("price_out", "Out $/1M"),
-    ("tps", "tok/s"), ("ttft", "TTFT"),
-]
-_COMPARE_FULL = [
-    ("intelligence", "Intelligence"), ("cost_per_task", "$/task"),
+    ("intelligence", "Intelligence"), ("value", "Intel/$"),
+    ("cost_per_task", "$/task"),
     ("price_in", "In $/1M"), ("price_out", "Out $/1M"),
     ("tps", "tok/s"), ("ttft", "TTFT"), ("context_tokens", "Context"),
+]
+_COMPARE_FULL = _COMPARE_ROWS + [
+    ("cache_hit_discount", "Cache disc."),
     ("release_date", "Released"), ("params_b", "Params (B)"),
     ("is_open_weights", "Open weights"), ("effort", "Effort"),
 ]
+_COMPARE_VALUE_NAMES = {"value", "intel/$", "$/intel", "intel/1$", "intelperdollar",
+                        "intel per dollar", "intelligence per dollar"}
+
+
+def _compare_cell(m: Model, key: str) -> str:
+    if key == "value":
+        score = select.lookup(m, "intelligence")
+        cost = m.cost_per_task
+        return render.num(score / cost, 1) if score is not None and cost else "-"
+    value = select.lookup(m, key)
+    if value is None and key == "cache_hit_discount":
+        cache_read = select.lookup(m, "cache_read")
+        price_in = select.lookup(m, "price_in")
+        if cache_read is not None and price_in:
+            value = 1 - cache_read / price_in
+    if key == "cache_hit_discount":
+        return _discount(value)
+    return _fmt(key, value)
 
 
 def _compare(queries: list[str], metrics: str = "", compact: bool = True,
@@ -753,12 +1015,15 @@ def _compare(queries: list[str], metrics: str = "", compact: bool = True,
         raise ValueError(
             f"aa_compare takes 2-6 models; got {len(queries) if isinstance(queries, list) else 0}"
         )
-    models = loaders.leaderboard(refresh=refresh)
+    models = _models(refresh)
     picked = [_resolve_slug(q, models) for q in queries]
 
     if metrics:
         rows = []
         for name in _split(metrics):
+            if name.strip().lower() in _COMPARE_VALUE_NAMES:
+                rows.append(("value", "Intel/$"))
+                continue
             key = _metric_key(name, "metric")
             metric = catalog.metric(key)
             rows.append((key, metric.label if metric else name))
@@ -773,13 +1038,17 @@ def _compare(queries: list[str], metrics: str = "", compact: bool = True,
     if slug_row:
         table_rows.append(["Slug", *[m.slug for m in picked]])
     for key, label in rows:
-        table_rows.append([label, *[_fmt(key, select.lookup(m, key))
-                                   for m in picked]])
+        table_rows.append([label, *[_compare_cell(m, key) for m in picked]])
     labels = ["Metric", *short]
     body = render.table(labels, table_rows)
 
     cache_name, api = _lb_cache()
-    head = _header(None, len(picked), "models compared", name=cache_name, api=api)
+    head = _header(count=f"{len(picked)} models compared",
+                   name=cache_name, api=api,
+                   source_label=_prov_label(_models_rich(refresh)))
+    if any(key == "ttft" for key, _ in rows):
+        return (f"{head}\n{body}\n— TTFT is AA's long-prompt median; "
+                "aa_model gives the per-prompt-type breakdown")
     return f"{head}\n{body}"
 
 
@@ -787,21 +1056,56 @@ def _compare(queries: list[str], metrics: str = "", compact: bool = True,
 # aa_benchmarks
 # --------------------------------------------------------------------------- #
 
-def _coverage(bench: catalog.Benchmark, models: Sequence[Model]) -> str:
-    if bench.key in ("coding", "agentic") or bench.key.startswith("capabilities."):
+_UNTRACKED_FALLBACK = {
+    "bfcl": "AA does not track BFCL (Berkeley Function Calling Leaderboard). For "
+            "tool use see τ²-Bench, τ³-Banking, IFBench, or the FnCall/JSON endpoint "
+            "flags (aa_reference topic=providers).",
+    "mathvista": "AA does not track MathVista. For vision + math reasoning use "
+                 "MMMU-Pro, MATH-500 or AIME 2025; for general vision use MMMU-Pro "
+                 "plus the modality flags.",
+    "docvqa": "AA does not track DocVQA. For document reasoning use GDP.pdf, MLCR-AA "
+              "or AA-LCR.",
+}
+
+
+def _untracked(query: str) -> tuple[str, str] | None:
+    """Match a query against ``catalog.UNTRACKED_BENCHMARKS`` (or the built-in list)."""
+    table = dict(getattr(catalog, "UNTRACKED_BENCHMARKS", {}) or {})
+    if not table:
+        table = _UNTRACKED_FALLBACK
+    q = _norm_alias(query)
+    if not q:
+        return None
+    for name, note in table.items():
+        n = _norm_alias(name)
+        if n and (q == n or n in q or q in n):
+            return str(name), str(note)
+    return None
+
+
+def _coverage(bench: catalog.Benchmark, lb: Sequence[Model],
+              merged: Sequence[Model]) -> str:
+    """Live coverage label — never "chart set only" when the rich set scores it."""
+    key = bench.key
+    native = sum(1 for m in lb if select.lookup(m, key) is not None)
+    if native:
+        return f"leaderboard ({native}/{len(lb)} models)"
+    rich = sum(1 for m in merged if select.lookup(m, key) is not None)
+    if rich:
+        return f"rich dataset ({rich}/{len(merged)} models)"
+    hint = str(getattr(bench, "source_hint", "") or "")
+    if key in ("coding", "agentic") or key.startswith("capabilities.") or hint == "api":
         return "api only"
-    count = sum(1 for m in models if select.lookup(m, bench.key) is not None)
-    if count:
-        return f"{count}/{len(models)}"
     if bench.unit == "mixed":
         return "model page only"
-    if bench.slug:
-        return "chart set only"
+    if hint == "chart" or bench.slug:
+        return "AA chart set"
     return "model page only"
 
 
 def _benchmarks(query: str = "", verbose: bool = False) -> str:
-    models = loaders.leaderboard()
+    lb = loaders.leaderboard()
+    merged = _models()
     q = (query or "").strip().lower()
     entries = []
     for bench in catalog.BENCHMARKS.values():
@@ -810,6 +1114,11 @@ def _benchmarks(query: str = "", verbose: bool = False) -> str:
             continue
         entries.append(bench)
     if not entries:
+        untracked = _untracked(query) if query else None
+        if untracked is not None:
+            name, note = untracked
+            head = _header(count=f"AA does not track {name}", note=f"query={query}")
+            return f"{head}\n— {note}"
         near = ", ".join(_close(query, [b.key for b in catalog.BENCHMARKS.values()]
                                 + [b.label for b in catalog.BENCHMARKS.values()]))
         raise ValueError(
@@ -825,7 +1134,8 @@ def _benchmarks(query: str = "", verbose: bool = False) -> str:
         headers = ["Benchmark", "Slug", "Unit", "Coverage"]
     rows = []
     for bench in entries:
-        base = [bench.label, bench.slug or "-", bench.unit, _coverage(bench, models)]
+        base = [bench.label, bench.slug or "-", bench.unit,
+                _coverage(bench, lb, merged)]
         if verbose:
             base += ["yes" if bench.index_member else "-",
                      ", ".join(bench.tags) or "-", bench.desc]
@@ -834,9 +1144,9 @@ def _benchmarks(query: str = "", verbose: bool = False) -> str:
         rows.append(base)
 
     cache_name, api = _lb_cache()
-    note = (f"benchmarks · query={query}" if query else "benchmarks · all")
-    head = _header(len(catalog.BENCHMARKS), len(rows), note,
-                   name=cache_name, api=api)
+    note = f"query={query}" if query else ""
+    count = f"{len(rows)} of {len(catalog.BENCHMARKS)} benchmarks"
+    head = _header(count=count, note=note, name=cache_name, api=api)
     body = _table_block(head, headers, rows)
     if not show_measures:
         body += ("\n— descriptions hidden at this size; add query=<term> or "
@@ -859,16 +1169,26 @@ def _benchmark_leaderboard(
     include_estimates: bool = True,
     refresh: bool = False,
 ) -> str:
-    bench = catalog.benchmark(benchmark)
-    if bench is None:
+    try:
+        key = _metric_key(benchmark, "benchmark")
+    except ValueError:
+        untracked = _untracked(benchmark)
+        if untracked is not None:
+            name, note = untracked
+            raise ValueError(f"AA does not track {name} — {note}") from None
         near = ", ".join(_close(benchmark, [b.key for b in catalog.BENCHMARKS.values()]
                                 + [b.label for b in catalog.BENCHMARKS.values()]))
         raise ValueError(
             f"unknown benchmark {benchmark!r} — closest: {near}\n"
             "— aa_benchmarks lists every benchmark with its slug and coverage"
+        ) from None
+    bench = catalog.BENCHMARKS.get(key)
+    if bench is None:
+        raise ValueError(
+            f"{benchmark!r} resolved to {key!r}, which is not a ranked benchmark "
+            "— try aa_benchmarks for the catalog"
         )
     n = top if isinstance(top, int) and top > 0 else 15
-    key = bench.key
 
     def keep(m: Model) -> bool:
         if creator and not (m.creator and creator.lower() in m.creator.lower()):
@@ -890,48 +1210,59 @@ def _benchmark_leaderboard(
                 out.append((m, float(value)))
         return out
 
-    # 1) full cross-model ranking from the 700-row leaderboard
-    lb = loaders.leaderboard(refresh=refresh)
-    pairs = scored(lb)
-    source_note: str
+    lb = _models(refresh)
+    rich_used = _models_rich(refresh)
     cache_name, api = _lb_cache()
     include_extra = True
-    if pairs:
-        present = sum(1 for m in lb if select.lookup(m, key) is not None)
-        source_note = f"{bench.label} · {present}/{len(lb)} models scored (leaderboard)"
+    source_note: str
+
+    if _is_index_key(key):
+        # Capability / Coding / Agentic indexes have no leaderboard column; they
+        # come from the rich overlay, or there is no ranking to give.
+        pairs = scored(lb)
+        if not pairs:
+            raise ValueError(_no_rank_text(key, bench.label))
+        source_note = f"{bench.label} · rich dataset — not a full leaderboard"
     else:
-        # 2) AA's own chart set for the eval page
-        pairs = []
-        if bench.slug:
-            try:
-                chart = loaders.eval_models(bench.slug, refresh=refresh)
-            except (AAFetchError, ValueError):
-                chart = []
-            pairs = scored(chart)
-            if not pairs and chart:
-                pairs = _raw_chart_pairs(bench.slug, key, chart, keep, refresh=refresh)
-            if pairs:
-                source_note = (f"{bench.label} · AA chart set ({len(pairs)} models) — "
-                               "not a full leaderboard")
-                cache_name, api = f"eval_{bench.slug}", False
-        # 3) homepage panel (top 20) for the security boards
-        if not pairs and bench.slug:
-            try:
-                panel = loaders.home_boards(refresh=refresh).get(f"eval:{bench.slug}") or []
-            except AAFetchError:
-                panel = []
-            raw = []
-            for item in panel:
-                value = item.get("score")
-                if value is None or not keep(_panel_model(item, key)):
-                    continue
-                raw.append((_panel_model(item, key), float(value)))
-            pairs = raw
-            if pairs:
-                source_note = (f"{bench.label} · homepage panel (top {len(pairs)}) — "
-                               "not a full leaderboard")
-                cache_name, api = "home", False
-                include_extra = False
+        pairs = scored(lb)
+        if pairs:
+            native = scored(loaders.leaderboard(refresh=refresh))
+            if rich_used and len(pairs) > len(native):
+                source_note = f"{bench.label} · rich dataset — not a full leaderboard"
+            else:
+                source_note = f"{bench.label} · leaderboard"
+        else:
+            # AA's own chart set for the eval page
+            pairs = []
+            if bench.slug:
+                try:
+                    chart = loaders.eval_models(bench.slug, refresh=refresh)
+                except (AAFetchError, ValueError):
+                    chart = []
+                pairs = scored(chart)
+                if not pairs and chart:
+                    pairs = _raw_chart_pairs(bench.slug, key, chart, keep, refresh=refresh)
+                if pairs:
+                    source_note = f"{bench.label} · AA chart set — not a full leaderboard"
+                    cache_name, api = f"eval_{bench.slug}", False
+            # homepage panel (top 20) for the security boards
+            if not pairs and bench.slug:
+                try:
+                    panel = loaders.home_boards(refresh=refresh).get(
+                        f"eval:{bench.slug}") or []
+                except AAFetchError:
+                    panel = []
+                raw = []
+                for item in panel:
+                    value = item.get("score")
+                    if value is None or not keep(_panel_model(item, key)):
+                        continue
+                    raw.append((_panel_model(item, key), float(value)))
+                pairs = raw
+                if pairs:
+                    source_note = f"{bench.label} · homepage panel — not a full leaderboard"
+                    cache_name, api = "home", False
+                    include_extra = False
 
     if not pairs:
         raise ValueError(
@@ -942,6 +1273,10 @@ def _benchmark_leaderboard(
     pairs.sort(key=lambda t: t[1], reverse=True)
     shown = pairs[:n]
 
+    request_keys = _split(fields)
+    wants_ci = any(k in ("ci_lower", "ci_upper", "ci") for k in request_keys)
+    ci_map = _chart_ci(bench.slug, refresh) if wants_ci else {}
+
     score_label = bench.label
     if bench.unit not in ("%", "index"):
         score_label += f" ({bench.unit})"
@@ -949,7 +1284,7 @@ def _benchmark_leaderboard(
                     ("score", score_label)]
     cols: list[tuple[str, str]]
     if fields:
-        cols = _cols([], fields, ("score",))
+        cols = _cols([], fields, ("score", "ci_lower", "ci_upper", "ci"), _BENCH_IDENTITY)
     else:
         cols = list(default_cols)
         if include_extra:
@@ -959,21 +1294,57 @@ def _benchmark_leaderboard(
 
     table_rows = []
     for m, value in shown:
+        lo, hi = ci_map.get(m.slug, (None, None))
         cells = []
         for col, _label in cols:
             if col == "score":
                 cells.append(_fmt(key, value))
+            elif col in ("ci_lower", "ci_upper", "ci"):
+                if col == "ci":
+                    cells.append("-" if lo is None and hi is None
+                                 else f"{render.num(lo, 0)}–{render.num(hi, 0)}")
+                else:
+                    cells.append(render.num(lo if col == "ci_lower" else hi, 0))
             else:
                 cells.append(_fmt(col, select.lookup(m, col)))
         table_rows.append(cells)
 
-    head = _header(len(lb), len(shown), source_note, name=cache_name, api=api)
-    body = _table_block(head, [label for _, label in cols], table_rows)
+    count = f"{len(shown)} of {len(pairs)} scored ({len(lb)} tracked)"
+    head = _header(count=count, note=source_note, name=cache_name, api=api,
+                   source_label=_prov_label(rich_used))
+    body = _table_block(head, [label for _, label in cols], table_rows, trim=not fields)
     notes = _missing_notes(lb, [("intelligence", "intelligence",
                                  min_intelligence is not None)])
     if notes:
         body += "\n" + render.note(notes)
     return body
+
+
+def _chart_ci(slug: str, refresh: bool = False) -> dict[str, tuple[float | None, float | None]]:
+    """95% CI (lower, upper) per chart-set model, from the raw eval-page records."""
+    if not slug:
+        return {}
+    try:
+        path = loaders.SOURCE_URLS["eval"].format(slug=slug)
+        text = fetch.get(loaders.url(path), f"eval_{slug}", refresh=refresh).text
+        records = flight.find_array(
+            flight.payload(text), ("chartDefaultSelected", "releaseDate", "suffix")
+        )
+    except Exception:  # pragma: no cover - best-effort enrichment
+        return {}
+    out: dict[str, tuple[float | None, float | None]] = {}
+    for rec in records:
+        if not isinstance(rec, dict) or not rec.get("slug"):
+            continue
+        lower = rec.get("ciLower")
+        upper = rec.get("ciUpper")
+        breakdown = rec.get("briefcaseBreakdown")
+        if isinstance(breakdown, dict):
+            lower = lower if lower is not None else breakdown.get("lower95ci")
+            upper = upper if upper is not None else breakdown.get("upper95ci")
+        if lower is not None or upper is not None:
+            out[rec["slug"]] = (lower, upper)
+    return out
 
 
 def _raw_chart_pairs(slug: str, key: str, models: Sequence[Model], keep,
@@ -1029,8 +1400,8 @@ def _panel_model(item: dict, key: str) -> Model:
 # aa_providers
 # --------------------------------------------------------------------------- #
 
-_PROV_SORT = ("cost_per_task", "price_in", "price_out", "tps", "ttft",
-              "intelligence", "context_tokens")
+_PROV_SORT = ("cost_per_task", "price_in", "price_out", "cache_read", "cache_write",
+              "tps", "ttft", "intelligence", "context_tokens")
 _PROV_COLS = [
     ("host", "Host"), ("model_name", "Model"),
     ("price_in", "In $/M"), ("price_out", "Out $/M"),
@@ -1047,6 +1418,10 @@ _PROV_EXTRA = ("host", "model_name", "model_slug", "precision", "cache_read",
 def _endpoint_cell(e, key: str) -> str:
     if key == "precision":
         return _txt(e.precision)
+    if key == "model_name":
+        return _txt(e.model_name or e.model_slug)  # never a blank Model column
+    if key == "model_slug":
+        return _txt(e.model_slug)
     if key == "cache_read":
         return _fmt("cache_read", e.cache_read)
     if key == "discount":
@@ -1068,46 +1443,92 @@ def _endpoint_sort(eps: Sequence[loaders.Endpoint], key: str) -> list[loaders.En
     return present + missing
 
 
+_PROV_SORT_ALIASES = {
+    "input": "price_in", "in": "price_in",
+    "output": "price_out", "out": "price_out",
+    "cacheread": "cache_read", "cachehit": "cache_read", "read": "cache_read",
+    "cachewrite": "cache_write", "write": "cache_write",
+    "speed": "tps", "latency": "ttft",
+    "ctx": "context_tokens", "context": "context_tokens", "contextwindow": "context_tokens",
+    "cost": "cost_per_task", "cpt": "cost_per_task", "costpertask": "cost_per_task",
+    "intel": "intelligence", "iq": "intelligence",
+}
+
+
+def _prov_sort_key(sort: str) -> str:
+    raw = str(sort).strip().lower()
+    if raw in _PROV_SORT:
+        return raw
+    key = _PROV_SORT_ALIASES.get(_norm_alias(sort))
+    if key is not None:
+        return key
+    norm = _norm_alias(sort)
+    for candidate in _PROV_SORT:  # tolerate price-in / cache.read spellings
+        if _norm_alias(candidate) == norm:
+            return candidate
+    raise ValueError(
+        f"unknown sort {sort!r} — accepted: {', '.join(_PROV_SORT)} "
+        "(aliases: input, output, cache_read, cache_write, speed, latency, ctx, cost)"
+    )
+
+
 def _providers(model: str = "", host: str = "", top: int = 15,
                sort: str = "cost_per_task", fields: str = "",
                open_weights: bool | None = None, min_context: int | None = None,
                refresh: bool = False) -> str:
     n = top if isinstance(top, int) and top > 0 else 15
+    sort_key = _prov_sort_key(sort)
 
     if model:
-        base = _resolve_slug(model, loaders.leaderboard(refresh=refresh))
+        base = _resolve_slug(model, _models(refresh))
         endpoints = loaders.provider_endpoints(base.slug, refresh=refresh)
+        # Endpoint payloads often omit the context window; fall back to the
+        # model-level value rather than rendering a misleading "-".
+        ctx_filled = False
+        if base.context_tokens:
+            for e in endpoints:
+                if e.context_tokens is None:
+                    e.context_tokens = base.context_tokens
+                    ctx_filled = True
         if min_context is not None:
             endpoints = [e for e in endpoints
                          if e.context_tokens is not None and e.context_tokens >= min_context]
-        endpoints = _endpoint_sort(endpoints, sort if sort in _PROV_SORT else "cost_per_task")
+        endpoints = _endpoint_sort(endpoints, sort_key)
         if not endpoints:
             return (f"# no provider endpoints recorded for {base.name} (aa.{base.slug}) "
-                    "— the model-page providers array was empty")
-        cols = _cols(_PROV_COLS_MODEL, fields, _PROV_EXTRA)
+                    "— the model-page providers array was empty or all filtered out")
+        cols = _cols(_PROV_COLS_MODEL, fields, _PROV_EXTRA, [("host", "Host")])
         rows = [[_endpoint_cell(e, k) for k, _ in cols] for e in endpoints[:n]]
-        head = _header(None, len(rows),
-                       f"endpoints · {base.name} (aa.{base.slug})",
+        count = f"{len(rows)} of {len(endpoints)} endpoints"
+        head = _header(count=count,
+                       note=f"{base.name} (aa.{base.slug}), by {sort_key}",
                        name=f"providers_{base.slug}")
-        return _table_block(head, [l for _, l in cols], rows)
-
-    if sort not in _PROV_SORT:
-        raise ValueError(
-            f"unknown sort {sort!r} — expected one of {', '.join(_PROV_SORT)}"
-        )
+        body = _table_block(head, [l for _, l in cols], rows, trim=not fields)
+        if ctx_filled:
+            body += "\n— context is model-level, not per-endpoint"
+        return body
 
     endpoints = loaders.provider_board(refresh=refresh)
     if host:
         hl = host.lower()
         endpoints = [e for e in endpoints if hl in (e.host or "").lower()]
-    if min_context is not None:
-        endpoints = [e for e in endpoints
-                     if e.context_tokens is not None and e.context_tokens >= min_context]
     if open_weights is not None:
         ow = {m.slug: m.is_open_weights for m in loaders.leaderboard(refresh=refresh)}
         endpoints = [e for e in endpoints
                      if ow.get(e.model_slug) == open_weights]
-    endpoints = _endpoint_sort(endpoints, sort)
+    board_ctx = False
+    if any(e.context_tokens is None for e in endpoints):
+        by_slug = {m.slug: m for m in _models(refresh)}
+        for e in endpoints:
+            if e.context_tokens is None:
+                rec = by_slug.get(e.model_slug)
+                if rec is not None and rec.context_tokens:
+                    e.context_tokens = rec.context_tokens
+                    board_ctx = True
+    if min_context is not None:
+        endpoints = [e for e in endpoints
+                     if e.context_tokens is not None and e.context_tokens >= min_context]
+    endpoints = _endpoint_sort(endpoints, sort_key)
 
     if not endpoints:
         sel = []
@@ -1119,14 +1540,20 @@ def _providers(model: str = "", host: str = "", top: int = 15,
             sel.append(f"ctx>={min_context:g}")
         return f"# no provider endpoints match {', '.join(sel) or 'filters'} — drop one filter"
 
-    cols = _cols(_PROV_COLS, fields, _PROV_EXTRA)
+    cols = _cols(_PROV_COLS, fields, _PROV_EXTRA, _PROV_IDENTITY)
     rows = [[_endpoint_cell(e, k) for k, _ in cols] for e in endpoints[:n]]
-    if host:
-        note = f"endpoints · host~{host}, by {sort}"
+    explicit = bool(host or open_weights is not None or min_context is not None)
+    if explicit:
+        count = f"{len(rows)} shown of {len(endpoints)} matching"
+        note = f"host~{host}, by {sort_key}" if host else f"by {sort_key}"
     else:
-        note = f"endpoints · cheapest {len(rows)} across all hosts, by {sort}"
-    head = _header(len(endpoints), len(rows), note, name="providers_board", api=False)
-    return _table_block(head, [l for _, l in cols], rows)
+        count = f"{len(rows)} of {len(endpoints)} endpoints"
+        note = f"cheapest across all hosts, by {sort_key}"
+    head = _header(count=count, note=note, name="providers_board", api=False)
+    body = _table_block(head, [l for _, l in cols], rows, trim=not fields)
+    if board_ctx:
+        body += "\n— context is model-level, not per-endpoint"
+    return body
 
 
 # --------------------------------------------------------------------------- #
@@ -1141,7 +1568,43 @@ _SPEECH_BOARDS = {
 _MEDIA_COLS = [("rank", "Rank"), ("name", "Model"), ("creator", "Creator"),
                ("elo", "Elo"), ("appearances", "Appearances"),
                ("price", "Price"), ("release_date", "Release")]
-_MEDIA_EXTRA = ("ci_lower", "ci_upper", "open_weights", "url", "price_unit", "price")
+_MEDIA_FIELDS = {
+    "rank": "Rank", "name": "Model", "model": "Model", "creator": "Creator",
+    "elo": "Elo", "ci": "95% CI", "ci_lower": "CI low", "ci_upper": "CI high",
+    "appearances": "Appearances", "price": "Price", "price_unit": "Price unit",
+    "release": "Release", "release_date": "Release", "open_weights": "Open",
+    "url": "URL",
+}
+_MEDIA_CANON = {"model": "name", "release": "release_date"}
+
+
+def _media_cols(fields: Any) -> list[tuple[str, str]]:
+    """Media fields are row keys (``elo``/``ci``/``name``), not model metrics.
+
+    The ``Model`` identity column is always rendered first so a requested table
+    is never an anonymous list of numbers.
+    """
+    out: list[tuple[str, str]] = []
+    keys: set[str] = set()
+    for raw in _split(fields):
+        name = re.sub(r"[\s-]+", "_", raw.strip().lower())
+        if name not in _MEDIA_FIELDS:
+            raise ValueError(
+                f"unknown field {raw!r} — valid: {', '.join(sorted(_MEDIA_FIELDS))}"
+            )
+        key = _MEDIA_CANON.get(name, name)
+        if key in keys:
+            continue
+        keys.add(key)
+        out.append((key, _MEDIA_FIELDS[name]))
+    if "name" not in keys:
+        out.insert(0, ("name", "Model"))
+    return out
+
+
+def _norm_board(name: str) -> str:
+    """Board keys are accepted hyphen/space/case-insensitively (``text-to-image``)."""
+    return re.sub(r"[\s-]+", "_", str(name).strip().lower())
 
 
 def _media_cell(row: dict, key: str) -> str:
@@ -1156,6 +1619,15 @@ def _media_cell(row: dict, key: str) -> str:
         return f"{int(value):,}" if value is not None else "-"
     if key == "elo":
         return _fmt("briefcaseElo", row.get("elo"))
+    if key == "ci_lower":
+        return render.num(row.get("ci_lower"), 0)
+    if key == "ci_upper":
+        return render.num(row.get("ci_upper"), 0)
+    if key == "ci":
+        low, high = row.get("ci_lower"), row.get("ci_upper")
+        if low is None and high is None:
+            return "-"
+        return f"{render.num(low, 0)}–{render.num(high, 0)}"
     if key == "release_date":
         return _txt(row.get("release_date"))
     return _txt(row.get(key))
@@ -1164,15 +1636,16 @@ def _media_cell(row: dict, key: str) -> str:
 def _media(board: str, top: int = 15, fields: str = "", open_weights: bool | None = None,
            refresh: bool = False) -> str:
     n = top if isinstance(top, int) and top > 0 else 15
+    key_name = _norm_board(board)
 
-    if board in _SPEECH_BOARDS:
-        key = _SPEECH_BOARDS[board]
-        rows = loaders.home_boards(refresh=refresh).get(key) or []
+    if key_name in _SPEECH_BOARDS:
+        speech = _SPEECH_BOARDS[key_name]
+        rows = loaders.home_boards(refresh=refresh).get(speech) or []
         if open_weights is not None:
             rows = [r for r in rows if r.get("openWeights") == open_weights]
         if not rows:
             return f"# no rows for speech board {board!r} in the homepage payload"
-        if key == "sts":
+        if speech == "sts":
             cols = [("rank", "Rank"), ("name", "Model"), ("hostName", "Host"),
                     ("stsIndex", "STS")]
             table_rows = [[str(i), _txt(r.get("name")), _txt(r.get("hostName")),
@@ -1184,31 +1657,36 @@ def _media(board: str, top: int = 15, fields: str = "", open_weights: bool | Non
             table_rows = [[str(i), _txt(r.get("name")), _txt(r.get("creatorName")),
                            render.pct(r.get("werIndex"))]
                           for i, r in enumerate(rows[:n], 1)]
-        head = _header(len(rows), len(table_rows),
-                       f"{board} · speech (WER lower is better)" if key != "sts"
-                       else f"{board} · speech, STS index",
+        note = (f"{board_key} · speech, WER lower is better" if speech != "sts"
+                else f"{board_key} · speech, STS index")
+        head = _header(count=f"{len(table_rows)} of {len(rows)} rows", note=note,
                        name="home", api=False)
         return _table_block(head, [l for _, l in cols], table_rows)
 
-    if board not in loaders.MEDIA_BOARDS:
+    if key_name not in loaders.MEDIA_BOARDS:
         valid = sorted(loaders.MEDIA_BOARDS) + sorted(_SPEECH_BOARDS)
         raise ValueError(
-            f"unknown media board {board!r} — valid: {', '.join(valid)}"
+            f"unknown media board {board!r} — valid: {', '.join(valid)} "
+            "(hyphens/spaces/case are ignored, e.g. text-to-image == text_to_image)"
         )
-    rows = loaders.media(board, refresh=refresh)
+    rows = loaders.media(key_name, refresh=refresh)
     if open_weights is not None:
         rows = [r for r in rows if r.get("open_weights") == open_weights]
     if not rows:
         return f"# no rows on media board {board!r} (open_weights={open_weights})"
 
     if fields:
-        cols = _cols(_MEDIA_COLS, fields, _MEDIA_EXTRA)
+        cols = _media_cols(fields)
     else:
         cols = list(_MEDIA_COLS)
     table_rows = [[_media_cell(r, k) for k, _ in cols] for r in rows[:n]]
-    head = _header(len(rows), len(table_rows), f"{board} · human-preference Elo",
-                   name=f"media_{board}", api=False)
-    return _table_block(head, [l for _, l in cols], table_rows)
+    explicit = bool(fields or open_weights is not None)
+    count = (f"{len(table_rows)} shown of {len(rows)} matching" if explicit
+             else f"{len(table_rows)} of {len(rows)} {key_name}")
+    head = _header(count=count,
+                   note="human-preference Elo (ask fields=ci_lower,ci_upper,ci for the 95% CI)",
+                   name=f"media_{key_name}", api=False)
+    return _table_block(head, [l for _, l in cols], table_rows, trim=not fields)
 
 
 # --------------------------------------------------------------------------- #
@@ -1219,22 +1697,29 @@ _AGENT_COLS = [("rank", "Rank"), ("agent", "Agent"), ("model", "Model"),
                ("creator", "Creator"), ("score", "Score"), ("cost_per_task", "$/Task")]
 
 
+def _no_ref(value: Any) -> str:
+    """Render a flight ``$…:props:…`` reference as ``-`` instead of leaking it."""
+    text = _txt(value)
+    return "-" if text.startswith("$") and ":props:" in text else text
+
+
 def _agents(board: str = "coding_agents", top: int = 15, refresh: bool = False) -> str:
     n = top if isinstance(top, int) and top > 0 else 15
-    rows = loaders.agents(board, refresh=refresh)
+    board_key = _norm_board(board)
+    rows = loaders.agents(board_key, refresh=refresh)
     shown = rows[:n]
     table_rows = []
     for row in shown:
         table_rows.append([
-            _txt(row.get("rank")),
-            _txt(row.get("agent") or row.get("name")),
-            _txt(row.get("model")),
-            _txt(row.get("creator")),
+            _no_ref(row.get("rank")),
+            _no_ref(row.get("agent") or row.get("name")),
+            _no_ref(row.get("model")),
+            _no_ref(row.get("creator")),
             render.pct(row.get("score")),
             _fmt("cost_per_task", row.get("cost_per_task")),
         ])
-    head = _header(len(rows), len(shown), f"agent rows · {board}",
-                   name=f"agents_{board}", api=False)
+    head = _header(count=f"{len(shown)} of {len(rows)} rows", note=board_key,
+                   name=f"agents_{board_key}", api=False)
     return _table_block(head, [l for _, l in _AGENT_COLS], table_rows)
 
 
@@ -1249,7 +1734,7 @@ _SEARCH_COLS = [("name", "Model"), ("creator", "Creator"), ("intelligence", "Int
 def _search(query: str = "", creator: str = "", open_weights: bool | None = None,
             top: int = 15, refresh: bool = False) -> str:
     n = top if isinstance(top, int) and top > 0 else 15
-    models = loaders.leaderboard(refresh=refresh)
+    models = _models(refresh)
     if query:
         found = select.search(models, query, limit=max(n, 20))
     else:
@@ -1266,8 +1751,16 @@ def _search(query: str = "", creator: str = "", open_weights: bool | None = None
     cols = _cols(_SEARCH_COLS, "")
     rows = [[_fmt(k, select.lookup(m, k)) for k, _ in cols] for m in shown]
     cache_name, api = _lb_cache()
-    note = f"models · name match {query!r}" if query else "models · most intelligent"
-    head = _header(len(models), len(rows), note, name=cache_name, api=api)
+    matched = len(found)
+    explicit = bool(query or creator or open_weights is not None)
+    if explicit:
+        count = (f"{len(rows)} shown of {matched} matching "
+                 f"({len(models)} tracked)")
+    else:
+        count = f"{len(rows)} of {matched} models"
+    note = f"name match {query!r}" if query else "most intelligent"
+    head = _header(count=count, note=note, name=cache_name, api=api,
+                   source_label=_prov_label(_models_rich(refresh)))
     return _table_block(head, [l for _, l in cols], rows)
 
 
@@ -1371,8 +1864,9 @@ def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
         cache_name = "eval_catalog"
         payload = [_project(c, keys) for c in loaders.eval_catalog(refresh=refresh)]
 
-    head = _header(None, n, f"raw {kind} · top {n} · JSON, token-expensive — prefer "
-                            "the table tools", name=cache_name, api=api)
+    head = _header(count=f"raw {kind} · top {n}",
+                   note="JSON, token-expensive — prefer the table tools",
+                   name=cache_name, api=api)
     body = json.dumps(payload, indent=1, default=str)
     return f"{head}\n{body}"
 
@@ -1400,7 +1894,7 @@ srv = MCPServer(
 def aa_leaderboard(
     mode: str = "rank",
     sort: str = "intelligence",
-    fields: str = "",
+    fields: str | list[str] = "",
     top: int = 10,
     creator: str = "",
     name: str = "",
@@ -1453,7 +1947,7 @@ def aa_leaderboard(
 
 @srv.tool(name="aa_model", title="Model digest", structured_output=False)
 @_tool
-def aa_model(query: str, sections: str = "", refresh: bool = False) -> str:
+def aa_model(query: str, sections: str | list[str] = "", refresh: bool = False) -> str:
     """One model's full digest: specs, indices, benchmark scores, pricing and speed.
 
     Use after aa_leaderboard/aa_search when you need everything about a single
@@ -1461,9 +1955,10 @@ def aa_model(query: str, sections: str = "", refresh: bool = False) -> str:
 
     Args:
         query: model name or slug (fuzzy). Ambiguous names return a candidate table.
-        sections: comma subset of identity, indexes, benchmarks, pricing, speed,
-            cost, openness, modalities, all. Default identity, indexes,
-            benchmarks, pricing, speed.
+        sections: comma string (or list) of identity/indexes/benchmarks/pricing/
+            speed/cost/openness/modalities, or all. Default: identity, indexes,
+            benchmarks, pricing, speed. Alias: specs = identity. Unknown names
+            error with the valid list.
         refresh: bypass the cache and re-fetch.
     """
     return _model(query, sections=sections, refresh=refresh)
@@ -1471,15 +1966,15 @@ def aa_model(query: str, sections: str = "", refresh: bool = False) -> str:
 
 @srv.tool(name="aa_compare", title="Compare models", structured_output=False)
 @_tool
-def aa_compare(queries: list[str], metrics: str = "", compact: bool = True,
+def aa_compare(queries: list[str], metrics: str | list[str] = "", compact: bool = True,
                refresh: bool = False) -> str:
     """Side-by-side comparison of 2-6 models as metric rows x model columns.
 
     Args:
         queries: 2-6 model names or slugs.
-        metrics: comma list of metric rows to show; empty uses the default set
-            (intelligence, $/task, in/out $/1M, tok/s, TTFT, context, ...).
-        compact: when true (and no metrics given) keep only the 6 rows that matter.
+        metrics: comma string (or list) of metric rows; empty uses the default set
+            (Intelligence, Intel/$, $/task, in/out $/1M, tok/s, TTFT, Context).
+        compact: when true (and no metrics given) keep the core rows only.
         refresh: bypass the cache and re-fetch.
     """
     return _compare(queries, metrics=metrics, compact=compact, refresh=refresh)
@@ -1505,7 +2000,7 @@ def aa_benchmarks(query: str = "", verbose: bool = False) -> str:
 def aa_benchmark_leaderboard(
     benchmark: str,
     top: int = 15,
-    fields: str = "",
+    fields: str | list[str] = "",
     creator: str = "",
     open_weights: bool | None = None,
     min_intelligence: float | None = None,
@@ -1540,7 +2035,7 @@ def aa_benchmark_leaderboard(
 @srv.tool(name="aa_providers", title="Provider endpoints", structured_output=False)
 @_tool
 def aa_providers(model: str = "", host: str = "", top: int = 15,
-                 sort: str = "cost_per_task", fields: str = "",
+                 sort: str = "cost_per_task", fields: str | list[str] = "",
                  open_weights: bool | None = None, min_context: int | None = None,
                  refresh: bool = False) -> str:
     """Provider endpoints: per-host pricing, precision, speed and feature flags.
@@ -1568,7 +2063,7 @@ def aa_providers(model: str = "", host: str = "", top: int = 15,
 
 @srv.tool(name="aa_media", title="Media leaderboards", structured_output=False)
 @_tool
-def aa_media(board: str, top: int = 15, fields: str = "",
+def aa_media(board: str, top: int = 15, fields: str | list[str] = "",
              open_weights: bool | None = None, refresh: bool = False) -> str:
     """Human-preference arenas: image, video, speech, music (Elo + 95% CI).
 
@@ -1577,9 +2072,11 @@ def aa_media(board: str, top: int = 15, fields: str = "",
             text_to_video, image_to_video, video_editing, text_to_speech,
             text_to_speech_controlled, music_instrumental, music_with_vocals) or a
             speech board (speech_to_text, speech_to_text_streaming,
-            speech_to_speech).
+            speech_to_speech). Hyphens/spaces/case are ignored
+            (text-to-image == text_to_image).
         top: rows to return (default 15).
-        fields: comma list of columns; supports ci_lower, ci_upper, open_weights.
+        fields: comma string (or list) of columns; supports ci_lower, ci_upper, ci
+            (95% CI), open_weights, url. Elo CI is not shown by default.
         open_weights: keep only open- or closed-weights entries.
         refresh: bypass the cache and re-fetch.
     """
@@ -1635,7 +2132,7 @@ def aa_reference(topic: str = "overview") -> str:
 
 @srv.tool(name="aa_raw", title="Raw JSON escape hatch", structured_output=False)
 @_tool
-def aa_raw(kind: str, query: str = "", fields: str = "", top: int = 1,
+def aa_raw(kind: str, query: str = "", fields: str | list[str] = "", top: int = 1,
            refresh: bool = False) -> str:
     """Raw JSON escape hatch (token-expensive — prefer the table tools).
 
@@ -1664,11 +2161,32 @@ def _r_metrics() -> str:
     return "\n\n".join(f"## {k}\n\n{reference.TOPICS[k]}" for k in keys)
 
 
-@srv.resource("aa://reference/fields", name="Field aliases",
+def _fields_compact() -> str:
+    """A compact, grouped field list (not the 200-line alias dump)."""
+    groups: dict[str, list[str]] = {}
+    for metric in catalog.METRICS.values():
+        groups.setdefault(metric.group, []).append(metric.key)
+    lines = [
+        "Fields accepted by fields=/metrics=/sort= (canonical names below; aliases, "
+        "labels and eval-page slugs are also accepted).",
+    ]
+    for group in ("identity", "index", "eval", "pricing", "speed", "agentic", "media"):
+        if group in groups:
+            lines.append(f"- {group}: {', '.join(groups[group])}")
+    for group in sorted(set(groups) - {"identity", "index", "eval", "pricing",
+                                       "speed", "agentic", "media"}):
+        lines.append(f"- {group}: {', '.join(groups[group])}")
+    lines.append("- media arenas add: rank, appearances, elo, ci_lower, ci_upper, ci, "
+                 "price, price_unit, release_date, open_weights, url")
+    lines.append("Full alias list: aa_reference topic=fields.")
+    return "\n".join(lines)
+
+
+@srv.resource("aa://reference/fields", name="Field names (grouped)",
               mime_type="text/plain",
-              description="Every field alias accepted by fields=/metrics=/sort=.")
+              description="Canonical field names by group; aliases/labels/slugs accepted.")
 def _r_fields() -> str:
-    return "\n".join(catalog.field_names())
+    return _fields_compact()
 
 
 @srv.resource("aa://benchmarks", name="Benchmark catalog", mime_type="application/json",
@@ -1682,6 +2200,22 @@ def _r_benchmarks() -> str:
               description="URLs, cache paths, TTLs, offline mode and recovery.")
 def _r_sources() -> str:
     return reference.TOPICS["sources"]
+
+
+def _register_topic_resource(topic: str) -> None:
+    def _res() -> str:
+        return reference.TOPICS[topic]
+
+    _res.__name__ = f"_r_topic_{topic}"
+    _res.__doc__ = f"aa_reference topic={topic}"
+    srv.resource(f"aa://reference/{topic}", name=f"reference: {topic}",
+                 mime_type="text/markdown",
+                 description=f"Static reference text for the {topic} topic.")(_res)
+
+
+for _topic in reference.TOPICS:
+    if _topic != "fields":  # aa://reference/fields serves the grouped list above
+        _register_topic_resource(_topic)
 
 
 # --------------------------------------------------------------------------- #

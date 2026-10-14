@@ -290,3 +290,15 @@ def test_every_eval_numeric_benchmark_is_reachable(eval_records):
         )
         if present:
             assert key in surfaced, f"{key} present in eval payload but unreachable"
+
+
+# --------------------------------------------------------------------------- #
+# T7: non-dict guard
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("fn", [normalize.from_chart, normalize.from_legacy,
+                                normalize.from_leaderboard])
+def test_non_dict_records_raise_value_error(fn):
+    with pytest.raises(ValueError):
+        fn("$e:props:children:0:props:currentModel")

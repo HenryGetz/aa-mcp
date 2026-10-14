@@ -31,6 +31,23 @@ def _norm(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
+def _tokens(text: str) -> list[str]:
+    """Whitespace/punctuation-separated, lowercased alphanumeric tokens."""
+    import re
+
+    return [t for t in re.split(r"[^a-z0-9]+", text.lower()) if t]
+
+
+def _token_score(token: str, fields: list[str]) -> int:
+    if any(f == token for f in fields):
+        return 90
+    if any(f.startswith(token) for f in fields):
+        return 70
+    if any(token in f for f in fields):
+        return 50
+    return 0
+
+
 def lookup(model: Model, key: str):
     """Return the value of metric ``key`` for ``model`` (``None`` if absent)."""
     src = VALUE_SOURCE.get(key)
@@ -69,7 +86,7 @@ def filter_models(
     score_key=None,
 ) -> list[Model]:
     cn = _norm(creator) if creator else None
-    nn = _norm(name) if name else None
+    name_tokens = _tokens(name) if name else None
     out: list[Model] = []
     for m in models:
         if exclude_deprecated and m.deprecated:
@@ -79,8 +96,9 @@ def filter_models(
             or (m.creator_slug and cn in _norm(m.creator_slug))
         ):
             continue
-        if nn and not (
-            nn in _norm(m.slug) or nn in _norm(m.name) or nn in _norm(m.short_name)
+        if name_tokens and not all(
+            any(t in f for f in (_norm(m.slug), _norm(m.name), _norm(m.short_name)))
+            for t in name_tokens
         ):
             continue
         if open_weights is not None and m.is_open_weights != open_weights:
@@ -191,10 +209,16 @@ def _fields(m: Model) -> list[str]:
 
 
 def search(models, query: str, limit: int = 20) -> list[Model]:
-    """Fuzzy name/slug search, ranked by match quality then intelligence."""
-    nq = _norm(query)
-    if not nq:
+    """Fuzzy name/slug search, ranked by match quality then intelligence.
+
+    The query is tokenised on whitespace/punctuation and **every** token must
+    appear (as a substring) in the model's normalized slug/name/short_name/creator
+    — in any order.  Single-token queries behave exactly as before.
+    """
+    tokens = _tokens(query)
+    if not tokens:
         return []
+    nq = _norm(query)
     scored = []
     for m in models:
         f = _fields(m)
@@ -202,12 +226,11 @@ def search(models, query: str, limit: int = 20) -> list[Model]:
             score = 100
         elif nq in (f[1], f[2]):
             score = 90
-        elif any(x.startswith(nq) for x in f if x):
-            score = 70
-        elif any(nq in x for x in f if x):
-            score = 50
         else:
-            continue
+            token_scores = [_token_score(t, f) for t in tokens]
+            if not all(token_scores):
+                continue
+            score = min(token_scores)
         scored.append((score, m.intelligence if m.intelligence is not None else -1.0, m))
     scored.sort(key=lambda t: (-t[0], -t[1]))
     return [m for _, _, m in scored[:limit]]

@@ -18,6 +18,7 @@ __all__ = [
     "Benchmark",
     "METRICS",
     "BENCHMARKS",
+    "UNTRACKED_BENCHMARKS",
     "FIELD_ALIASES",
     "VALUE_SOURCE",
     "metric",
@@ -46,6 +47,7 @@ class Benchmark:
     desc: str
     tags: tuple[str, ...]
     index_member: bool
+    source_hint: str = "leaderboard"  # "leaderboard" | "rich" | "api" | "chart"
 
 
 # --------------------------------------------------------------------------- #
@@ -212,9 +214,93 @@ _B = [
      "EnterpriseOps-Gym-AA success rate by domain.", ("agentic", "breakdown"), False),
 ]
 
+#: benchmark key -> best surface that yields a *cross-model* value.
+#: Everything not listed defaults to "leaderboard" (the 700-row array).
+_SOURCE_HINTS: dict[str, str] = {
+    # only the keyed JSON API carries these composites
+    "coding": "api",
+    "agentic": "api",
+    # present in the ~700 x 94 rich dataset (model pages), incl. derived fields
+    "aime25": "rich",
+    "automationBenchPartialScore": "rich",
+    "briefcaseBreakdown": "rich",
+    "briefcaseElo": "rich",
+    "cweBench": "rich",
+    "cyberIndex": "rich",
+    "cybergymE2e": "rich",
+    "deepsecBench": "rich",
+    "enterpriseOpsGym": "rich",
+    "frontierCode": "rich",
+    "gdpPdfAllPass": "rich",
+    "gdpval": "rich",
+    "harveyLab": "rich",
+    "hleDiamond": "rich",
+    "livecodebench": "rich",
+    "mlcrOverall": "rich",
+    "omniscienceHallucinationRate": "rich",
+    "openness": "rich",
+    "terminalBenchScience": "rich",
+    "capabilities.financeAndAccounting": "rich",
+    "capabilities.strategyAndOps": "rich",
+    "capabilities.legal": "rich",
+    "capabilities.healthcareAndMedical": "rich",
+    "capabilities.engineering": "rich",
+    "capabilities.economics": "rich",
+    # only the curated chart/eval-page sets carry these
+    "aa3dBreakdown": "chart",
+    "aa3dElo": "chart",
+    "analystAgentPassAt1": "chart",
+    "analystAgentPassAtK": "chart",
+    "automationBenchBreakdown": "chart",
+    "cweBenchRefusalRate": "chart",
+    "cybergymE2eRefusalRate": "chart",
+    "deepsecBenchRefusalRate": "chart",
+    "enterpriseOpsGymSuccessRateByDomain": "chart",
+    "gdpPdfBreakdown": "chart",
+    "gdpvalBreakdown": "chart",
+    "globalMmluLiteScore": "chart",
+    "harveyLabBreakdown": "chart",
+    "math500": "chart",
+    "mlcrAccuracy": "chart",
+    "mlcrCompleteness": "chart",
+    "mlcrConciseness": "chart",
+    "mmluPro": "chart",
+    "when2call": "chart",
+    "wildguardtest": "chart",
+}
+
 BENCHMARKS: dict[str, Benchmark] = {
-    key: Benchmark(key, label, slug, unit, desc, tuple(tags), member)
+    key: Benchmark(key, label, slug, unit, desc, tuple(tags), member,
+                   _SOURCE_HINTS.get(key, "leaderboard"))
     for key, label, slug, unit, desc, tags, member in _B
+}
+
+#: Lowercased benchmark names AA does not track, with the closest thing AA measures.
+#: Factual only — "AA does not track X" plus the nearest AA surface, no equivalence claim.
+UNTRACKED_BENCHMARKS: dict[str, str] = {
+    "mathvista": "AA does not track MathVista; visual reasoning is covered by MMMU-Pro "
+                 "plus the per-model image/video input modality flags.",
+    "docvqa": "AA does not track DocVQA; the closest document-style evaluation is "
+              "GDP.pdf (with MMLU-Pro for broad knowledge).",
+    "bfcl": "AA does not track BFCL (Berkeley Function Calling); tool use is covered by "
+            "the per-endpoint functionCalling/jsonMode flags and by "
+            "\u03c4\u00b2-Bench / \u03c4\u00b3-Banking.",
+    "berkeley function calling": "AA does not track BFCL (Berkeley Function Calling); "
+            "tool use is covered by the per-endpoint functionCalling/jsonMode flags and "
+            "by \u03c4\u00b2-Bench / \u03c4\u00b3-Banking.",
+    "human eval": "AA does not track HumanEval; the closest coding evaluation is "
+                  "LiveCodeBench (also SciCode / FrontierCode).",
+    "humaneval": "AA does not track HumanEval; the closest coding evaluation is "
+                 "LiveCodeBench (also SciCode / FrontierCode).",
+    "mbpp": "AA does not track MBPP; the closest coding evaluation is LiveCodeBench.",
+    "chatbot arena": "AA does not track Chatbot Arena; human preference is measured in "
+                     "AA's own media/agent arenas and via the AA-Briefcase Elo.",
+    "lmsys arena": "AA does not track the LMArena/LMSYS arena; human preference is "
+                   "measured in AA's own media/agent arenas and via the AA-Briefcase Elo.",
+    "mt-bench": "AA does not track MT-Bench; the closest instruction-following "
+                "evaluation is IFBench.",
+    "alpaca eval": "AA does not track AlpacaEval; the closest agentic knowledge-work "
+                   "evaluation is the AA-Briefcase Elo.",
 }
 
 

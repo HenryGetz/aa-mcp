@@ -15,8 +15,8 @@ Two interchangeable data backends; the same canonical `Model` records come out o
 
 Contract: `source.active_source()`, `source.source_label()` (`aa:api` / `aa:rsc`) —
 tool headers must show which backend answered. A bad/expired key must never break a
-call: downgrade to RSC for the process and log once to stderr.
-Full spec: `docs/BRIEF_T5.md`.
+call: downgrade to RSC for the process and log once to stderr. Implementation lives in
+`src/aa_mcp/api.py` + `src/aa_mcp/source.py`.
 
 ## ADDENDUM (verified 2026-10-14): SDK is `mcp` 2.x — NOT FastMCP
 

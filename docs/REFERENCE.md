@@ -63,8 +63,8 @@ Scraped records (the majority of models):
   relevant domains. Range roughly -70..+70 (can be negative). `AA-Omniscience
   Accuracy` and `Hallucination Rate` break it out.
 - **Openness Index** (model pages) — availability, transparency, licensing (0-100).
-- **AA-Briefcase Elo** — long-horizon knowledge-work benchmark, reported as Elo with
-  95% CI (private set; not a full public leaderboard).
+- **AA-Briefcase Elo** — long-horizon knowledge-work benchmark, reported as Elo
+  (95% CI via `fields=ci_lower,ci_upper,ci`; private set; not a full public leaderboard).
 
 API-only (require `AA_API_KEY`): **Coding Index**, **Agentic Index**, and the six
 Capability Indexes — Finance & Accounting, Strategy & Ops, Legal, Healthcare &
@@ -142,15 +142,19 @@ Measured by AA on the provider in `performanceDataSource` (usually first-party A
 ## providers
 
 Per model x provider endpoint: host, precision/quantization tag (from the endpoint
-slug), $/1M input/output/cache-read, cache discount, cache-hit rate, cost per task,
-tok/s, TTFT, E2E, function-calling and JSON-mode support, and context window.
+slug — shown only when AA's payload discloses it, which is rare), $/1M
+input/output/cache-read, cache discount, cache-hit rate, cost per task,
+tok/s, TTFT, E2E, function-calling and JSON-mode support, and context window (the
+model-level value when the endpoint does not report one).
 The provider board holds 1,201 endpoints across ~453 models and 64 hosts (measured
 2026-10-14) with pricing, performance and feature flags, but without precision tags
 or per-endpoint cost per task — use the per-model view for those.
 
 ## media
 
-Human-preference arenas (Elo + 95% CI + appearance counts): text-to-image,
+Human-preference arenas (Elo + appearance counts; the 95% confidence interval is
+available on request with `fields=ci_lower,ci_upper,ci`, not shown by default):
+text-to-image,
 image-editing, text-to-video, image-to-video, video-editing, text-to-speech
 (provider-voice and controlled-voice), music (instrumental, with-vocals). Prices are
 $/1k images, $/min and $/1M characters respectively. Speech boards: speech-to-text
@@ -169,7 +173,8 @@ out_tokens_per_task, context_tokens (ctx), params_b, active_params_b, release_da
 knowledge_cutoff, license, weights_url, is_open_weights (open), is_reasoning,
 effort, deprecated, size_class, modalities_in, modalities_out, creator, slug, name
 plus every benchmark key listed in `benchmarks` (e.g. gpqa, hle, mmmuPro,
-briefcaseElo, terminalBench40).
+briefcaseElo, terminalBench40). Media arenas also accept `ci_lower`, `ci_upper`
+and `ci` (the 95% confidence interval).
 
 ## sources
 

@@ -61,9 +61,9 @@ def test_legacy_model_page() -> None:
     assert model.source == "legacy"
 
 
-def test_chart_without_initial_models_raises(tmp_path: Path) -> None:
-    with pytest.raises(LookupError):
-        loaders.parse_chart('<script>{"currentModel":{"slug":"x"}}</script>')
+def test_chart_without_initial_models_is_empty() -> None:
+    # T7: a page with no usable chart array yields [] instead of crashing.
+    assert loaders.parse_chart('<script>{"currentModel":{"slug":"x"}}</script>') == []
 
 
 # --------------------------------------------------------------------------- #
@@ -532,3 +532,268 @@ def test_api_leaderboard_with_licensing_survives_rsc_failure(monkeypatch: pytest
     assert len(models) == 1
     assert models[0].is_open_weights is None
     assert models[0].indices["capabilities.engineering"] == 11.7
+
+
+# --------------------------------------------------------------------------- #
+# T7: ref-string robustness, agents boards, rich dataset
+# --------------------------------------------------------------------------- #
+
+import gzip  # noqa: E402
+
+
+def _rich_page() -> str:
+    records = json.loads(gzip.open(FIXTURES / "rich_dataset.json.gz", "rb").read())
+    refs = json.loads((FIXTURES / "initial_models_refs.json").read_text(encoding="utf-8"))
+    current = json.loads((FIXTURES / "rich_current_model.json").read_text(encoding="utf-8"))
+    return json.dumps({"currentModel": current, "initialModels": refs,
+                       "props": {"models": records}})
+
+
+def test_parse_chart_ref_snippet_does_not_crash() -> None:
+    refs = (FIXTURES / "initial_models_refs.json").read_text(encoding="utf-8")
+    page = '{"initialModels":' + refs + "}"
+    models = loaders.parse_chart(page)  # no rich pool -> nothing resolvable
+    assert models == []
+
+
+def test_parse_chart_resolves_refs_to_chart_set() -> None:
+    models = loaders.parse_chart(_rich_page())
+    slugs = [m.slug for m in models]
+    assert len(models) == 28
+    assert "qwen3-8-2-4t-a95b" in slugs  # resolved from the currentModel ref
+    assert all(isinstance(m, type(models[0])) for m in models)
+
+
+def test_parse_rich_dataset_counts() -> None:
+    models = loaders.parse_rich_dataset(_rich_page())
+    assert len(models) >= 600
+    capped = sum(1 for m in models if m.indices.get("capabilities.legal") is not None)
+    assert capped >= 200
+
+
+def test_parse_rich_dataset_fixture_has_90_plus_keys() -> None:
+    records = json.loads(gzip.open(FIXTURES / "rich_dataset.json.gz", "rb").read())
+    dicts = [r for r in records if isinstance(r, dict)]
+    assert len(dicts) >= 600
+    assert max(len(r) for r in dicts) >= 90
+    assert len({k for r in dicts for k in r}) >= 90  # 94-key union
+
+
+def test_parse_rich_dataset_absent_on_plain_page() -> None:
+    assert loaders.parse_rich_dataset(_text("model_page_chart.rsc")) == []
+
+
+def test_rich_dataset_offline_uses_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    records = json.loads(gzip.open(FIXTURES / "rich_dataset.json.gz", "rb").read())
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "rich_dataset.json").write_text(json.dumps(records), encoding="utf-8")
+    (cache / "rich_seed.json").write_text(json.dumps({"slug": "step-5", "ts": 0}), encoding="utf-8")
+    monkeypatch.setenv("AA_OFFLINE", "1")
+    monkeypatch.setenv("AA_CACHE_DIR", str(cache))
+    monkeypatch.setattr(loaders, "_RICH_MEMO", None)
+    assert loaders.rich_seed() == "step-5"
+    models = loaders.rich_dataset()
+    assert len(models) >= 600
+
+
+def test_rich_dataset_offline_without_cache_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AA_OFFLINE", "1")
+    monkeypatch.setenv("AA_CACHE_DIR", str(tmp_path / "empty"))
+    monkeypatch.setattr(loaders, "_RICH_MEMO", None)
+    monkeypatch.setattr(loaders, "rich_seed", lambda: None)
+    assert loaders.rich_dataset() == []
+
+
+def test_model_resolves_ref_page_offline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "model_qwen3-8-2-4t-a95b.rsc").write_text(_rich_page(), encoding="utf-8")
+    monkeypatch.setenv("AA_OFFLINE", "1")
+    monkeypatch.setenv("AA_CACHE_DIR", str(cache))
+    models = loaders.model("qwen3-8-2-4t-a95b")
+    assert len(models) == 28
+    assert "qwen3-8-2-4t-a95b" in models
+
+
+def test_agent_row_tolerates_string_creator() -> None:
+    rec = {"agentName": "Cursor", "creator": "Cursor", "indexScore": 0.5,
+           "display": {"model": "Claude Sonnet 5.5"}}
+    row = loaders._agent_row(rec)
+    assert row["creator"] == "Cursor"
+    assert row["agent"] == "Cursor"
+
+
+def test_agent_row_unwraps_values_formatted() -> None:
+    rec = {"values": {"agentName": "Devin", "creator": {"name": "Cognition"}, "score": 0.4},
+           "formatted": {"score": "0.4"}}
+    row = loaders._agent_row(rec)
+    assert row["agent"] == "Devin"
+    assert row["creator"] == "Cognition"
+
+
+def test_parse_agents_chatbot_and_search_shapes() -> None:
+    chatbots = json.dumps({"blob": [{"name": "ChatGPT Pro", "tier": "premium",
+                                     "featuresScore": 5.45, "creatorName": "OpenAI",
+                                     "modelName": "GPT-6 Astra (max)", "priceMonthly": 200}]})
+    rows = loaders.parse_agents(chatbots, "chatbots")
+    assert len(rows) == 1
+    assert rows[0]["name"] == "ChatGPT Pro" and rows[0]["creator"] == "OpenAI"
+
+    search = json.dumps({"blob": [{"providerKey": "perplexity-medium",
+                                   "providerName": "Perplexity Search",
+                                   "aaSearchQualityIndex": 0.79,
+                                   "searchApiCostPerTaskUsd": 0.06}]})
+    rows = loaders.parse_agents(search, "search_api")
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Perplexity Search"
+    assert rows[0]["cost_per_task"] == pytest.approx(0.06)
+
+
+# --------------------------------------------------------------------------- #
+# T7b: agent flight-reference resolution + no "$…" leakage
+# --------------------------------------------------------------------------- #
+
+
+def _ref_leaks(obj, path="") -> list:
+    found = []
+    if isinstance(obj, str):
+        if obj.startswith("$"):
+            found.append((path, obj))
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            found += _ref_leaks(v, f"{path}.{k}")
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            found += _ref_leaks(v, f"{path}[{i}]")
+    return found
+
+
+def test_agent_creator_refs_resolved_in_fixture() -> None:
+    rows = loaders.parse_agents(_text("agents_coding.rsc"), "coding_agents")
+    assert len(rows) == 39
+    assert all(r["creator"] for r in rows)
+    assert rows[1]["creator"] == "Meta"       # Muse Code
+    assert rows[2]["creator"] == "Anthropic"  # Claude Code
+    assert _ref_leaks(rows) == []
+
+
+def test_agent_row_resolves_named_array_ref() -> None:
+    page = json.dumps({
+        "benchmarkRows": [
+            {"agentName": "A", "indexScore": 0.5,
+             "agentCreator": "$1:props:children:props:rows:0:agentCreator"}
+        ],
+        "rows": [{"agentCreator": {"name": "Acme", "slug": "acme"}}],
+    })
+    rows = loaders.parse_agents(page, "coding_agents")
+    assert len(rows) == 1
+    assert rows[0]["creator"] == "Acme"
+
+
+def test_agent_row_drops_unresolved_ref() -> None:
+    row = loaders._agent_row(
+        {"agentName": "X", "creator": "$30:props:children:props:rows:99:agentCreator"}
+    )
+    assert row["creator"] is None
+    assert _ref_leaks(row) == []
+
+
+def test_no_ref_literals_in_media_and_providers() -> None:
+    for fixture, board in (("media_t2i.rsc", "text_to_image"),
+                           ("media_t2v.rsc", "text_to_video"),
+                           ("media_tts.rsc", "text_to_speech")):
+        rows = loaders.parse_media(_text(fixture), board)
+        assert _ref_leaks(rows) == [], fixture
+
+    assert _ref_leaks([e.__slots__ and {k: getattr(e, k) for k in e.__slots__}
+                       for e in loaders.parse_provider_endpoints(_text("providers_model_flat.rsc"))]) == []
+    assert _ref_leaks([{k: getattr(e, k) for k in e.__slots__}
+                       for e in loaders.parse_provider_board(_text("providers_board.rsc"))]) == []
+
+
+# --------------------------------------------------------------------------- #
+# T7c: provider endpoint names + completeness
+# --------------------------------------------------------------------------- #
+
+
+def test_provider_board_model_name_populated() -> None:
+    endpoints = loaders.parse_provider_board(_text("providers_board.rsc"))
+    assert len(endpoints) == 1201
+    assert all(e.model_name for e in endpoints)
+    assert endpoints[0].model_name == "GLM-4.5V (non-reasoning)"
+    assert endpoints[0].model_slug == "glm-4-5v"
+
+
+def test_provider_endpoints_model_name_falls_back_to_slug() -> None:
+    endpoints = loaders.parse_provider_endpoints(_text("providers_model_flat.rsc"))
+    assert len(endpoints) == 4
+    assert all(e.model_name for e in endpoints)
+    assert {e.model_name for e in endpoints} == {"claude-opus-5-5"}
+
+
+def test_endpoint_keeps_every_row_and_sorts_none_last() -> None:
+    page = json.dumps({"hostModels": [
+        {"host": {"name": "H1", "slug": "h1"}, "model": {"slug": "m"},
+         "pricing": {"price1mInputTokens": 1.0}, "jsonMode": True,
+         "performance": {"intelligenceIndexCostPerTask": {"total": 9.0}}},
+        {"host": {"name": "H2", "slug": "h2"}, "model": {"slug": "m"},
+         "pricing": {"price1mInputTokens": 0.5}, "jsonMode": True,
+         "performance": {}},  # no cost -> must be kept, sorted last
+        {"host": {"name": "H3", "slug": "h3"}, "model": {"slug": "m"},
+         "pricing": {"price1mInputTokens": 2.0}, "jsonMode": True,
+         "performance": {"intelligenceIndexCostPerTask": {"total": 1.5}}},
+    ]})
+    endpoints = loaders.parse_provider_endpoints(page)
+    assert len(endpoints) == 3  # nothing dropped
+    assert [e.cost_per_task for e in endpoints] == [1.5, 9.0, None]
+    assert endpoints[-1].host_slug == "h2"
+
+
+def test_endpoint_model_name_ignores_reference_label() -> None:
+    page = json.dumps({"hostModels": [
+        {"host": {"name": "H", "slug": "h"}, "model": {"slug": "m-slug"},
+         "label": "$30:props:children:props:rows:0:label", "jsonMode": True,
+         "pricing": {}, "performance": {}},
+    ]})
+    endpoints = loaders.parse_provider_endpoints(page)
+    assert endpoints[0].model_name == "m-slug"
+
+
+# --------------------------------------------------------------------------- #
+# T8: precision from labels (slug suffix stays a fallback)
+# --------------------------------------------------------------------------- #
+
+
+def test_precision_from_host_label_and_model_label() -> None:
+    page = json.dumps({"hostModels": [
+        {"host": {"name": "Supernova", "label": "Supernova (FP4)", "slug": "supernova"},
+         "model": {"slug": "m"}, "jsonMode": True, "pricing": {}, "performance": {}},
+        {"host": {"name": "Crusoe", "label": "Crusoe (FP8)", "slug": "crusoe"},
+         "model": {"slug": "m"}, "jsonMode": True, "pricing": {}, "performance": {}},
+        {"host": {"name": "X", "label": "X (NVFP4)", "slug": "x"},
+         "model": {"slug": "m"}, "jsonMode": True, "pricing": {}, "performance": {}},
+        {"host": {"name": "Plain", "slug": "plain"},
+         "model": {"slug": "m", "name": "DeepSeek V3.2 (FP8)"},
+         "jsonMode": True, "pricing": {}, "performance": {}},
+    ]})
+    by_host = {e.host: e.precision for e in loaders.parse_provider_endpoints(page)}
+    assert by_host == {"Supernova": "fp4", "Crusoe": "fp8", "X": "fp4", "Plain": "fp8"}
+
+
+def test_precision_slug_suffix_still_works() -> None:
+    page = json.dumps({"hostModels": [
+        {"host": {"name": "H", "slug": "h"}, "model": {"slug": "m"},
+         "slug": "h_m_fp8", "jsonMode": True, "pricing": {}, "performance": {}},
+    ]})
+    assert loaders.parse_provider_endpoints(page)[0].precision == "fp8"
+
+
+def test_precision_none_when_absent() -> None:
+    page = json.dumps({"hostModels": [
+        {"host": {"name": "GMI", "slug": "gmi"}, "model": {"slug": "m"},
+         "slug": "gmi_m", "jsonMode": True, "pricing": {}, "performance": {}},
+    ]})
+    assert loaders.parse_provider_endpoints(page)[0].precision is None
