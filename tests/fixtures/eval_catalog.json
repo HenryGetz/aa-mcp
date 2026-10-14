@@ -1,0 +1,425 @@
+[
+ {
+  "slug": "artificial-analysis-intelligence-index",
+  "title": "Artificial Analysis Intelligence Index v4.3.2",
+  "tags": [],
+  "text": "Artificial Analysis Intelligence Index v4.3.2 A composite benchmark aggregating ten challenging evaluations to provide a holistic measure of AI capabilities across mathematics, science, coding, and reasoning."
+ },
+ {
+  "slug": "artificial-analysis-openness-index",
+  "title": "Artificial Analysis Openness Index",
+  "tags": [],
+  "text": "Artificial Analysis Openness Index A composite measure providing an industry standard to communicate model openness for users and developers."
+ },
+ {
+  "slug": "aa-briefcase",
+  "title": "AA-Briefcase v1.1: Agentic Knowledge Work Benchmark",
+  "tags": [
+   "Updated",
+   "Business",
+   "Intelligence Index",
+   "Private Dataset",
+   "Agentic",
+   "Knowledge Work",
+   "Tool Use",
+   "Writing",
+   "Reasoning",
+   "Instruction Following"
+  ],
+  "text": "Updated AA-Briefcase v1.1: Agentic Knowledge Work Benchmark A private evaluation developed by Artificial Analysis for frontier agentic capability in long-horizon knowledge work, testing agents on realistic business workflows that require deliverables such as spreadsheets, presentations, and memos. B"
+ },
+ {
+  "slug": "gdpval-aa",
+  "title": "GDPval-AA v2.1 Leaderboard",
+  "tags": [
+   "Updated",
+   "Business",
+   "Finance",
+   "Legal",
+   "Medical",
+   "Humanities",
+   "Intelligence Index",
+   "Agentic",
+   "Knowledge Work",
+   "Writing",
+   "Reasoning",
+   "Instruction Following",
+   "Tool Use",
+   "Multimodal"
+  ],
+  "text": "Updated GDPval-AA v2.1 Leaderboard GDPval-AA v2.1 is Artificial Analysis' evaluation framework for OpenAI's GDPval dataset. It tests AI models on real-world tasks across 44 occupations and 9 major industries. Models are given shell access and web browsing capabilities in an agentic loop via Stirrup "
+ },
+ {
+  "slug": "aa-3d",
+  "title": "AA-3D: Interactive 3D Experience Benchmark",
+  "tags": [
+   "New",
+   "Science",
+   "Humanities",
+   "Agentic",
+   "Coding",
+   "Tool Use",
+   "Multimodal"
+  ],
+  "text": "New AA-3D: Interactive 3D Experience Benchmark A benchmark developed by Artificial Analysis for how well AI models build interactive 3D experiences. Models work as agents in an offline sandbox via Stirrup to turn a written brief into a three.js scene, with Elo ratings derived from blind pairwise vot"
+ },
+ {
+  "slug": "apex-agents-aa",
+  "title": "APEX-Agents-AA Benchmark Leaderboard",
+  "tags": [
+   "Coding",
+   "Agentic",
+   "Knowledge Work",
+   "Tool Use",
+   "Reasoning"
+  ],
+  "text": "APEX-Agents-AA Benchmark Leaderboard Artificial Analysis' implementation of the APEX-Agents benchmark, testing AI agents on long-horizon, cross-application tasks in professional-services environments with realistic application tooling. Coding Agentic Knowledge Work Tool Use Reasoning"
+ },
+ {
+  "slug": "aa-analyst-agent",
+  "title": "AA-AnalystAgent Benchmark Leaderboard",
+  "tags": [
+   "Finance",
+   "Business",
+   "Math",
+   "Private Dataset",
+   "Agentic",
+   "Tool Use",
+   "Reasoning",
+   "Faithfulness"
+  ],
+  "text": "AA-AnalystAgent Benchmark Leaderboard Artificial Analysis' data analysis benchmark, testing AI agents on their ability to work with spreadsheets and documents to answer quantitative questions a Business Analyst or Data Analyst would face day-to-day. Finance Business Math Private Dataset Agentic Tool"
+ },
+ {
+  "slug": "automationbench-aa",
+  "title": "AutomationBench-AA: Agentic SaaS Workflow Benchmark",
+  "tags": [
+   "Business",
+   "Private Dataset",
+   "Intelligence Index",
+   "Agentic",
+   "Tool Use",
+   "Instruction Following"
+  ],
+  "text": "AutomationBench-AA: Agentic SaaS Workflow Benchmark A benchmark measuring agentic task completion across simulated SaaS application environments, scoring the share of each task's objectives completed without guardrail violations. Business Private Dataset Intelligence Index Agentic Tool Use Instructi"
+ },
+ {
+  "slug": "harvey-lab-aa",
+  "title": "Harvey LAB-AA v1.1 Benchmark Leaderboard",
+  "tags": [
+   "Updated",
+   "Legal",
+   "Private Dataset",
+   "Agentic",
+   "Writing",
+   "Reasoning",
+   "Long Context",
+   "Instruction Following"
+  ],
+  "text": "Updated Harvey LAB-AA v1.1 Benchmark Leaderboard Artificial Analysis' implementation of Harvey's Legal Agent Benchmark (LAB), testing AI agents on real-world legal work from Harvey's dataset of 120 private tasks spanning 24 legal practice areas. v1.1, built in collaboration with Harvey, checks every"
+ },
+ {
+  "slug": "gdp-pdf",
+  "title": "GDP.pdf Benchmark Leaderboard",
+  "tags": [
+   "Business",
+   "Finance",
+   "Legal",
+   "Medical",
+   "Science",
+   "Intelligence Index",
+   "Multimodal",
+   "Long Context",
+   "Reasoning",
+   "Instruction Following"
+  ],
+  "text": "GDP.pdf Benchmark Leaderboard Artificial Analysis' implementation of Surge AI's GDP.pdf benchmark, testing whether language models can reason over long, real-world professional documents and satisfy detailed task-specific criteria. Business Finance Legal Medical Science Intelligence Index Multimodal"
+ },
+ {
+  "slug": "enterprise-ops-gym-aa",
+  "title": "EnterpriseOps-Gym-AA Benchmark Leaderboard",
+  "tags": [
+   "Business",
+   "Agentic",
+   "Tool Use",
+   "Instruction Following",
+   "User Interaction"
+  ],
+  "text": "EnterpriseOps-Gym-AA Benchmark Leaderboard Artificial Analysis' independent implementation of ServiceNow's EnterpriseOps-Gym, an agentic benchmark testing whether LLM agents can complete stateful, multi-step enterprise workflows across eight business domains via live tool use, graded on the final st"
+ },
+ {
+  "slug": "terminalbench-4-0",
+  "title": "Terminal-Bench 4.0 Benchmark Leaderboard",
+  "tags": [
+   "Coding",
+   "Intelligence Index",
+   "Agentic",
+   "Tool Use",
+   "Reasoning",
+   "Instruction Following"
+  ],
+  "text": "Terminal-Bench 4.0 Benchmark Leaderboard A harder 66-task benchmark of complex terminal work across software, machine learning, science, operations, security, hardware, and media, with recalibrated compute and time allowances and improved instructions, environments, and verifiers. Coding Intelligenc"
+ },
+ {
+  "slug": "terminal-bench-science",
+  "title": "Terminal-Bench-Science 0.1 Benchmark Leaderboard",
+  "tags": [
+   "New",
+   "Science",
+   "Coding",
+   "Agentic",
+   "Tool Use",
+   "Reasoning",
+   "Instruction Following"
+  ],
+  "text": "New Terminal-Bench-Science 0.1 Benchmark Leaderboard A 70-task benchmark of research workflows authored and reviewed by domain experts across the life, physical, earth, mathematical, and engineering sciences, each completed in a terminal and checked by its own set of tests. Science Coding Agentic To"
+ },
+ {
+  "slug": "frontiercode",
+  "title": "FrontierCode 1.1 Benchmark Leaderboard",
+  "tags": [
+   "New",
+   "Coding",
+   "Private Dataset",
+   "Agentic",
+   "Tool Use",
+   "Reasoning",
+   "Instruction Following"
+  ],
+  "text": "New FrontierCode 1.1 Benchmark Leaderboard Artificial Analysis' implementation of Cognition's FrontierCode 1.1, a private agentic coding benchmark that tests models on completing coding tasks in a way that would actually get merged by maintainers of real-world repositories. Coding Private Dataset Ag"
+ },
+ {
+  "slug": "artificial-analysis-long-context-reasoning",
+  "title": "Artificial Analysis Long Context Reasoning Benchmark Leaderboard",
+  "tags": [
+   "Intelligence Index",
+   "Long Context",
+   "Reasoning",
+   "Faithfulness"
+  ],
+  "text": "Artificial Analysis Long Context Reasoning Benchmark Leaderboard A challenging benchmark measuring language models' ability to extract, reason about, and synthesize information from long-form documents ranging from 10k to 100k tokens (measured using the cl100k_base tokenizer). Intelligence Index Lon"
+ },
+ {
+  "slug": "omniscience",
+  "title": "AA-Omniscience: Knowledge and Hallucination Benchmark",
+  "tags": [
+   "Humanities",
+   "Business",
+   "Finance",
+   "Legal",
+   "Medical",
+   "Science",
+   "Intelligence Index",
+   "Private Dataset",
+   "Faithfulness",
+   "Reasoning"
+  ],
+  "text": "AA-Omniscience: Knowledge and Hallucination Benchmark A benchmark measuring factual recall and hallucination across various economically relevant domains. Humanities Business Finance Legal Medical Science Intelligence Index Private Dataset Faithfulness Reasoning"
+ },
+ {
+  "slug": "scicode",
+  "title": "SciCode Benchmark Leaderboard",
+  "tags": [
+   "Under review",
+   "Coding",
+   "Science",
+   "Math",
+   "Intelligence Index",
+   "Reasoning"
+  ],
+  "text": "Under review SciCode Benchmark Leaderboard A scientist-curated coding benchmark featuring 288 test set subproblems from 80 laboratory problems across 16 scientific disciplines. Coding Science Math Intelligence Index Reasoning"
+ },
+ {
+  "slug": "humanitys-last-exam",
+  "title": "Humanity's Last Exam Benchmark Leaderboard",
+  "tags": [
+   "Science",
+   "Math",
+   "Humanities",
+   "Medical",
+   "Intelligence Index",
+   "Reasoning"
+  ],
+  "text": "Humanity's Last Exam Benchmark Leaderboard A frontier-level benchmark with 2,500 expert-vetted questions across mathematics, sciences, and humanities, designed to be the final closed-ended academic evaluation. Science Math Humanities Medical Intelligence Index Reasoning"
+ },
+ {
+  "slug": "critpt",
+  "title": "CritPt Benchmark Leaderboard",
+  "tags": [
+   "Under review",
+   "Science",
+   "Intelligence Index",
+   "Reasoning"
+  ],
+  "text": "Under review CritPt Benchmark Leaderboard A benchmark designed to test LLMs on research-level physics reasoning tasks, featuring 71 composite research challenges. Science Intelligence Index Reasoning"
+ },
+ {
+  "slug": "gpqa-diamond",
+  "title": "GPQA Diamond Benchmark Leaderboard",
+  "tags": [
+   "Science",
+   "Reasoning"
+  ],
+  "text": "GPQA Diamond Benchmark Leaderboard The most challenging 198 questions from GPQA, where PhD experts achieve 65% accuracy but skilled non-experts only reach 34% despite web access. Science Reasoning"
+ },
+ {
+  "slug": "itbench-aa",
+  "title": "ITBench-AA Benchmark Leaderboard",
+  "tags": [
+   "Coding",
+   "Private Dataset",
+   "Agentic",
+   "Tool Use",
+   "Reasoning"
+  ],
+  "text": "ITBench-AA Benchmark Leaderboard Artificial Analysis' implementation of IBM's ITBench benchmark, testing AI agents on Kubernetes incident root-cause analysis from offline incident snapshots. The agent inspects alerts, events, traces, and topology and identifies the contributing-factor entities (depl"
+ },
+ {
+  "slug": "mmmu-pro",
+  "title": "MMMU-Pro Benchmark Leaderboard",
+  "tags": [
+   "Science",
+   "Humanities",
+   "Multimodal",
+   "Reasoning"
+  ],
+  "text": "MMMU-Pro Benchmark Leaderboard An enhanced MMMU benchmark that eliminates shortcuts and guessing strategies to more rigorously test multimodal models across 30 academic disciplines. Science Humanities Multimodal Reasoning"
+ },
+ {
+  "slug": "ifbench",
+  "title": "IFBench Benchmark Leaderboard",
+  "tags": [
+   "Instruction Following"
+  ],
+  "text": "IFBench Benchmark Leaderboard A benchmark evaluating precise instruction-following generalization on 58 diverse, verifiable out-of-domain constraints that test models' ability to follow specific output requirements. Instruction Following"
+ },
+ {
+  "slug": "mlcr-aa",
+  "title": "Medical Long Context Reasoning (MLCR-AA)",
+  "tags": [
+   "Medical",
+   "Private Dataset",
+   "Long Context",
+   "Reasoning",
+   "Faithfulness"
+  ],
+  "text": "Medical Long Context Reasoning (MLCR-AA) An open benchmark from Wisedocs measuring how well models reason over long, fragmented medical records, performing the multi-document synthesis claims professionals rely on when reviewing insurance and healthcare cases. Medical Private Dataset Long Context Re"
+ },
+ {
+  "slug": "tau3-banking",
+  "title": "\ud835\udf0f\u00b3-Banking Benchmark Leaderboard",
+  "tags": [
+   "Finance",
+   "Business",
+   "Legacy",
+   "Agentic",
+   "Tool Use",
+   "Instruction Following",
+   "User Interaction"
+  ],
+  "text": "\ud835\udf0f\u00b3-Banking Benchmark Leaderboard A fintech customer-support benchmark from the \ud835\udf0f-Knowledge framework that tests whether agents can navigate a large unstructured knowledge base and execute multi-step tool calls to resolve realistic banking workflows. Finance Business Legacy Agentic Tool Use Instructi"
+ },
+ {
+  "slug": "terminalbench-2-1",
+  "title": "Terminal-Bench 2.1 Benchmark Leaderboard",
+  "tags": [
+   "Coding",
+   "Legacy",
+   "Agentic",
+   "Tool Use",
+   "Reasoning",
+   "Instruction Following"
+  ],
+  "text": "Terminal-Bench 2.1 Benchmark Leaderboard A verified refresh of Terminal-Bench 2.0 \u2014 89 curated tasks across software engineering, system administration, data processing, model training, and security, with environment and instruction fixes so scores reflect agent capability rather than environment ga"
+ },
+ {
+  "slug": "terminalbench-hard",
+  "title": "Terminal-Bench Hard Benchmark Leaderboard",
+  "tags": [
+   "Coding",
+   "Legacy",
+   "Agentic",
+   "Tool Use",
+   "Reasoning",
+   "Long Context",
+   "Instruction Following"
+  ],
+  "text": "Terminal-Bench Hard Benchmark Leaderboard An agentic benchmark evaluating AI capabilities in terminal environments through software engineering, system administration, and data processing tasks. Coding Legacy Agentic Tool Use Reasoning Long Context Instruction Following"
+ },
+ {
+  "slug": "tau2-bench",
+  "title": "\ud835\udf0f\u00b2-Bench Telecom Benchmark Leaderboard",
+  "tags": [
+   "Business",
+   "Legacy",
+   "Agentic",
+   "Tool Use",
+   "Instruction Following",
+   "Faithfulness",
+   "User Interaction"
+  ],
+  "text": "\ud835\udf0f\u00b2-Bench Telecom Benchmark Leaderboard A dual-control conversational AI benchmark simulating technical support scenarios where both agent and user must coordinate actions to resolve telecom service issues. Business Legacy Agentic Tool Use Instruction Following Faithfulness User Interaction"
+ },
+ {
+  "slug": "mmlu-pro",
+  "title": "MMLU-Pro Benchmark Leaderboard",
+  "tags": [
+   "Humanities",
+   "Science",
+   "Math",
+   "Business",
+   "Legal",
+   "Medical",
+   "Legacy",
+   "Reasoning",
+   "Instruction Following"
+  ],
+  "text": "MMLU-Pro Benchmark Leaderboard An enhanced version of MMLU with 12,000 graduate-level questions across 14 subject areas, featuring ten answer options and deeper reasoning requirements. Humanities Science Math Business Legal Medical Legacy Reasoning Instruction Following"
+ },
+ {
+  "slug": "livecodebench",
+  "title": "LiveCodeBench Benchmark Leaderboard",
+  "tags": [
+   "Coding",
+   "Math",
+   "Legacy",
+   "Reasoning"
+  ],
+  "text": "LiveCodeBench Benchmark Leaderboard A contamination-free coding benchmark that continuously harvests fresh competitive programming problems from LeetCode, AtCoder, and CodeForces, evaluating code generation, self-repair, and execution. Coding Math Legacy Reasoning"
+ },
+ {
+  "slug": "math-500",
+  "title": "MATH-500 Benchmark Leaderboard",
+  "tags": [
+   "Math",
+   "Legacy",
+   "Reasoning"
+  ],
+  "text": "MATH-500 Benchmark Leaderboard A 500-problem subset from the MATH dataset, featuring competition-level mathematics across six domains including algebra, geometry, and number theory. Math Legacy Reasoning"
+ },
+ {
+  "slug": "aime-2025",
+  "title": "AIME 2025 Benchmark Leaderboard",
+  "tags": [
+   "Math",
+   "Legacy",
+   "Reasoning"
+  ],
+  "text": "AIME 2025 Benchmark Leaderboard All 30 problems from the 2025 American Invitational Mathematics Examination, testing olympiad-level mathematical reasoning with integer answers from 000-999. Math Legacy Reasoning"
+ },
+ {
+  "slug": "global-mmlu-lite",
+  "title": "Global-MMLU-Lite Benchmark Leaderboard",
+  "tags": [
+   "Humanities",
+   "Science",
+   "Math",
+   "Business",
+   "Multilingual",
+   "Legacy",
+   "Reasoning",
+   "Instruction Following"
+  ],
+  "text": "Global-MMLU-Lite Benchmark Leaderboard A lightweight, multilingual version of MMLU, designed to evaluate knowledge and reasoning skills across a diverse range of languages and cultural contexts. Humanities Science Math Business Multilingual Legacy Reasoning Instruction Following"
+ }
+]

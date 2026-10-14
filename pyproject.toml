@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aa-mcp"
+version = "0.1.0"
+description = "MCP server for artificialanalysis.ai — live AI model benchmarks, pricing, speed and provider data, token-efficient by design"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Henry Getz" }]
+keywords = ["mcp", "artificial-analysis", "benchmarks", "llm", "model-comparison"]
+dependencies = ["mcp>=2.0.0"]
+
+[project.scripts]
+aa-mcp = "aa_mcp.server:main"
+
+[project.urls]
+Homepage = "https://github.com/HenryGetz/aa-mcp"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aa_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

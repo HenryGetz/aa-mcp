@@ -1,0 +1,119 @@
+{
+  "tier": "free",
+  "intelligence_index_version": 4.1,
+  "pagination": {
+    "page": 1,
+    "page_size": 200,
+    "total_pages": 1,
+    "has_more": false
+  },
+  "data": [
+    {
+      "id": "36f73aaf-d38a-4b56-a2b3-d04d17186910",
+      "name": "gpt-oss-20B (high)",
+      "slug": "gpt-oss-20b",
+      "release_date": "2025-08-05",
+      "model_creator": {
+        "id": "e67e56e3-15cd-43db-b679-da4660a69f41",
+        "name": "OpenAI"
+      },
+      "evaluations": {
+        "artificial_analysis_intelligence_index": 24.5,
+        "artificial_analysis_coding_index": 18.5,
+        "artificial_analysis_agentic_index": 27.6,
+        "artificial_analysis_finance_and_accounting_index": 7.3,
+        "artificial_analysis_strategy_and_ops_index": 4.8,
+        "artificial_analysis_legal_index": 7.3,
+        "artificial_analysis_healthcare_and_medical_index": 6.6,
+        "artificial_analysis_engineering_index": 11.7,
+        "artificial_analysis_economics_index": 11.3
+      },
+      "artificial_analysis_intelligence_index_cost": {
+        "total_cost": 20.69,
+        "cost_per_task": {
+          "total_cost": 0.1678
+        }
+      },
+      "pricing": {
+        "price_1m_input_tokens": 0.06,
+        "price_1m_output_tokens": 0.2,
+        "price_1m_cache_hit_tokens": 0.015,
+        "price_1m_cache_write_tokens": 0.075
+      },
+      "performance": {
+        "median_output_tokens_per_second": 296.47,
+        "median_time_to_first_token_seconds": 0.65,
+        "median_time_to_first_answer_token_seconds": 7.4,
+        "median_end_to_end_response_time_seconds": 9.09
+      }
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000002",
+      "name": "Unmeasured Model",
+      "slug": "unmeasured-model",
+      "release_date": null,
+      "model_creator": null,
+      "evaluations": {
+        "artificial_analysis_intelligence_index": null,
+        "artificial_analysis_coding_index": null,
+        "artificial_analysis_agentic_index": null,
+        "artificial_analysis_finance_and_accounting_index": null,
+        "artificial_analysis_strategy_and_ops_index": null,
+        "artificial_analysis_legal_index": null,
+        "artificial_analysis_healthcare_and_medical_index": null,
+        "artificial_analysis_engineering_index": null,
+        "artificial_analysis_economics_index": null
+      },
+      "artificial_analysis_intelligence_index_cost": null,
+      "pricing": {
+        "price_1m_input_tokens": null,
+        "price_1m_output_tokens": null,
+        "price_1m_cache_hit_tokens": null,
+        "price_1m_cache_write_tokens": null
+      },
+      "performance": {
+        "median_output_tokens_per_second": null,
+        "median_time_to_first_token_seconds": null,
+        "median_time_to_first_answer_token_seconds": null,
+        "median_end_to_end_response_time_seconds": null
+      }
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000003",
+      "name": "Llama 4.1 405B (instruct)",
+      "slug": "llama-4-1-405b",
+      "release_date": "2026-04-02",
+      "model_creator": {
+        "id": "00000000-0000-0000-0000-0000000000aa",
+        "name": "Meta"
+      },
+      "evaluations": {
+        "artificial_analysis_intelligence_index": 41.2,
+        "artificial_analysis_coding_index": 33.0,
+        "artificial_analysis_agentic_index": 29.4,
+        "artificial_analysis_finance_and_accounting_index": 12.1,
+        "artificial_analysis_strategy_and_ops_index": 9.9,
+        "artificial_analysis_legal_index": 14.0,
+        "artificial_analysis_healthcare_and_medical_index": 13.2,
+        "artificial_analysis_engineering_index": 19.5,
+        "artificial_analysis_economics_index": 17.8
+      },
+      "artificial_analysis_intelligence_index_cost": {
+        "total_cost": 30.5,
+        "cost_per_task": null
+      },
+      "pricing": {
+        "price_1m_input_tokens": 0.9,
+        "price_1m_output_tokens": 0.9,
+        "price_1m_cache_hit_tokens": null,
+        "price_1m_cache_write_tokens": null
+      },
+      "performance": {
+        "median_output_tokens_per_second": 88.0,
+        "median_time_to_first_token_seconds": 0.42,
+        "median_time_to_first_answer_token_seconds": null,
+        "median_end_to_end_response_time_seconds": 22.5
+      }
+    }
+  ]
+}
