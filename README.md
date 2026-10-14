@@ -156,6 +156,10 @@ Deliberately out of scope (and the server says so instead of guessing):
   in `src/aa_mcp/loaders.py` (`flight.py` finds the arrays).
 - **AA redeploys often** — never hardcode chunk or build-id URLs; the client always
   re-parses freshly fetched payloads.
+- **Cache size**: payloads are stored verbatim (a rich model page is ~3 MB, so the
+  cache settles around 50-120 MB). Clear it with
+  `python -c "from aa_mcp.fetch import clear_cache; print(clear_cache())"` — worst
+  case the next call refetches.
 
 ## Development
 
