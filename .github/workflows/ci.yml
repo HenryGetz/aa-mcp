@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - name: Tests (offline, fixture-backed)
+        run: uv run pytest -q
+        env:
+          AA_OFFLINE: "1"
+      - name: Import check (no stdout pollution)
+        run: |
+          out=$(uv run python -c "import aa_mcp.server")
+          test -z "$out" || { echo "server import wrote to stdout"; exit 1; }
+      - name: Tool inventory over stdio
+        run: uv run python eval/client.py tools
