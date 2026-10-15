@@ -17,7 +17,7 @@ Tool routing:
 | Question | Tool |
 |---|---|
 | smartest / best / cheapest / fastest models now | `aa_leaderboard` |
-| best value (intelligence per $/task), budget caps | `aa_leaderboard` `mode=value` |
+| best value (intelligence per $/task), budget caps | `aa_leaderboard` `mode=value` (also `sort=value` / `sort=intel_per_cost` / `sort=intel/$`) |
 | Pareto frontier / trade-offs: Intelligence Index vs. Cost per Index Task (default), vs. Output Tokens per Task (`x=out_tokens_per_task`), vs. Cost to Run the AA Intelligence Index (`x=index_total_cost`); also context, params, TTFT, price | `aa_pareto` (`x=`, `score=`) — `aa_leaderboard mode=frontier` is the same code path |
 | anything about ONE model (specs, scores, price, license, context, cutoff) | `aa_model` |
 | model A vs B (up to 12 models, any benchmark, any metric, reproducible spec) | `aa_compare` (`metrics=all`, `view=diff`, `spec=` YAML) |
@@ -46,8 +46,10 @@ publishes — including chart-set / homepage-panel scores (the cyber boards, AA-
 …), stating the source in the footer — and footers the gaps (a per-model
 `missing on requested metrics: <model> <n>` count, plus the per-metric detail
 while the gap is small, or "<model> has no published pricing or speed on AA"). The echoed `spec:` reproduces the effective call (view/metrics/compact
-included); `compact` selects the core rows for the default metric set and is a
-documented no-op when `metrics=` is given.
+included); `compact` selects the core rows for the default metric set, and with
+`metrics=` it omits the Slug row and any all-null row (`compact=false` includes
+them). The default metric set is a subset (13 rows); its footer says so and
+points at `metrics=all` for every published row.
 
 `aa_leaderboard sort=<key>` is the uniform ranking path: it ranks any key with
 per-model values on any surface it can reach — the 700-row leaderboard, the rich
@@ -184,7 +186,8 @@ tok/s, TTFT, E2E, function-calling and JSON-mode support, and context window (th
 model-level value when the endpoint does not report one).
 The provider board holds 1,201 endpoints across ~453 models and 64 hosts (measured
 2026-10-14) with pricing, performance and feature flags, but without precision tags
-or per-endpoint cost per task — use the per-model view for those.
+or per-endpoint cost per task — use the per-model view for those. The table always
+shows the column it is sorted by (`sort=ttft` appends a TTFT column).
 
 ## media
 
@@ -204,7 +207,8 @@ keys are `speech_to_text`, `speech_to_text_streaming` and `speech_to_speech`
 ## fields
 
 Field aliases accepted by every `fields=`/`metrics=`/`sort=` parameter (canonical
-name first): intelligence (intel), estimated, coding, agentic, omniscience,
+name first); `fields=all` (or `*`) selects every column the surface has (bounded
+by the response cap): intelligence (intel), estimated, coding, agentic, omniscience,
 omniscience_accuracy, omniscience_non_hallucination, openness, capabilities.<name>,
 cost_per_task (alias cost; shown as $/Task), index_total_cost (whole-suite index cost,
 `aa_pareto x=index_total_cost`), price_in, price_out, cache_read,

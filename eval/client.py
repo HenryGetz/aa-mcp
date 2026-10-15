@@ -121,7 +121,9 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("tools")
-    sub.add_parser("schema")
+    s = sub.add_parser("schema")
+    s.add_argument("tool", nargs="*", default=[],
+                   help="one or more tool names; omit for every schema")
     sub.add_parser("resources")
     sub.add_parser("prompts")
     sub.add_parser("bench")
@@ -129,7 +131,6 @@ def main() -> int:
     c = sub.add_parser("call")
     c.add_argument("tool")
     c.add_argument("args", nargs="?", default="{}")
-
     r = sub.add_parser("read")
     r.add_argument("uri")
 
@@ -141,10 +142,14 @@ def main() -> int:
     log_path = pathlib.Path(a.log)
 
     if a.cmd in ("tools", "schema"):
+        wanted = {t.lower() for t in getattr(a, "tool", []) or []}
+
         async def go(session):
             res = await session.list_tools()
             out = []
             for t in res.tools:
+                if wanted and t.name.lower() not in wanted:
+                    continue
                 desc = (t.description or "").strip().splitlines()
                 summary = desc[0] if desc else ""
                 params = sorted((t.input_schema or {}).get("properties", {}))
@@ -154,6 +159,9 @@ def main() -> int:
                     out.append(json.dumps(
                         {"name": t.name, "description": t.description,
                          "input_schema": t.input_schema}, indent=1))
+            if not out and wanted:
+                known = ", ".join(sorted(x.name for x in res.tools))
+                return f"no tool matched {sorted(wanted)} — available: {known}"
             return "\n".join(out)
         print(asyncio.run(_with_session(a.env, go)))
         return 0

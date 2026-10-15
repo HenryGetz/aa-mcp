@@ -71,6 +71,12 @@ def cases() -> list[tuple[str, dict]]:
         ("aa_leaderboard", {"top": 2, "include_deprecated": True}),
         ("aa_leaderboard", {"top": 2, "fields": "license,effort,params_b,open_weights,capabilities.legal"}),
         ("aa_leaderboard", {"top": 2, "fields": "tps,ttft,ctx,params,released,creator"}),
+        # Wave G: argument vocabulary — value sort tokens, wildcard fields,
+        # the column a provider table is sorted by, and closest-match errors
+        ("aa_leaderboard", {"sort": "intel_per_cost", "top": 3}),
+        ("aa_leaderboard", {"sort": "intel/$", "top": 2}),
+        ("aa_leaderboard", {"fields": "all", "top": 2}),
+        ("aa_leaderboard", {"sort": "nonsense_sort", "top": 2}),   # expected fail
     ]
 
     # --- model: sections x representative models ----------------------------
@@ -115,6 +121,12 @@ def cases() -> list[tuple[str, dict]]:
         ("aa_compare", {"queries": ["mimo-v2-6-pro", "deepseek-v4-1-flash",
                                     "gpt-6-luna-xhigh", "muse-wonder-full"],
                         "metrics": "all", "view": "diff"}),
+        # Wave G: compact=false adds the Slug row (compact=true omits it)
+        ("aa_compare", {"queries": ["mimo-v2-6-pro", "deepseek-v4-1-flash",
+                                    "gpt-6-luna-xhigh", "muse-wonder-full"],
+                        "metrics": "all", "compact": False}),
+        ("aa_compare", {"queries": ["mimo-v2-6-pro", "deepseek-v4-1-flash",
+                                    "gpt-6-luna-xhigh", "muse-wonder-full"]}),
         # documented error paths (listed in EXPECTED_FAILURES): never a broken table
         ("aa_compare", {"queries": ["Grok Voice 3.0", "claude-opus-5-5"]}),
         # YAML / JSON spec round-trip (the emitted `spec:` block is re-runnable)
@@ -198,6 +210,11 @@ def cases() -> list[tuple[str, dict]]:
     for sort in ("cost_per_task", "price_in", "price_out", "cache_read", "tps", "ttft",
                  "intelligence", "context_tokens"):
         out.append(("aa_providers", {"model": "kimi-k3", "sort": sort, "top": 2}))
+    out += [
+        # the sorted-by column must be visible, and fields=all must work
+        ("aa_providers", {"model": "kimi-k3", "sort": "ttft", "fields": "all", "top": 3}),
+        ("aa_providers", {"model": "kimi-k3", "sort": "nope", "top": 2}),  # expected fail
+    ]
 
     # --- media: every board -------------------------------------------------
     boards = sorted(loaders.MEDIA_BOARDS) + ["speech_to_text", "speech_to_text_streaming",
@@ -259,6 +276,12 @@ EXPECTED_FAILURES: dict[tuple[str, str], str] = {
     ("aa_leaderboard", '{"sort": "mmluPro", "top": 2}'):
         "MMLU-Pro's only current values are on deprecated models; the default "
         "(active-only) view explains that include_deprecated=true ranks them",
+    ("aa_leaderboard", '{"sort": "nonsense_sort", "top": 2}'):
+        "an unknown sort token lists the closest accepted metric names instead of "
+        "dead-ending (argument vocabulary, round 6)",
+    ("aa_providers", '{"model": "kimi-k3", "sort": "nope", "top": 2}'):
+        "an unknown provider sort lists the closest accepted sort keys and the "
+        "alias list",
     ("aa_raw", '{"kind": "eval", "query": "claude-opus-5-5", "top": 1}'):
         "aa_raw kind=eval validates the slug: a model slug is rejected with "
         "'kind=eval expects an evaluation slug (e.g. gpqa-diamond)' instead of "

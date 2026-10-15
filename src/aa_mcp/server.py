@@ -595,6 +595,20 @@ def _primary_cache(tool: str) -> str:
 
 
 
+#: tokens that ask a ``fields=``/``metrics=`` list for *every* column the surface has
+_ALL_FIELD_TOKENS = {"all", "*", "everything", "every", "allfields"}
+
+
+def _is_wildcard_field(name: str) -> bool:
+    text = str(name).strip()
+    return text in ("*", "**") or _norm_alias(text) in _ALL_FIELD_TOKENS
+
+
+def _col_label(key: str) -> str:
+    metric = catalog.metric(key)
+    return metric.label if metric else key.replace("_", " ").title()
+
+
 def _cols(default: Sequence[tuple[str, str]], fields: Any,
           extra: Iterable[str] = (),
           identity: Sequence[tuple[str, str]] = ()) -> list[tuple[str, str]]:
@@ -602,13 +616,26 @@ def _cols(default: Sequence[tuple[str, str]], fields: Any,
 
     ``identity`` columns (Model/Slug/Host/...) are always rendered first, even
     when ``fields`` names only metrics, so a requested table is never anonymous.
+    A wildcard token (``all``/``*``/``everything``) selects the whole surface:
+    its default columns plus every ``extra`` column it can render.
     """
     if not fields:
         return list(default)
     extra = set(extra)
+    names = _split(fields)
+    if any(_is_wildcard_field(n) for n in names):
+        out = list(default)
+        keys = {k for k, _ in out}
+        for e in extra:
+            if e in keys:
+                continue
+            keys.add(e)
+            out.append((e, _col_label(e)))
+        prefix = [(k, label) for k, label in identity if k not in keys]
+        return prefix + out
     out: list[tuple[str, str]] = []
     keys: set[str] = set()
-    for name in _split(fields):
+    for name in names:
         try:
             key = _metric_key(name, "field")
         except ValueError:
@@ -618,8 +645,7 @@ def _cols(default: Sequence[tuple[str, str]], fields: Any,
         if key in keys:
             continue
         keys.add(key)
-        metric = catalog.metric(key)
-        out.append((key, metric.label if metric else name.replace("_", " ").title()))
+        out.append((key, _col_label(key)))
     prefix = [(k, label) for k, label in identity if k not in keys]
     return prefix + out
 
@@ -1675,6 +1701,13 @@ _BENCH_IDENTITY = [("name", "Model"), ("slug", "Slug")]
 _PROV_IDENTITY = [("host", "Host"), ("model_name", "Model")]
 
 
+#: ``aa_leaderboard sort=`` tokens that mean "rank by value" (score per $/task)
+_VALUE_SORT_RAW = {"intel/$", "intel/1$", "$/intel", "intel per $", "intel per dollar",
+                   "intelligence per dollar", "intelligence/$"}
+_VALUE_SORT_NORM = {"value", "intelpercost", "intelperdollar", "intelligenceperdollar",
+                    "intelperusd", "intelper1usd", "intelligencedollar", "bestvalue"}
+
+
 def _leaderboard(
     mode: str = "rank",
     sort: str = "intelligence",
@@ -1698,7 +1731,17 @@ def _leaderboard(
             f"unknown mode {_q(mode)} — expected rank, value or frontier"
         )
     n = top if isinstance(top, int) and top > 0 else 10
-    sort_key = _metric_key(sort, "sort")
+    # an explicit "best value" sort token switches to the value ranking
+    # (score per $/task) instead of erroring as an unknown sort key.
+    sort_raw = str(sort).strip()
+    value_sort = (sort_raw.lower() in _VALUE_SORT_RAW
+                  or _norm_alias(sort_raw) in _VALUE_SORT_NORM)
+    if value_sort:
+        if mode == "rank":
+            mode = "value"
+        sort_key = _metric_key("intelligence", "sort")
+    else:
+        sort_key = _metric_key(sort, "sort")
     _mixed = catalog.BENCHMARKS.get(sort_key)
     if _mixed is not None and _mixed.unit == "mixed":
         raise ValueError(_breakdown_text(sort_key, _mixed.label))
@@ -1792,7 +1835,10 @@ def _leaderboard(
         models = [m for m, _ in pairs]
         value_of = functools.partial(_value_of, score_key=sort_key)
         cols = _cols(_LB_COLS + [("value", f"{label}/$")], fields, _LB_EXTRA, _LB_IDENTITY)
-        note = f"value = {label} per $/task, {where}"
+        note = f"value = {label} per $/task"
+        if value_sort:
+            note += f" (sort={sort_raw})"
+        note += f", {where}"
         footnotes += _missing_notes(all_models, [("cost_per_task", "cost per task", True)])
     else:
         # a rank table lists only the models the key actually scored — an
@@ -3025,13 +3071,22 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
 
     short = [m.short_name or m.name for m in models]
     labels = ["Metric", *short]
-    slug_row = len(set(short)) != len(short) or len(models) > 6
+    # with an explicit metrics= list, compact controls the extras: true (default)
+    # omits the Slug row and any all-null metric row, false includes them
+    slug_row = (not compact if metrics_arg
+                else len(set(short)) != len(short) or len(models) > 6)
+    shown_specs = list(row_specs)
+    dropped_rows = 0
+    if metrics_arg and compact:
+        shown_specs = [(k, lbl) for k, lbl in row_specs
+                       if any(cell(m, k) != "-" for m in models)]
+        dropped_rows = len(row_specs) - len(shown_specs)
     rows: list[list[str]] = []
     if slug_row:
         rows.append(["Slug", *[m.slug for m in models]])
     if view_arg == "diff":
         ref_name = short[0]
-        for key, label in row_specs:
+        for key, label in shown_specs:
             vals = [numeric(m, key) for m in models]
             cells: list[str] = []
             for i, m in enumerate(models):
@@ -3044,17 +3099,36 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
         view_note = (f"diff: each cell is value (Δ vs {render.clean(ref_name, None)}, "
                      "the first model); + means higher")
     else:
-        for key, label in row_specs:
+        for key, label in shown_specs:
             rows.append([label, *[cell(m, key) for m in models]])
         view_note = ""
 
     cache_name, api = _lb_cache()
-    count = f"{len(models)} models · {len(row_specs)} metrics"
+    metric_count = (f"{len(shown_specs)} of {len(row_specs)} metrics"
+                    if dropped_rows else f"{len(shown_specs)} metrics")
+    count = f"{len(models)} models · {metric_count}"
     note = view_note
     head = _header(count=count, note=note, name=cache_name, api=api,
                    source_label=_prov_label(rich_used))
-    footnotes = [(f"metrics: {metrics_arg or 'default'}"
-                  f"{' (default set)' if not metrics_arg else ''}")]
+    if metrics_arg:
+        footnotes = [f"metrics: {metrics_arg}"]
+    else:
+        # the default set is a subset: say so (a first-try reader must not mistake
+        # it for "every metric"). The exact metrics=all row count would require
+        # loading the rich overlay + every eval chart set for a footer line, so
+        # name the widening paths instead of paying that on the default path.
+        footnotes = [
+            f"showing the default {len(row_specs)}-row subset, not every metric: "
+            "metrics=all selects every published row these models have (rich "
+            "overlay + AA's eval chart set / homepage panels), metrics=benchmarks "
+            "limits to benchmarks/indexes"]
+    if metrics_arg and compact:
+        if slug_row is False:
+            footnotes.append("compact=true: Slug row omitted (compact=false adds it)")
+        if dropped_rows:
+            footnotes.append(
+                f"compact=true: {dropped_rows} all-null rows omitted "
+                "(compact=false includes them)")
     if page_fetched:
         footnotes.append(
             "model page fetched + merged for "
@@ -3089,9 +3163,6 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
                 text += f" … (+{len(names) - len(shown)} more)"
             footnotes.append(f"{text} from AA's {where} "
                              f"(top ~{counts[where]} models)")
-    if metrics_arg:
-        footnotes.append("compact is ignored when metrics= is given "
-                         "(metrics selects the rows)")
     if board_hint:
         footnotes.append(f"board {board_hint} ignored — every model resolved to a "
                          "language model, not an arena entry")
@@ -3589,10 +3660,26 @@ def _prov_sort_key(sort: str) -> str:
     for candidate in _PROV_SORT:  # tolerate price-in / cache.read spellings
         if _norm_alias(candidate) == norm:
             return candidate
+    near = ", ".join(_close(str(sort), list(_PROV_SORT) + list(_PROV_SORT_ALIASES)))
     raise ValueError(
-        f"unknown sort {_q(sort)} — accepted: {', '.join(_PROV_SORT)} "
+        f"unknown sort {_q(sort)} — closest: {near or 'none'}\n"
+        f"— accepted: {', '.join(_PROV_SORT)} "
         "(aliases: input, output, cache_read, cache_write, speed, latency, ctx, cost)"
     )
+
+
+def _with_sort_col(cols: Sequence[tuple[str, str]],
+                   sort_key: str) -> list[tuple[str, str]]:
+    """Append the sort key as a visible column when the default set omits it.
+
+    ``aa_providers sort=ttft`` reorders rows but the default columns hide TTFT,
+    so the ranking is unreadable — show what the table is sorted by (the same
+    rule ``aa_leaderboard`` already follows).
+    """
+    cols = list(cols)
+    if any(k == sort_key for k, _ in cols):
+        return cols
+    return cols + [(sort_key, _col_label(sort_key))]
 
 
 def _providers(model: str = "", host: str = "", top: int = 15,
@@ -3622,6 +3709,8 @@ def _providers(model: str = "", host: str = "", top: int = 15,
             return (f"# no provider endpoints recorded for {base.name} (aa.{base.slug}) "
                     "— the model-page providers array was empty or all filtered out")
         cols = _cols(_PROV_COLS_MODEL, fields, _PROV_EXTRA, [("host", "Host")])
+        if not fields:
+            cols = _with_sort_col(cols, sort_key)
         rows = [[_endpoint_cell(e, k) for k, _ in cols] for e in endpoints[:n]]
         count = f"{len(rows)} of {len(endpoints)} endpoints"
         head = _header(count=count,
@@ -3665,6 +3754,8 @@ def _providers(model: str = "", host: str = "", top: int = 15,
         return f"# no provider endpoints match {', '.join(sel) or 'filters'} — drop one filter"
 
     cols = _cols(_PROV_COLS, fields, _PROV_EXTRA, _PROV_IDENTITY)
+    if not fields:
+        cols = _with_sort_col(cols, sort_key)
     rows = [[_endpoint_cell(e, k) for k, _ in cols] for e in endpoints[:n]]
     explicit = bool(host or open_weights is not None or min_context is not None)
     if explicit:

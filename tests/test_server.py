@@ -14,7 +14,7 @@ import json
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
-from aa_mcp import catalog, server
+from aa_mcp import catalog, loaders, server
 from aa_mcp.normalize import Model
 
 # --------------------------------------------------------------------------- #
@@ -600,7 +600,8 @@ def test_compare_table_puts_models_in_columns(fake):
     assert out.splitlines()[1].startswith("| Metric | Alpha One | Beta Two |")
     assert "| Intelligence | 60.0 | 50.0 |" in out
     assert "| Intel/$ | 60.0 | 100.0 |" in out
-    assert "metrics: default" in out
+    assert "showing the default 8-row subset, not every metric" in out
+    assert "metrics=all selects every published row" in out
 
 
 def test_compare_diff_shows_deltas_against_the_first_model(fake):
@@ -927,10 +928,76 @@ def test_compare_spec_echo_reproduces_a_non_default_call(fake):
     assert server._compare(spec=spec) == out
 
 
-def test_compare_compact_is_documented_when_metrics_given(fake):
-    assert "compact is ignored when metrics= is given" in \
-        server._compare(["alpha", "beta"], metrics="gpqa")
-    assert "compact is ignored" not in server._compare(["alpha", "beta"])
+def test_compare_compact_controls_slug_row_and_null_rows(fake):
+    # with metrics=, compact=true (default) omits the Slug row and says so
+    compact = server._compare(["alpha", "beta"], metrics="gpqa,tps")
+    assert "| Slug |" not in compact
+    assert "compact=true: Slug row omitted (compact=false adds it)" in compact
+    # compact=false adds the Slug row
+    full = server._compare(["alpha", "beta"], metrics="gpqa,tps", compact=False)
+    assert "| Slug | alpha | beta |" in full
+    assert "Slug row omitted" not in full
+    # the default path is unchanged (Slug row only when it disambiguates)
+    assert "compact=true: Slug row omitted" not in server._compare(["alpha", "beta"])
+
+
+def test_compare_compact_drops_all_null_rows(fake):
+    compact = server._compare(["alpha", "beta"],
+                              metrics="gpqa,cost_per_task,cache_write")
+    assert "| Cache Write Price" not in compact      # all-null row dropped
+    assert "1 all-null rows omitted" in compact
+    full = server._compare(["alpha", "beta"],
+                           metrics="gpqa,cost_per_task,cache_write", compact=False)
+    assert "| Cache Write Price" in full
+    assert "all-null rows omitted" not in full
+
+
+def _endpoint(slug, host, **kw):
+    base = dict(model_slug=slug, model_name=slug, host=host, host_slug=host.lower(),
+                precision=None, price_in=1.0, price_out=2.0, cache_read=None,
+                cache_write=None, cache_hit_discount=None, cost_per_task=0.5,
+                tps=10.0, ttft=1.0, e2e=None, function_calling=True, json_mode=True,
+                openai_compatible=None, context_tokens=128_000, intelligence=50.0,
+                source="providers_model")
+    base.update(kw)
+    return loaders.Endpoint(**base)
+
+
+def test_providers_shows_the_column_it_sorted_by(fake, monkeypatch):
+    eps = [_endpoint("alpha", "hostA", ttft=0.7), _endpoint("alpha", "hostB", ttft=1.9)]
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: eps)
+    out = server._providers(model="alpha", sort="ttft", top=3)
+    assert "TTFT" in out.splitlines()[1]            # the sort column is visible
+    assert "0.7s" in out and "1.9s" in out
+    assert "by ttft" in out
+    # an explicit fields= list is still respected (no surprise column)
+    narrow = server._providers(model="alpha", sort="ttft", fields="host", top=3)
+    assert "TTFT" not in narrow
+
+
+def test_provider_sort_error_lists_closest():
+    with pytest.raises(ValueError) as exc:
+        server._prov_sort_key("speeed")
+    assert "closest" in str(exc.value) and "speed" in str(exc.value)
+
+
+def test_leaderboard_accepts_value_sort_tokens(fake):
+    out = server._leaderboard(sort="intel_per_cost", top=3)
+    assert "value = Intel per $/task (sort=intel_per_cost)" in out
+    assert "Intel/$" in out
+    assert server._leaderboard(sort="intel/$", top=2).count("(sort=intel/$)") == 1
+    assert server._leaderboard(sort="value", top=2).count("(sort=value)") == 1
+    # the explicit mode=value path is unchanged
+    assert "value = Intel per $/task, active only" in \
+        server._leaderboard(mode="value", top=3)
+
+
+def test_cols_accepts_a_wildcard_field():
+    cols = server._cols([("a", "A"), ("b", "B")], "all", ("c", "d"), [("id", "Id")])
+    assert [k for k, _ in cols][:3] == ["id", "a", "b"]
+    assert set(k for k, _ in cols) == {"id", "a", "b", "c", "d"}
+    assert [k for k, _ in server._cols([("a", "A")], "*", ("b",))] == ["a", "b"]
+    assert [k for k, _ in server._cols([("a", "A")], "everything", ())] == ["a"]
 
 
 def test_compare_sanitizes_a_hostile_scraped_name(monkeypatch):
