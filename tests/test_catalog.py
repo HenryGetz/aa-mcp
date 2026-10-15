@@ -44,7 +44,8 @@ def test_all_33_eval_slugs_are_covered():
 
 def test_benchmarks_have_unit_and_desc():
     for b in catalog.BENCHMARKS.values():
-        assert b.unit in ("%", "Elo", "index", "mixed", "s", "tok/s", "USD/task")
+        assert b.unit in ("%", "Elo", "index", "mixed", "s", "tok/s", "USD/task",
+                          "text")
         assert b.desc and b.key
 
 
@@ -184,6 +185,8 @@ _NEW_BENCHMARKS = {
     "cweBenchRefusalRate": ("pct", "low"),
     "cybergymE2eRefusalRate": ("pct", "low"),
     "deepsecBenchRefusalRate": ("pct", "low"),
+    "cyberRefusalRate": ("pct", "low"),
+    "cyberMitigationStatus": ("str", "high"),
 }
 
 
@@ -247,6 +250,7 @@ def test_lower_is_better_marks_match_descriptions():
     assert lowered == {
         "omniscienceHallucinationRate",
         "cweBenchRefusalRate",
+        "cyberRefusalRate",
         "cybergymE2eRefusalRate",
         "deepsecBenchRefusalRate",
     }
@@ -469,7 +473,17 @@ def test_rankables_all_by_default_sorted_and_unique():
 
 
 def test_rankable_how_hints_are_actionable():
-    assert catalog.rankable("gpqa").how == "aa_benchmark_leaderboard benchmark=gpqa"
+    assert catalog.rankable("gpqa").how == "aa_leaderboard sort=gpqa"
+    assert catalog.rankable("cyberIndex").how == "aa_leaderboard sort=cyberIndex"
+    assert catalog.rankable("cyberRefusalRate").how == \
+        "aa_leaderboard sort=cyberRefusalRate"
+    assert catalog.rankable("cweBench").how == "aa_leaderboard sort=cweBench"
+    # a chart key with no eval-page slug has no cross-model column to sort
+    assert catalog.rankable("when2call").how == \
+        "aa_benchmark_leaderboard benchmark=when2call"
+    # a container/breakdown kind keeps the honest explanatory error path
+    assert catalog.rankable("aa3dBreakdown").how == \
+        "aa_benchmark_leaderboard benchmark=aa3dBreakdown"
     assert catalog.rankable("tps").how == "aa_leaderboard sort=tps"
     assert catalog.rankable("cost_per_task").how == "aa_pareto x=cost_per_task"
     assert catalog.rankable("text_to_speech").how == "aa_media board=text_to_speech"
@@ -491,8 +505,6 @@ _HOW_TOOLS = {
 _PARETO_AXES = {"cost_per_task", "index_total_cost", "out_tokens_per_task",
                 "time_per_task", "tps", "context_tokens", "params_b", "ttft",
                 "price_in", "price_out"}
-#: surfaces whose values ``aa_leaderboard sort=`` can actually serve
-_LEADERBOARD_SURFACES = {"leaderboard", "rich"}
 
 
 def test_every_rankable_how_hint_is_well_formed():
@@ -518,25 +530,31 @@ def test_every_rankable_how_hint_is_well_formed():
             assert value in _PARETO_AXES, (key, r.how)
 
 
-def test_aa_leaderboard_hint_only_for_leaderboard_or_rich_surfaces():
-    """``aa_leaderboard sort=`` is only hinted for leaderboard/rich values.
+def test_aa_leaderboard_hint_covers_every_reachable_surface():
+    """``aa_leaderboard sort=`` is the default path for every reachable key.
 
-    This is the round-5 defect: ``cyberIndex`` (a homepage-panel index) was
-    hinted as ``aa_leaderboard sort=cyberIndex``, which errors because the
-    700-row leaderboard has no such column. It must be hinted at
-    ``aa_benchmark_leaderboard benchmark=cyberIndex`` instead.
+    Wave F made the leaderboard's sort/filter/field path join a key's values from
+    AA's eval chart set / homepage panel by slug, so a chart/panel-backed index
+    (the Cyber Index) is now first-class like ``intelligence``. Keys that are
+    genuinely unreachable — the JSON-API-only indexes, container/breakdown kinds,
+    and chart keys with no eval-page slug — keep the explanatory error path.
     """
     for key, r in catalog.RANKABLES.items():
-        if not r.how.startswith("aa_leaderboard sort="):
+        bench = catalog.BENCHMARKS.get(key)
+        if bench is None:
             continue
-        assert r.surface in _LEADERBOARD_SURFACES, (key, r.surface)
-        # a benchmark AA publishes only on an eval chart set / homepage panel
-        # cannot be served by the leaderboard's sort
-        assert "panel" not in r.desc.lower(), (key, r.desc)
-    # the audited panel-only index is hinted at the tool that reaches it
-    assert catalog.RANKABLES["cyberIndex"].surface == "chart"
-    assert catalog.RANKABLES["cyberIndex"].how == \
-        "aa_benchmark_leaderboard benchmark=cyberIndex"
+        if r.how.startswith("aa_leaderboard sort="):
+            assert r.surface in {"leaderboard", "rich", "chart"}, (key, r.surface)
+            assert bench.unit != "mixed", (key, bench.unit)
+            if r.surface == "chart":
+                assert bench.slug, (key, r.slug)
+        else:
+            assert (bench.unit == "mixed" or bench.source_hint == "api"
+                    or not bench.slug), (key, r.how)
+    # the audited panel/chart index and its companions are now first-class
+    for key in ("cyberIndex", "cyberRefusalRate", "cyberMitigationStatus"):
+        assert catalog.RANKABLES[key].surface == "chart"
+        assert catalog.RANKABLES[key].how == f"aa_leaderboard sort={key}"
 
 
 # --------------------------------------------------------------------------- #

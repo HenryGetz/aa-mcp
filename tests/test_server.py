@@ -209,7 +209,7 @@ def test_pareto_top_and_include_all(fake):
 def test_pareto_missing_score_explains_itself(fake):
     with pytest.raises(ValueError) as exc:
         server._pareto(score="openness")
-    assert "no values" in str(exc.value)
+    assert "no per-model values" in str(exc.value)
 
 
 def test_pareto_missing_axis_explains_itself(fake, monkeypatch):
@@ -281,6 +281,110 @@ def test_compare_tool_signature_matches_the_brief():
 def test_benchmarks_tool_signature_matches_the_brief():
     params = list(inspect.signature(server.aa_benchmarks).parameters)
     assert params == ["query", "domain", "tag", "verbose"]
+
+
+# --------------------------------------------------------------------------- #
+# Wave F: aa_leaderboard ranks any key with per-model values on any surface
+# --------------------------------------------------------------------------- #
+
+
+def _patch_leaderboard(monkeypatch, base, extra):
+    """Point the leaderboard's data layer at ``base`` rows + an ``extra`` source."""
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (list(base), rich))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: list(base))
+    monkeypatch.setattr(server, "_lb_cache", lambda: ("leaderboard", False))
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name, api=False: (None, False))
+    monkeypatch.setattr(server, "_extra_score_models",
+                        lambda key, refresh=False: list(extra.get(key, [])))
+
+
+def test_leaderboard_ranks_a_panel_backed_index_like_intelligence(monkeypatch):
+    """``sort=cyberIndex`` ranks the chart/panel subset and labels the coverage."""
+    base = [_model("gpt-x", "GPT X", intelligence=50.0, cost_per_task=1.0),
+            _model("llama-y", "Llama Y", intelligence=40.0, cost_per_task=0.5)]
+    chart = [_model("gpt-x", "GPT X", evals={"cyberIndex": 68.7}),
+             _model("llama-y", "Llama Y", evals={"cyberIndex": 20.0}),
+             _model("panel-only", "Panel Only", evals={"cyberIndex": 55.0})]
+    _patch_leaderboard(monkeypatch, base, {"cyberIndex": chart})
+
+    out = server._leaderboard(sort="cyberIndex", top=5)
+    lines = out.splitlines()
+    assert "3 of 3 scored (2 tracked)" in lines[0]          # honest coverage
+    assert "chart set" in lines[0]                          # and source
+    assert "joined onto the leaderboard rows" in out        # and a footnote
+    # ranked by the joined score, descending (higher is better), panel-only included
+    body = out.index("GPT X") < out.index("Panel Only") < out.index("Llama Y")
+    assert body
+    # the x-columns still come from the leaderboard row the score was joined onto
+    assert "$1.00" in out and "$0.50" in out
+
+
+def test_leaderboard_value_mode_works_for_a_panel_backed_score(monkeypatch):
+    base = [_model("gpt-x", "GPT X", cost_per_task=1.0),
+            _model("llama-y", "Llama Y", cost_per_task=0.5)]
+    chart = [_model("gpt-x", "GPT X", evals={"cyberIndex": 68.7}),
+             _model("llama-y", "Llama Y", evals={"cyberIndex": 20.0})]
+    _patch_leaderboard(monkeypatch, base, {"cyberIndex": chart})
+    out = server._leaderboard(mode="value", sort="cyberIndex")
+    assert "value = AA Cyber Ind per $/task" in out
+    assert "68.7" in out and "20.0" in out
+
+
+def test_leaderboard_frontier_mode_works_for_a_panel_backed_score(monkeypatch):
+    base = [_model("gpt-x", "GPT X", cost_per_task=1.0),
+            _model("llama-y", "Llama Y", cost_per_task=0.5)]
+    chart = [_model("gpt-x", "GPT X", evals={"cyberIndex": 68.7}),
+             _model("llama-y", "Llama Y", evals={"cyberIndex": 20.0})]
+    _patch_leaderboard(monkeypatch, base, {"cyberIndex": chart})
+    out = server._leaderboard(mode="frontier", sort="cyberIndex")
+    assert "Cyber Index vs $/task" in out.splitlines()[0]
+    assert "eval chart/panel" in out.splitlines()[0]
+    assert "joined onto the leaderboard rows" in out
+
+
+def test_leaderboard_fields_carry_the_companion_metrics(monkeypatch):
+    base = [_model("gpt-x", "GPT X", cost_per_task=1.0)]
+    panel = [_model("gpt-x", "GPT X",
+                    evals={"cyberRefusalRate": 0.1, "cyberMitigationStatus": "standard"}),
+             _model("llama-y", "Llama Y",
+                    evals={"cyberRefusalRate": 0.4,
+                           "cyberMitigationStatus": "unmitigated"})]
+    _patch_leaderboard(monkeypatch, base,
+                       {"cyberRefusalRate": panel, "cyberMitigationStatus": panel})
+    out = server._leaderboard(
+        sort="cyberRefusalRate",
+        fields="cyberRefusalRate,cyberMitigationStatus")
+    assert "Cyber Refus" in out and "Cyber Mitiga" in out
+    assert "10.0%" in out and "40.0%" in out          # refusal rate, % formatted
+    assert "standard" in out and "unmitigated" in out  # mitigation status
+    assert out.index("10.0%") < out.index("40.0%")     # lower refusal ranks first
+
+
+@pytest.mark.parametrize("key,value,evals", [
+    ("cyberIndex", "68.7", {"cyberIndex": 68.7}),      # eval chart set / panel
+    ("frontierCode", "50.0%", {"frontierCode": 0.5}),  # rich dataset
+    ("gpqa", "40.0%", {"gpqa": 0.4}),                  # 700-row leaderboard
+])
+def test_leaderboard_reaches_a_key_from_each_surface(monkeypatch, key, value, evals):
+    base = [_model("beta", "Beta Two", cost_per_task=0.5)]
+    row = _model("beta", "Beta Two", evals=evals)
+    _patch_leaderboard(monkeypatch, base, {key: [row]})
+    out = server._leaderboard(sort=key, top=5)
+    assert "Beta Two" in out and value in out
+    assert "scored" in out.splitlines()[0]
+
+
+def test_leaderboard_explains_a_deprecated_only_key(monkeypatch):
+    base = [_model("old", "Old", deprecated=True, evals={"mmluPro": 0.9}),
+            _model("new", "New", intelligence=50.0)]
+    _patch_leaderboard(monkeypatch, base, {})
+    with pytest.raises(ValueError) as exc:
+        server._leaderboard(sort="mmluPro")
+    assert "only published for deprecated models" in str(exc.value)
+    out = server._leaderboard(sort="mmluPro", include_deprecated=True)
+    assert "1 of 1 scored" in out.splitlines()[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -410,7 +514,7 @@ def test_benchmarks_domain_rows_and_count(fake):
     out = server._benchmarks(domain="security")
     assert "domain=security" in out.splitlines()[0]
     assert "of" in out.splitlines()[0] and "rankables" in out.splitlines()[0]
-    assert "aa_benchmark_leaderboard benchmark=cweBench" in out
+    assert "aa_leaderboard sort=cweBench" in out
 
 
 def test_benchmarks_hides_measures_for_large_results(fake):
@@ -681,7 +785,7 @@ def test_rankables_yaml_resource_lists_every_rankable():
     lines = [line for line in text.splitlines() if line.startswith("- key: ")]
     assert len(lines) == len(server._rankable_list())
     assert "- key: gpqa" in text
-    assert "how: aa_benchmark_leaderboard benchmark=gpqa" in text
+    assert "how: aa_leaderboard sort=gpqa" in text
 
 
 def test_compare_spec_resource_is_the_template():

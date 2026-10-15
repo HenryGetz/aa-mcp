@@ -52,6 +52,7 @@ __all__ = [
     "agents",
     "data_source",
     "eval_catalog",
+    "eval_label",
     "eval_models",
     "home_boards",
     "leaderboard",
@@ -74,6 +75,7 @@ __all__ = [
     "rich_dataset",
     "rich_seed",
     "sitemap_paths",
+    "union_eval_catalog",
     "url",
 ]
 
@@ -1111,7 +1113,28 @@ def parse_home_boards(text: str) -> dict[str, list[dict]]:
         rows = list(obj.get("models") or []) if isinstance(obj, dict) else []
         out[name] = _sort_desc(rows, metric) if desc else _sort_asc(rows, metric)
     for panel in _eval_panels(payload):
-        out[f"eval:{panel['evalSlug']}"] = list(panel["models"])
+        panel_key = f"eval:{panel['evalSlug']}"
+        rows = out.setdefault(panel_key, [])
+        # AA publishes more than one panel for an eval slug (e.g. the Cyber Index
+        # capability panel and a security panel carrying refusalRate /
+        # mitigationStatus). Merge them by model slug — union of fields, first
+        # non-null wins — so no companion scalar is dropped (wave F).
+        index = {r.get("slug"): r for r in rows
+                 if isinstance(r, dict) and r.get("slug")}
+        for row in panel["models"]:
+            if not isinstance(row, dict):
+                rows.append(row)
+                continue
+            slug = row.get("slug")
+            merged = index.get(slug)
+            if merged is None:
+                rows.append(row)
+                if slug:
+                    index[slug] = row
+                continue
+            for field, value in row.items():
+                if merged.get(field) is None and value is not None:
+                    merged[field] = value
     return out
 
 
@@ -1749,11 +1772,63 @@ def parse_eval_catalog(html_text: str) -> list[dict]:
     return cards
 
 
+#: slug word -> display spelling for labels derived from a slug (sitemap-only evals).
+_EVAL_LABEL_WORDS = {
+    "aa": "AA", "ai": "AI", "api": "API", "cwe": "CWE", "e2e": "E2E",
+    "gdp": "GDP", "gdpval": "GDPval", "gpqa": "GPQA", "hle": "HLE",
+    "mlcr": "MLCR", "mmlu": "MMLU", "mmmu": "MMMU", "pdf": "PDF",
+    "sre": "SRE", "swe": "SWE", "tau2": "\u03c4\u00b2", "tau3": "\u03c4\u00b3",
+}
+
+
+def eval_label(slug: str) -> str:
+    """A readable title derived from an evaluation slug (sitemap-only fallback)."""
+    words = [w for w in str(slug).split("-") if w]
+    return " ".join(_EVAL_LABEL_WORDS.get(w, w.capitalize()) for w in words)
+
+
+def union_eval_catalog(cards: list[dict], paths: list[str]) -> list[dict]:
+    """The card list plus every sitemap ``/evaluations/<slug>`` it omits.
+
+    ``/evaluations`` server-renders a curated card grid that does not list every
+    eval page AA publishes (e.g. ``artificial-analysis-cyber-index``), so the
+    sitemap's ``/evaluations/*`` paths are unioned in. Card metadata (title /
+    description / tags) is kept where the card exists; the rest get a label
+    derived from the slug (wave F).
+    """
+    out: list[dict] = list(cards)
+    seen = {str(c.get("slug") or "") for c in cards}
+    for path in paths:
+        if not path.startswith("/evaluations/"):
+            continue
+        slug = path[len("/evaluations/"):].strip("/")
+        if not slug or "/" in slug or slug in seen:
+            continue
+        seen.add(slug)
+        out.append({"slug": slug, "title": eval_label(slug),
+                    "description": "", "tags": []})
+    return out
+
+
 def eval_catalog(refresh: bool = False) -> list[dict]:
-    """Every evaluation card from the plain-HTML ``/evaluations`` index."""
+    """Every evaluation AA publishes: the ``/evaluations`` cards + the sitemap.
+
+    The card grid alone omits eval pages (the Cyber Index among them), so the
+    sitemap's ``/evaluations/*`` paths are unioned in. Both payloads are read
+    through the memo (keyed on their cache file mtimes), so a warm call re-parses
+    nothing.
+    """
     source_url = url(SOURCE_URLS["eval_catalog"])
     got = fetch.get(source_url, "eval_catalog", refresh=refresh, rsc=False)
-    key = (str(got.path), got.fetched_at)
+    try:
+        sitemap = fetch.get(url(SOURCE_URLS["sitemap"]), "sitemap",
+                            refresh=refresh, rsc=False)
+        sitemap_key = (str(sitemap.path), sitemap.fetched_at)
+        paths = parse_sitemap(sitemap.text)
+    except Exception:  # best-effort: cards are still a usable catalog
+        sitemap_key = ("", 0.0)
+        paths = []
+    key = (str(got.path), got.fetched_at, sitemap_key)
     if not refresh:
         memo = _EVAL_CATALOG_MEMO.get(key)
         if memo is not _MISS:
@@ -1764,8 +1839,9 @@ def eval_catalog(refresh: bool = False) -> list[dict]:
             f"{source_url}: no evaluation cards found in the payload — "
             f"{_refresh_note(got.path, source_url)}"
         )
-    _EVAL_CATALOG_MEMO.put(key, cards)
-    return cards
+    rows = union_eval_catalog(cards, paths)
+    _EVAL_CATALOG_MEMO.put(key, rows)
+    return rows
 
 
 # --------------------------------------------------------------------------- #

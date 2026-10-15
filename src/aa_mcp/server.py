@@ -869,11 +869,18 @@ def _no_rank_text(key: str, label: str) -> str:
             "model page only.\n"
             "— read it with aa_model <slug>."
         )
+    bench = catalog.BENCHMARKS.get(key)
+    if bench is not None and bench.source_hint == "chart" and not bench.slug:
+        return (
+            f"{label!r} is published only on individual model pages — AA exposes no "
+            "cross-model column for it in the current source.\n"
+            "— read it with aa_model <slug>."
+        )
     return (
-        f"{label!r} has no values in the 700-row leaderboard — it is chart-set / "
-        "model-page only.\n"
-        "— rank it with aa_benchmark_leaderboard benchmark=<slug>, or read one model "
-        "with aa_model <slug>."
+        f"{label!r} has no per-model values in the current source — it is not in the "
+        "700-row leaderboard, and AA's eval chart set / homepage panel carry none "
+        "either.\n"
+        "— try refresh=true to re-fetch, or read one model with aa_model <slug>."
     )
 
 
@@ -1114,6 +1121,11 @@ def _build_fallback_rankables() -> dict[str, _Rankable]:
         kind = "index" if bench.unit == "index" else "benchmark"
         if bench.unit == "mixed":
             how = f"aa_model <model-slug> sections=benchmarks ({bench.label} breakdown)"
+        elif (bench.source_hint != "api"
+              and (bench.source_hint != "chart" or bench.slug)):
+            # mirrors catalog's rule: the leaderboard path reaches leaderboard /
+            # rich / chart-set / panel keys (the join is by eval-page slug)
+            how = f"aa_leaderboard sort={key}"
         else:
             how = f"aa_benchmark_leaderboard benchmark={key}"
             if bench.source_hint == "api":
@@ -1415,13 +1427,16 @@ def _axis_missing_text(key: str, label: str) -> str:
 
 
 def _score_surface(key: str, refresh: bool = False) -> tuple[list[Model], str]:
-    """Models carrying ``key`` from AA's eval chart set or homepage panel.
+    """Models carrying ``key`` from AA's eval chart set and homepage panel(s).
 
-    Returns ``(models, source)`` where ``source`` is ``"chart set"``,
-    ``"homepage panel"`` or ``""``. The same source chain
-    ``aa_benchmark_leaderboard`` uses; needed so a frontier or a comparison works
-    for a benchmark the 700-row leaderboard does not carry (e.g. the cyber
-    boards, which AA publishes only on an eval page / panel).
+    Returns ``(models, source)`` where ``source`` names the surfaces that
+    contributed (``"chart set"``, ``"homepage panel"``, or both joined with
+    ``" + "``), or ``""`` when AA publishes no per-model values for ``key``.
+    Every surface is unioned in one pass — the eval page's chart set and the
+    homepage panel(s) (which AA publishes per eval slug, sometimes twice) — so a
+    companion scalar carried by only one of them is still reachable. The chart
+    record wins where both carry a value (it is the richer record); panel-only
+    models are appended rather than dropped.
     """
     bench = catalog.BENCHMARKS.get(key)
     if bench is None or not bench.slug:
@@ -1432,16 +1447,20 @@ def _score_surface(key: str, refresh: bool = False) -> tuple[list[Model], str]:
     except (AAFetchError, ValueError):
         chart = []
     scored = [m for m in chart if select.lookup(m, key) is not None]
-    if scored:
-        return scored, "chart set"
+    sources = ["chart set"] if scored else []
     panel = _home_rows(refresh).get(f"eval:{bench.slug}") or []
-    out: list[Model] = []
+    panel_models: list[Model] = []
     for item in panel:
-        if isinstance(item, dict) and item.get("score") is not None:
-            model = _panel_model(item, key)
-            if model.slug:
-                out.append(model)
-    return out, ("homepage panel" if out else "")
+        if not isinstance(item, dict) or _panel_value(item, key) is None:
+            continue
+        model = _panel_model(item, key)
+        if model.slug:
+            panel_models.append(model)
+    if panel_models:
+        sources.append("homepage panel")
+        have = {m.slug for m in scored}
+        scored = scored + [m for m in panel_models if m.slug not in have]
+    return scored, " + ".join(sources)
 
 
 def _extra_score_models(key: str, refresh: bool = False) -> list[Model]:
@@ -1459,6 +1478,33 @@ def _extra_score_models(key: str, refresh: bool = False) -> list[Model]:
 def _extra_score_meta(key: str) -> tuple[str, int]:
     """``(source, scored)`` recorded for ``key`` by this call's extra join."""
     return _call_cache().get("extra_source", {}).get(key, ("", 0))
+
+
+def _join_extra_scores(
+    models: Sequence[Model], key: str, refresh: bool = False
+) -> tuple[list[Model], str]:
+    """Join AA's eval chart-set / homepage-panel values for ``key`` onto ``models``.
+
+    Returns ``(models, source)``; ``source`` is ``""`` when AA publishes no
+    per-model surface for ``key`` (so the caller keeps its honest no-rank error).
+    The 700-row leaderboard record is the base and the chart/panel record is
+    merged under it (same slug), so leaderboard-only columns (cost, speed) survive
+    while the chart/panel score is added. Models AA publishes only on a panel /
+    chart set are appended, so a ranking is never silently truncated to the rows
+    the leaderboard happens to carry.
+    """
+    extra = _extra_score_models(key, refresh)
+    if not extra:
+        return list(models), ""
+    base = {m.slug: m for m in models}
+    joined: dict[str, Model] = {}
+    for m in extra:
+        if not m.slug:
+            continue
+        joined[m.slug] = normalize.merge(m, base[m.slug]) if m.slug in base else m
+    out = [joined.get(m.slug, m) for m in models]
+    out += [joined[slug] for slug in joined if slug not in base]
+    return out, (_extra_score_meta(key)[0] or "chart set")
 
 
 def _score_label(key: str) -> str:
@@ -1507,17 +1553,10 @@ def _pareto(
     all_models, rich_used = _models_state(refresh, rich=rich)
     panel_used = False
     if not any(_metric_value(m, score_key) is not None for m in all_models):
-        extra = _extra_score_models(score_key, refresh)
-        if extra:
-            # join the extra source's score onto the model with the same slug so
-            # the x axis (cost/size/speed) comes from the merged dataset
-            base_by_slug = {m.slug: m for m in all_models}
-            joined = {m.slug: (normalize.merge(m, base_by_slug[m.slug])
-                               if m.slug in base_by_slug else m)
-                      for m in extra}
-            all_models = [joined.get(m.slug, m) for m in all_models]
-            all_models += [joined[s] for s in joined if s not in base_by_slug]
-            panel_used = True
+        # join the extra source's score onto the model with the same slug so the
+        # x axis (cost/size/speed) comes from the merged dataset (one join path)
+        all_models, extra_source = _join_extra_scores(all_models, score_key, refresh)
+        panel_used = bool(extra_source)
     models = select.filter_models(
         all_models,
         creator=creator or None,
@@ -1677,6 +1716,28 @@ def _leaderboard(
 
     all_models, rich_used = _models_state(
         refresh, rich=_rich_needed(refresh=refresh, sort_key=sort_key, fields=fields))
+    tracked = len(_lb_rows(refresh))
+    # One uniform ranking path: a sort key (or a requested field) whose per-model
+    # values live on AA's eval chart set / homepage panel is joined by slug before
+    # filtering, exactly like a leaderboard-native column (wave F).
+    extra_source = ""
+    sort_source = ""
+    wanted = [sort_key]
+    for field in _split(fields):
+        try:
+            wanted.append(_metric_key(field, "field"))
+        except ValueError:
+            continue
+    for key in dict.fromkeys(wanted):
+        if any(select.lookup(m, key) is not None for m in all_models):
+            continue
+        joined, source = _join_extra_scores(all_models, key, refresh)
+        if not source:
+            continue
+        all_models = joined
+        extra_source = extra_source or source
+        if key == sort_key:
+            sort_source = source
     models = select.filter_models(
         all_models,
         creator=creator or None,
@@ -1709,6 +1770,12 @@ def _leaderboard(
     # A sort key the merged source cannot supply must explain itself, never
     # silently reorder (the rich overlay already covers capability/Elo fields).
     if not any(select.lookup(m, sort_key) is not None for m in models):
+        if (not include_deprecated
+                and any(select.lookup(m, sort_key) is not None for m in all_models)):
+            raise ValueError(
+                f"{label!r} is only published for deprecated models in the current "
+                "source.\n— re-run with include_deprecated=true to rank them."
+            )
         raise ValueError(_no_rank_text(sort_key, label))
 
     footnotes: list[str] = _missing_notes(all_models, [
@@ -1728,7 +1795,10 @@ def _leaderboard(
         note = f"value = {label} per $/task, {where}"
         footnotes += _missing_notes(all_models, [("cost_per_task", "cost per task", True)])
     else:
-        models = select.sort_models(models, sort_key)
+        # a rank table lists only the models the key actually scored — an
+        # unscored row would sort last with a "-" and inflate the coverage claim
+        models = [m for m in select.sort_models(models, sort_key)
+                  if select.lookup(m, sort_key) is not None]
         cols = _cols(_LB_COLS, fields, _LB_EXTRA, _LB_IDENTITY)
         note = f"{label}, {where}"
 
@@ -1748,16 +1818,26 @@ def _leaderboard(
         )
 
     matching = len(models)
+    sort_scored = sum(1 for m in models if select.lookup(m, sort_key) is not None)
+    if sort_source:
+        footnotes.append(
+            f"{label} comes from AA's eval chart set / homepage panel "
+            f"({sort_scored} scored), joined onto the leaderboard rows — not a "
+            "full leaderboard"
+        )
     if mode == "value":
         count = (f"{len(shown)} of {matching} scored by value "
-                 f"({len(all_models)} tracked)")
+                 f"({tracked} tracked)")
     elif explicit:
         count = (f"{len(shown)} shown of {matching} matching "
-                 f"({len(all_models)} tracked)")
+                 f"({tracked} tracked)")
     else:
-        count = f"{len(shown)} of {matching} scored ({len(all_models)} tracked)"
+        count = f"{len(shown)} of {sort_scored} scored ({tracked} tracked)"
+    source_label = _prov_label(rich_used)
+    if extra_source:
+        source_label = f"{source_label} + {extra_source}"
     head = _header(count=count, note=note, name=cache_name, api=api,
-                   source_label=_prov_label(rich_used))
+                   source_label=source_label)
     out = [_table_block(head, [label for _, label in cols],
                         [_model_cells(m, cols, value_of) for m in shown],
                         trim=not fields)]
@@ -3253,10 +3333,13 @@ def _benchmark_leaderboard(
                     panel = []
                 raw = []
                 for item in panel:
-                    value = item.get("score")
+                    value = _panel_value(item, key)
                     if value is None or not keep(_panel_model(item, key)):
                         continue
-                    raw.append((_panel_model(item, key), float(value)))
+                    try:
+                        raw.append((_panel_model(item, key), float(value)))
+                    except (TypeError, ValueError):
+                        continue
                 pairs = raw
                 if pairs:
                     source_note = f"{bench.label} · homepage panel — not a full leaderboard"
@@ -3395,6 +3478,23 @@ def _raw_chart_pairs(slug: str, key: str, models: Sequence[Model], keep,
     return out
 
 
+#: benchmark key -> the homepage eval-panel field carrying its value. AA names
+#: the headline panel scalar ``score``; companion metrics keep their own name
+#: (the Cyber Index panel ships ``refusalRate`` and ``mitigationStatus``).
+_PANEL_FIELDS = {
+    "cyberRefusalRate": "refusalRate",
+    "cyberMitigationStatus": "mitigationStatus",
+    "cweBenchRefusalRate": "refusalRate",
+    "cybergymE2eRefusalRate": "refusalRate",
+    "deepsecBenchRefusalRate": "refusalRate",
+}
+
+
+def _panel_value(item: dict, key: str) -> Any:
+    """The homepage-panel value for ``key`` (``score`` unless the key is a companion)."""
+    return item.get(_PANEL_FIELDS.get(key, "score"))
+
+
 def _panel_model(item: dict, key: str) -> Model:
     """Wrap a homepage eval-panel row as a minimal :class:`Model` for filtering."""
     return Model(
@@ -3405,7 +3505,7 @@ def _panel_model(item: dict, key: str) -> Model:
         params_b=None, active_params_b=None, context_tokens=None, license=None,
         license_url=None, weights_url=None, knowledge_cutoff=None, size_class=None,
         modalities_in=(), modalities_out=(), intelligence=None, estimated=False,
-        indices={}, evals={key: item.get("score")}, pricing={}, speed={},
+        indices={}, evals={key: _panel_value(item, key)}, pricing={}, speed={},
         cost_per_task=None, cost_breakdown=None, per_eval_cost=None, source="panel",
     )
 

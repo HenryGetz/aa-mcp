@@ -49,6 +49,16 @@ while the gap is small, or "<model> has no published pricing or speed on AA"). T
 included); `compact` selects the core rows for the default metric set and is a
 documented no-op when `metrics=` is given.
 
+`aa_leaderboard sort=<key>` is the uniform ranking path: it ranks any key with
+per-model values on any surface it can reach — the 700-row leaderboard, the rich
+overlay, or an eval chart set / homepage panel (joined by slug) — so a
+chart/panel-backed index (the AA Cyber Index, its refusal-rate and
+mitigation-status companions, the cyber boards, AA-3D, MMLU-Pro, …) ranks exactly
+like `intelligence`, with `mode=value`/`mode=frontier`/`fields=` too. The header
+states the real coverage (`n of m scored`, `700 tracked`) and the source, and the
+footnote names the surface joined; a key AA has no cross-model values for returns
+an explanatory error, never a bare failure.
+
 Trust these, do not re-derive:
 
 - **Cost per task is already cache-aware** (cache read + cache write + input +
@@ -113,8 +123,9 @@ Leaderboard-wide (full cross-model ranking available):
 - ITBench-AA (SRE) · % · 45 · Kubernetes incident root-cause analysis.
 - AA-Omniscience · index · 574 · see `indexes`.
 
-Chart-set only (AA exposes these for a curated model list, typically 5-32 models per
-eval page — not a full leaderboard; the tool states this):
+Chart-set / homepage-panel (AA exposes these for a curated model list, typically
+5-32 models per eval page — a subset, not a full leaderboard; `aa_leaderboard
+sort=<key>` joins them by slug and the header/footnote state the real coverage):
 - LiveCodeBench · % · competitive programming, contamination-free.
 - AIME 2025 · % · 30 olympiad math problems.
 - HLE Multichoice · % · HLE multiple-choice subset.
@@ -130,13 +141,17 @@ eval page — not a full leaderboard; the tool states this):
 - AA-3D · Elo · three-dimensional reasoning/design tasks.
 - Global-MMLU-Lite, MMLU-Pro, Math-500, When2Call, WildGuardTest · % · knowledge,
   math, tool-calling and safety suites.
-- Security boards (homepage, top 20): AA Cyber Index, CWE-Bench-AA,
-  DeepSecBench-AA, CyberGym-E2E-AA.
+- Security boards (homepage, top 20): AA Cyber Index (`cyberIndex`) with its
+  companions Cyber Refusal (`cyberRefusalRate`, lower is better) and Cyber
+  Mitigation (`cyberMitigationStatus`, standard/unmitigated), plus CWE-Bench-AA,
+  DeepSecBench-AA and CyberGym-E2E-AA (each with its own refusal-rate key).
 
 Index membership (v4.3.2) is marked per benchmark in `aa_benchmarks`. The
 `Coverage` column is computed live from the source chain the ranking tools use
 (700-row leaderboard → rich overlay → eval chart set / homepage panel), so a
-benchmark AA fetches live is never labelled "not fetched".
+benchmark AA fetches live is never labelled "not fetched" — and
+`aa_leaderboard sort=<key>` ranks that same chain, stating the real coverage
+(`n of m scored`, `700 tracked`) and the surface it joined.
 
 ## pricing
 
@@ -199,7 +214,7 @@ context_tokens (ctx), params_b, active_params_b, release_date,
 knowledge_cutoff, license, weights_url, is_open_weights (open), is_reasoning,
 effort, deprecated, size_class, modalities_in, modalities_out, creator, slug, name
 plus every benchmark key listed in `benchmarks` (e.g. gpqa, hle, mmmuPro,
-briefcaseElo, terminalBench40). Media arenas also accept `ci_lower`, `ci_upper`
+briefcaseElo, terminalBench40, cyberIndex, cyberRefusalRate, cyberMitigationStatus). Media arenas also accept `ci_lower`, `ci_upper`
 and `ci` (the 95% confidence interval).
 
 ## sources
@@ -207,6 +222,8 @@ and `ci` (the 95% confidence interval).
 - Site: https://artificialanalysis.ai — `/leaderboards/models` (all variants),
   `/models/<slug>` (rich record + chart set), `/models/<slug>/providers`,
   `/leaderboards/providers`, `/evaluations/<slug>`, `/evaluations` (catalog),
+  `/sitemap.xml` (the eval catalog is the union of the `/evaluations` cards and the
+  sitemap `/evaluations/*` paths, so every published eval page is discoverable),
   media/agent leaderboards, homepage (speech + security panels).
 - Transport: `RSC: 1` request header returns the Next.js flight payload (JSON-ish,
   ~1.2 MB gzip-transfer for the leaderboard). AA redeploys often; never hardcode

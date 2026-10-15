@@ -43,6 +43,23 @@ def cases() -> list[tuple[str, dict]]:
                  "price_in", "price_out", "params_b", "release_date", "omniscience",
                  "briefcaseElo", "capabilities.legal", "gpqa", "terminalBench40"):
         out.append(("aa_leaderboard", {"sort": sort, "top": 2}))
+    # Wave F: every chart/panel-backed key ranks through the default leaderboard
+    for sort in ("cyberIndex", "cyberRefusalRate", "cyberMitigationStatus",
+                 "cweBench", "deepsecBench", "cybergymE2e", "cweBenchRefusalRate",
+                 "aa3dElo", "harveyLab", "globalMmluLiteScore", "math500",
+                 "frontierCode", "enterpriseOpsGym", "gdpPdfAllPass", "mlcrOverall",
+                 "analystAgentPassAt1", "mlcrAccuracy"):
+        out.append(("aa_leaderboard", {"sort": sort, "top": 2}))
+    out += [
+        # F2: the companion metrics are usable as fields and modes, like intelligence
+        ("aa_leaderboard", {"sort": "cyberIndex", "mode": "frontier", "top": 3}),
+        ("aa_leaderboard", {"sort": "cyberIndex", "mode": "value", "top": 3}),
+        ("aa_leaderboard", {"sort": "cyberIndex", "top": 3,
+                            "fields": "cyberIndex,cyberRefusalRate,cyberMitigationStatus"}),
+        # a chart key whose values only exist for deprecated models still explains itself
+        ("aa_leaderboard", {"sort": "mmluPro", "top": 2}),
+        ("aa_leaderboard", {"sort": "mmluPro", "top": 2, "include_deprecated": True}),
+    ]
     out += [
         ("aa_leaderboard", {"top": 2, "creator": "anthropic"}),
         ("aa_leaderboard", {"top": 2, "name": "opus max"}),
@@ -213,6 +230,9 @@ def cases() -> list[tuple[str, dict]]:
                                if kind in ("model", "providers", "eval") else ""}))
     # the eval happy path (kind=eval rejects a *model* slug, see EXPECTED_FAILURES)
     out.append(("aa_raw", {"kind": "eval", "top": 1, "query": "gpqa-diamond"}))
+    # F4: the sitemap-union makes a card-omitted eval page (the Cyber Index) valid
+    out.append(("aa_raw", {"kind": "eval", "top": 1,
+                           "query": "artificial-analysis-cyber-index"}))
     return out
 
 
@@ -227,6 +247,9 @@ EXPECTED_FAILURES: dict[tuple[str, str], str] = {
     ("aa_benchmark_leaderboard", '{"benchmark": "hleDiamond", "top": 2}'):
         "HLE Diamond has no values in the 700-row leaderboard, the eval chart "
         "set or the homepage panels — '+' reported as 'no data for benchmark'",
+    ("aa_leaderboard", '{"sort": "mmluPro", "top": 2}'):
+        "MMLU-Pro's only current values are on deprecated models; the default "
+        "(active-only) view explains that include_deprecated=true ranks them",
     ("aa_raw", '{"kind": "eval", "query": "claude-opus-5-5", "top": 1}'):
         "aa_raw kind=eval validates the slug: a model slug is rejected with "
         "'kind=eval expects an evaluation slug (e.g. gpqa-diamond)' instead of "

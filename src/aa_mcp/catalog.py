@@ -169,6 +169,13 @@ _B = [
      "CyberGym end-to-end cyber-range benchmark (homepage panel).", ("cyber",), False),
     ("deepsecBench", "DeepSecBench-AA", "deepsecbench-aa", "%",
      "DeepSecBench-AA deep security benchmark (homepage panel).", ("cyber",), False),
+    # Companion metrics AA publishes beside the Cyber Index on the same panel /
+    # eval chart set (wave F): the refusal rate and the mitigation status.
+    ("cyberRefusalRate", "Cyber Refusal", "artificial-analysis-cyber-index", "%",
+     "AA Cyber Index refusal rate; lower is better.", ("cyber", "safety"), False),
+    ("cyberMitigationStatus", "Cyber Mitigation", "artificial-analysis-cyber-index", "text",
+     "AA Cyber Index mitigation status (standard/unmitigated), published on the "
+     "homepage panel and eval chart set.", ("cyber", "safety"), False),
     ("aa3dElo", "AA-3D Elo", "aa-3d", "Elo",
      "AA-3D interactive 3D experience benchmark, reported as Elo.", ("media", "elo"), False),
     # Sub-scores / safety rates carried on eval-page records (audit 2026-10-14).
@@ -258,6 +265,8 @@ _SOURCE_HINTS: dict[str, str] = {
     "automationBenchBreakdown": "chart",
     "cweBenchRefusalRate": "chart",
     "cyberIndex": "chart",
+    "cyberRefusalRate": "chart",
+    "cyberMitigationStatus": "chart",
     "cybergymE2eRefusalRate": "chart",
     "deepsecBenchRefusalRate": "chart",
     "enterpriseOpsGymSuccessRateByDomain": "chart",
@@ -387,7 +396,7 @@ for _key, _label, _kind, _group, _desc, _better in _M:
 
 # Benchmark metrics (scalar data fields living in Model.evals / .indices).
 _UNIT_KIND = {"%": "pct", "Elo": "elo", "index": "index", "s": "sec",
-              "tok/s": "tps", "USD/task": "usd", "mixed": "str"}
+              "tok/s": "tps", "USD/task": "usd", "mixed": "str", "text": "str"}
 #: Benchmark metrics where a *lower* value is the better result. Audited against
 #: `BENCHMARKS` (2026-10-14): the only benchmark descriptions that say "lower is
 #: better" are these four, plus the `METRICS` cost/TTFT/verbosity family above.
@@ -395,6 +404,7 @@ _UNIT_KIND = {"%": "pct", "Elo": "elo", "index": "index", "s": "sec",
 _LOWER_IS_BETTER = {
     "omniscienceHallucinationRate",
     "cweBenchRefusalRate",
+    "cyberRefusalRate",
     "cybergymE2eRefusalRate",
     "deepsecBenchRefusalRate",
 }
@@ -668,7 +678,7 @@ class Rankable:
 
 #: benchmark unit -> Rankable unit
 _BENCH_UNIT = {"%": "%", "Elo": "Elo", "index": "index", "mixed": "text",
-               "s": "s", "tok/s": "tok/s", "USD/task": "USD/task"}
+               "text": "text", "s": "s", "tok/s": "tok/s", "USD/task": "USD/task"}
 
 #: canonical full names for the composites whose short label is ambiguous in search
 _LABEL_OVERRIDES = {
@@ -689,6 +699,10 @@ _EXTRA_ALIASES = {
     "openness": ("Artificial Analysis Openness Index", "Openness Index"),
     "omniscience": ("AA-Omniscience Index", "Omniscience Index"),
     "cyberIndex": ("Artificial Analysis Cyber Index", "Cyber Index"),
+    "cyberRefusalRate": ("Cyber Index Refusal Rate", "Cyber Refusal Rate",
+                         "AA Cyber Index Refusal Rate"),
+    "cyberMitigationStatus": ("Cyber Index Mitigation Status", "Mitigation Status",
+                              "AA Cyber Index Mitigation Status"),
     "itbenchSre": ("ITBench-AA", "ITBench AA", "ITBench"),
     "terminalBench40": ("Terminal-Bench 4.0", "TerminalBench 4.0"),
     "terminalBenchScience": ("Terminal-Bench-Science 0.1", "Terminal-Bench Science 0.1"),
@@ -713,12 +727,18 @@ for _key, _b in BENCHMARKS.items():
     _kind = "index" if _b.unit == "index" else "benchmark"
     _label = _LABEL_OVERRIDES.get(_key, _b.label)
     _aliases = _dedupe((_b.key, _b.label, _b.slug, *_EXTRA_ALIASES.get(_key, ())))
-    # ``aa_leaderboard sort=`` only ranks keys whose values come from the
-    # leaderboard / rich dataset; every chart-set / panel / API-only key must go
-    # through ``aa_benchmark_leaderboard``, whose source chain reaches them
-    # (round-5 audit: the cyberIndex hint pointed at the leaderboard and errored).
+    # ``aa_leaderboard sort=`` is the default ranking path for every key that has
+    # per-model values on some surface it can reach (the 700-row leaderboard, the
+    # rich overlay, or an eval chart set / homepage panel — joined by slug). Keys
+    # AA serves only through the JSON API, container/breakdown kinds, and the few
+    # chart keys with no eval-page slug stay on ``aa_benchmark_leaderboard``.
+    _lb_reachable = (
+        _b.unit != "mixed"
+        and _b.source_hint != "api"
+        and (_b.source_hint != "chart" or bool(_b.slug))
+    )
     _how = (f"aa_leaderboard sort={_key}"
-            if _kind == "index" and _b.source_hint in ("leaderboard", "rich")
+            if _lb_reachable
             else f"aa_benchmark_leaderboard benchmark={_key}")
     RANKABLES[_key] = Rankable(
         key=_key, label=_label, kind=_kind,

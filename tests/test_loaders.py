@@ -135,6 +135,18 @@ def test_home_boards_counts_and_order() -> None:
     assert sts == sorted(sts, reverse=True)
 
 
+def test_home_boards_merge_panel_variants_by_model_slug() -> None:
+    """AA ships two Cyber Index panels; both field sets must survive the merge."""
+    boards = loaders.parse_home_boards(_text("home.rsc"))
+    rows = boards["eval:artificial-analysis-cyber-index"]
+    assert len(rows) == 20
+    # every row keeps the capability score and gains the security companions
+    assert all(r.get("score") is not None for r in rows)
+    assert any(r.get("refusalRate") is not None for r in rows)
+    assert any(r.get("mitigationStatus") for r in rows)
+    assert len({r["slug"] for r in rows}) == len(rows)  # merged, never duplicated
+
+
 # --------------------------------------------------------------------------- #
 # media arenas
 # --------------------------------------------------------------------------- #
@@ -300,6 +312,46 @@ def test_sitemap_paths() -> None:
         "/models/claude-opus-5-5",
         "/evaluations/gpqa-diamond",
     ]
+
+
+_CYBER_SITEMAP = _SITEMAP.replace(
+    "</urlset>",
+    "<url><loc>https://artificialanalysis.ai/evaluations/"
+    "artificial-analysis-cyber-index</loc></url></urlset>",
+)
+
+
+def test_eval_catalog_unions_the_sitemap_eval_paths() -> None:
+    """The catalog is the union of the /evaluations cards and the sitemap paths."""
+    cards = loaders.parse_eval_catalog(_text("eval_index.html"))
+    # the fixture sitemap only repeats a card slug, so the union is unchanged
+    assert len(loaders.union_eval_catalog(cards, loaders.parse_sitemap(_SITEMAP))) \
+        == len(cards)
+    rows = loaders.union_eval_catalog(cards, loaders.parse_sitemap(_CYBER_SITEMAP))
+    slugs = {r["slug"] for r in rows}
+    assert "artificial-analysis-cyber-index" in slugs
+    assert len(rows) >= len(cards)
+    extra = next(r for r in rows if r["slug"] == "artificial-analysis-cyber-index")
+    # sitemap-only evals get a label derived from the slug, no invented metadata
+    assert extra["title"] == "Artificial Analysis Cyber Index"
+    assert extra["description"] == "" and extra["tags"] == []
+
+
+def test_eval_catalog_wiring_includes_a_sitemap_only_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_get(url: str, name: str, **kwargs):
+        text = _CYBER_SITEMAP if name == "sitemap" else _text(_CACHE_MAP[name])
+        return fetch.Fetched(
+            text=text, path=Path("/fake-cache") / name, fetched_at=1_700_000_000.0,
+            cached=True, stale=False,
+        )
+
+    monkeypatch.setattr(loaders.fetch, "get", fake_get)
+    rows = loaders.eval_catalog()
+    slugs = {r["slug"] for r in rows}
+    assert "artificial-analysis-cyber-index" in slugs
+    assert len(rows) >= 33
 
 
 # --------------------------------------------------------------------------- #
