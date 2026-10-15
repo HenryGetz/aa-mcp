@@ -29,7 +29,7 @@ Tool routing:
 | image / video / TTS / music leaderboards | `aa_media` |
 | speech-to-text / realtime voice | `aa_media` (`speech_to_text`, `speech_to_text_streaming`, `speech_to_speech`) |
 | AA coding agents / chatbots / search API boards | `aa_agents` |
-| unsure of a model's exact name or slug (incl. media/speech) | `aa_search` (resolves language models and arena entries; always resolve names first) |
+| unsure of a model's exact name or slug (incl. media/speech) | `aa_search` (resolves language models and arena entries; when no model matches but the query names a benchmark/metric/board it answers with that thing's hint; always resolve names first) |
 | definitions, field names, provenance | `aa_reference` |
 | raw JSON for anything not covered | `aa_raw` (token-expensive, last resort) |
 

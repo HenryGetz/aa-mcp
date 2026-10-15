@@ -1300,3 +1300,114 @@ def test_view_rankable_coverage_is_not_absence(fake):
     assert "models scored on both axes" in out
     assert "Intel vs $/task" in out
 
+
+def _arena_multi():
+    return [
+        _arena_entry("Grok Voice 3.0", "speech_to_speech", kind="speech",
+                     creator="SpaceXAI", metric=("sts", "STS Index", 86.9, "index"),
+                     rank=None, appearances=None, release_date=None),
+        _arena_entry("Grok Voice 1.0", "speech_to_speech", kind="speech",
+                     creator="SpaceXAI", metric=("sts", "STS Index", 73.7, "index"),
+                     rank=None, appearances=None, release_date=None),
+        _arena_entry("GPT Image 1 (high)", "image_editing", creator="OpenAI",
+                     metric=("elo", "Elo", 991.0, "Elo")),
+        _arena_entry("GPT-Realtime-2 (High)", "speech_to_speech", kind="speech",
+                     creator="OpenAI", metric=("sts", "STS Index", 73.6, "index"),
+                     rank=None, appearances=None, release_date=None),
+    ]
+
+
+def test_arena_matcher_requires_every_token():
+    entries = _arena_multi()
+    rows, partial, hits = server._arena_matches("gpt 6 luna high", entries, 10)
+    assert partial and hits == 2
+    assert {e.name for e in rows} == {"GPT Image 1 (high)", "GPT-Realtime-2 (High)"}
+    full, is_partial, hits = server._arena_matches("grok voice", entries, 10)
+    assert not is_partial and hits == 2
+    assert {e.name for e in full} == {"Grok Voice 3.0", "Grok Voice 1.0"}
+    exact, is_partial, _h = server._arena_matches("Grok Voice 3.0", entries, 10)
+    assert not is_partial and [e.name for e in exact] == ["Grok Voice 3.0"]
+
+
+def test_search_labels_partial_arena_matches(fake, monkeypatch):
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: _arena_multi())
+    out = server.aa_search(query="gpt 6 luna high")
+    assert "# 2 partial arena-board matches (2/4 tokens)" in out
+    assert "GPT Image 1 (high)" in out
+    assert "not every query token appears" in out
+    assert "# 2 arena-board matches" not in out      # never a plain heading
+
+
+def test_search_exact_and_full_arena_matches_are_not_partial(fake, monkeypatch):
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: _arena_multi())
+    exact = server.aa_search(query="Grok Voice 3.0")
+    assert "# 1 arena-board match ·" in exact
+    assert "partial" not in exact
+    fuzzy = server.aa_search(query="grok voice")
+    assert "# 2 arena-board matches ·" in fuzzy
+    assert "Grok Voice 3.0" in fuzzy
+    assert "partial" not in fuzzy
+
+
+def test_compare_exact_arena_names_are_not_partial(fake, monkeypatch):
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: _arena_multi())
+    out = server._compare(["Grok Voice 3.0", "Grok Voice 1.0"], metrics="elo")
+    assert "| STS Index | 86.9 | 73.7 |" in out
+    assert "arena match was partial" not in out
+
+
+def test_compare_partial_arena_match_is_labelled(fake, monkeypatch):
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: _arena_multi())
+    out = server._compare(["grok voice zzz", "grok voice yyy"], metrics="elo")
+    assert "arena match was partial" in out
+    assert "Grok Voice" in out
+
+
+def _patch_models(monkeypatch, models):
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, rich))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    monkeypatch.setattr(server, "_rich_models", lambda refresh=False: models)
+    monkeypatch.setattr(server, "_lb_cache", lambda: ("leaderboard", False))
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name, api=False: (None, False))
+    monkeypatch.setattr(server, "_extra_score_models", lambda key, refresh=False: [])
+
+
+def test_search_hints_partial_arena_rows_when_lm_matches(monkeypatch):
+    """A strong language-model answer gets one hint line, never a fuzzy table."""
+    models = [_model("alpha-2026", "Alpha One 2026", intelligence=60.0)]
+    _patch_models(monkeypatch, models)
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [
+        _arena_entry("Alpha One", "text_to_image")])
+    out = server.aa_search(query="alpha one 2026")
+    assert "| Alpha One 2026 |" in out
+    assert "partial arena matches" in out
+    assert "partial arena-board match" not in out    # no fuzzy table
+    assert "| Board |" not in out
+
+
+def test_search_names_a_rankable_instead_of_dead_ending(fake):
+    out = server.aa_search(query="gpqa")
+    assert "names a benchmark, not a model" in out
+    assert catalog.rankable("gpqa").how in out
+    assert "no models match" not in out
+    assert "| Model |" not in out                    # one/two lines, no table
+
+
+def test_search_prefers_a_rankable_over_fuzzy_arena_rows(fake, monkeypatch):
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [
+        _arena_entry("Ideogram 4.0", "text_to_image")])
+    out = server.aa_search(query="terminal-bench 4.0")
+    assert "Terminal-Bench 4.0" in out
+    assert "not a model" in out
+    assert "partial arena-board match" not in out
+    assert "| Model |" not in out
+
+
+def test_search_still_dead_ends_when_nothing_matches(fake, monkeypatch):
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [])
+    out = server.aa_search(query="nonexistentmodel")
+    assert "no models match" in out
+    assert "names a" not in out
+

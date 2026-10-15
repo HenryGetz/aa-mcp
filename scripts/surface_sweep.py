@@ -218,6 +218,15 @@ def cases() -> list[tuple[str, dict]]:
     out.append(("aa_search", {"creator": "meta", "open_weights": True, "top": 2}))
     # Wave E: arena/media models are searchable too (E3)
     out.append(("aa_search", {"query": "Grok Voice 3.0"}))
+    # arena matches use the same all-token rule as the language-model path:
+    # a genuine AND match ("grok voice") vs a labelled partial ("gpt 6 luna high")
+    out.append(("aa_search", {"query": "grok voice"}))
+    out.append(("aa_search", {"query": "gpt 6 luna high"}))
+    # a strong language-model answer gets one arena hint line, not a fuzzy table
+    out.append(("aa_search", {"query": "claude opus 5.5"}))
+    # a query naming a rankable thing answers with its hint instead of dead-ending
+    out.append(("aa_search", {"query": "gpqa"}))
+    out.append(("aa_search", {"query": "terminal-bench 4.0"}))
 
     # --- reference: every topic --------------------------------------------
     for topic in sorted(reference.TOPICS):

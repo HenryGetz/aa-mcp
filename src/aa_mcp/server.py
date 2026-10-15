@@ -2734,7 +2734,8 @@ def _arena_row_specs(entries: Sequence[_ArenaEntry],
 
 
 def _arena_compare(entries: Sequence[_ArenaEntry], metrics_arg: str, view: str,
-                   filters: dict, *, chosen: str = "", other_boards: Sequence[str] = ()) -> str:
+                   filters: dict, *, chosen: str = "", other_boards: Sequence[str] = (),
+                   partial: bool = False) -> str:
     """Comparison table for arena/media entries (not language models)."""
     boards: list[str] = []
     for e in entries:
@@ -2798,6 +2799,11 @@ def _arena_compare(entries: Sequence[_ArenaEntry], metrics_arg: str, view: str,
             f"board {chosen} chosen — this name also appears on "
             f"{', '.join(other_boards)}; pass a board key (e.g. {other_boards[0]}) "
             "as a queries entry to compare a different board"
+        )
+    if partial:
+        footnotes.append(
+            "arena match was partial — not every query token appears in the name; "
+            f"verify the entry on aa_media board={chosen}"
         )
     if fell_back:
         native = ", ".join(native_labels) or "its own metrics"
@@ -2898,6 +2904,7 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
 
     picked: list[Model] = []
     arena_groups: list[list[_ArenaEntry]] = []
+    arena_partial = False
     for raw in names:
         name_board, name = _arena_split_board(raw)
         board = name_board or board_hint or None
@@ -2906,11 +2913,12 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
             continue
         except ValueError as exc:
             lm_error = exc
-        cands = _arena_candidates(name, board)
+        cands, partial = _arena_candidates(name, board)
         if cands:
             arena_groups.append(cands)
+            arena_partial = arena_partial or partial
             continue
-        if board and _arena_candidates(name):
+        if board and _arena_candidates(name)[0]:
             raise ValueError(
                 f"{_q(name)} is not on arena board {board} — drop the board, or "
                 f"check the name on it with aa_media board={board}"
@@ -2933,7 +2941,8 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
             )
         arena_picked, chosen, other_boards = _arena_pick_board(arena_groups)
         return _arena_compare(arena_picked, metrics_arg, view_arg, filters,
-                              chosen=chosen, other_boards=other_boards)
+                              chosen=chosen, other_boards=other_boards,
+                              partial=arena_partial)
 
     # mirror the site's comparison page: a model missing from the rich overlay
     # gets its own (cached) model page fetched and merged in.
@@ -3980,36 +3989,80 @@ def _arena_norm(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(text).lower())
 
 
-#: minimum fuzzy score to *resolve* an arena name for comparison (search is more
-#: lenient): exact/substring, or every query token present in the name.
-_ARENA_RESOLVE_MIN = 60
+def _arena_tokens(text: str) -> list[str]:
+    """Lowercased alphanumeric tokens (same split as ``select._tokens``)."""
+    return [t for t in re.split(r"[^a-z0-9]+", str(text).lower()) if t]
 
 
-def _arena_score(entry: _ArenaEntry, query: str) -> int:
-    """Fuzzy-match score of ``query`` against an arena entry's name (0 = no match)."""
+def _arena_fields(entry: _ArenaEntry) -> list[str]:
+    """Normalized searchable fields — the arena analogue of ``select._fields``.
+
+    Arena entries have no slug, so the name and the creator/host stand in for the
+    language-model path's slug/name/short_name/creator.
+    """
+    return [_arena_norm(entry.name), _arena_norm(entry.creator or "")]
+
+
+def _arena_token_hits(entry: _ArenaEntry, tokens: Sequence[str]) -> int:
+    """How many query ``tokens`` appear (as substrings) in the entry's fields."""
+    fields = _arena_fields(entry)
+    return sum(1 for t in tokens
+               if any(t == f or f.startswith(t) or t in f for f in fields if f))
+
+
+def _arena_score(entry: _ArenaEntry, query: str, tokens: Sequence[str]) -> int:
+    """Match score: ``>= _ARENA_FULL`` is an exact/AND match, ``1..`` a partial.
+
+    Mirrors ``select.search``: the whole query as the name (100) or a substring
+    of it (90), else **every** token must appear (70) — anything less is a partial
+    match, scored by how many tokens hit.
+    """
     qn = _arena_norm(query)
     name = _arena_norm(entry.name)
-    if not qn or not name:
+    if not qn or not name or not tokens:
         return 0
     if qn == name:
         return 100
     if qn in name:
-        return 80
-    if name in qn:
-        return 70
-    qtokens = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if t]
-    if len(qtokens) >= 2 and all(t in name for t in qtokens):
-        return 60
-    overlap = sum(1 for t in qtokens if t in name)
-    return 20 + overlap if overlap else 0
+        return 90
+    hits = _arena_token_hits(entry, tokens)
+    if hits == len(tokens):
+        return _ARENA_FULL
+    return hits
 
 
-def _arena_matches(query: str, entries: Sequence[_ArenaEntry],
-                   limit: int, min_score: int = 1) -> list[_ArenaEntry]:
-    scored = [(_arena_score(e, query), e) for e in entries]
-    scored = [(s, e) for s, e in scored if s >= min_score]
-    scored.sort(key=lambda t: (-t[0], t[1].board, t[1].name))
-    return [e for _, e in scored[:limit]]
+#: score at/above which a match used *every* query token (exact / AND match)
+_ARENA_FULL = 70
+
+
+def _arena_matches(query: str, entries: Sequence[_ArenaEntry], limit: int) -> tuple[
+        list[_ArenaEntry], bool, int]:
+    """``(matches, partial, best_token_hits)`` for a tokenised AND search.
+
+    Full (all-token) matches win; partial matches are returned only when no entry
+    matches every token, and only at the best token-hit tier (so the heading's
+    ``n/m tokens`` is true of every row). ``partial`` says which it is — the caller
+    labels them apart so exact and fuzzy results are never mixed under one heading.
+    """
+    tokens = _arena_tokens(query)
+    if not tokens:
+        return [], False, 0
+    scored = [(s, e) for e in entries if (s := _arena_score(e, query, tokens))]
+    if not scored:
+        return [], False, 0
+    full = [(s, e) for s, e in scored if s >= _ARENA_FULL]
+    if full:
+        pool, partial = full, False
+    else:
+        best_hits = max(_arena_token_hits(e, tokens) for _s, e in scored)
+        if len(tokens) > 1 and best_hits < 2:
+            return [], False, 0      # one stray token is not a useful match
+        pool = [(s, e) for s, e in scored
+                if _arena_token_hits(e, tokens) == best_hits]
+        partial = True
+    pool.sort(key=lambda t: (-t[0], t[1].board, t[1].name))
+    best = max(_arena_token_hits(e, tokens) for _s, e in pool)
+    return [e for _s, e in pool[:limit]], partial, best
 
 
 def _arena_value_text(metric: tuple[str, str, float | None, str]) -> str:
@@ -4027,22 +4080,22 @@ def _arena_value_text(metric: tuple[str, str, float | None, str]) -> str:
     return render.num(value, 2)
 
 
-def _arena_candidates(query: str, board: str | None = None) -> list[_ArenaEntry]:
-    """Every arena entry ``query`` matches at its best score (``[]`` when none).
+def _arena_candidates(query: str, board: str | None = None) -> tuple[
+        list[_ArenaEntry], bool]:
+    """``(candidates, partial)`` for one name — the AND rule, partial as fallback.
 
     With ``board`` the search is pinned to that board. Without it, a name that
     exists on several boards (e.g. "Eleven v4 Turbo" is on both voice boards)
     returns one candidate per board, so the caller can pick a board shared with
-    the other models being compared.
+    the other models being compared. ``partial`` is True only when no entry
+    matched every query token.
     """
     entries = _arena_entries()
     pool = [e for e in entries if e.board == board] if board is not None else entries
-    matches = _arena_matches(query, pool, limit=len(pool) or 1,
-                             min_score=_ARENA_RESOLVE_MIN)
+    matches, partial, _hits = _arena_matches(query, pool, limit=len(pool) or 1)
     if not matches:
-        return []
-    best = _arena_score(matches[0], query)
-    return [e for e in matches if _arena_score(e, query) == best]
+        return [], False
+    return matches, partial
 
 
 def _arena_pick_board(groups: Sequence[Sequence[_ArenaEntry]]) -> tuple[
@@ -4072,7 +4125,8 @@ def _arena_pick_board(groups: Sequence[Sequence[_ArenaEntry]]) -> tuple[
 
 def _arena_search_rows(query: str, top: int, creator: str = "",
                        open_weights: bool | None = None,
-                       refresh: bool = False) -> list[_ArenaEntry]:
+                       refresh: bool = False) -> tuple[list[_ArenaEntry], bool, int]:
+    """``(rows, partial, best_token_hits)`` for the arena part of ``aa_search``."""
     entries = _arena_entries(refresh)
     if open_weights is not None:
         entries = [e for e in entries if e.open_weights == open_weights]
@@ -4113,6 +4167,58 @@ def _arena_split_board(name: str) -> tuple[str | None, str]:
     return None, str(name).strip()
 
 
+#: rankable kind -> the noun ``aa_search`` uses when the query names a thing
+_RANKABLE_NOUN = {
+    "benchmark": "benchmark", "index": "composite index", "derived": "metric",
+    "arena": "arena board", "view": "comparison view",
+}
+
+
+def _rankable_hint_coverage(r: Any, models: Sequence[Model]) -> str:
+    """A short, cheap coverage note for the rankable named by a search query."""
+    kind = str(getattr(r, "kind", ""))
+    if kind == "view":
+        return ""
+    if kind == "arena":
+        return "arena board"
+    key = str(getattr(r, "key", ""))
+    native = sum(1 for m in models if _rankable_value(m, key) is not None)
+    if native:
+        return f"{native}/{len(models)} scored"
+    surface = str(getattr(r, "surface", "") or "")
+    return {"chart": "chart-set only", "rich": "rich/model-page data",
+            "api": "API-only (AA_API_KEY)"}.get(surface, "")
+
+
+def _rankable_search_hint(query: str, models: Sequence[Model]) -> str:
+    """One/two-line answer when ``query`` names a rankable thing, not a model.
+
+    ``aa_search`` is a name -> slug resolver, but a query like ``gpqa`` names a
+    benchmark with no model slug; point at its ``How to query`` call instead of
+    dead-ending on "no models match".
+    """
+    if not query:
+        return ""
+    domain = _query_domain(query)
+    if domain:
+        rows = _rankable_list(domain=domain)
+        if rows:
+            return (f"# {_q(query)} is a task domain, not a model — {len(rows)} "
+                    f"rankable things cover it\n— aa_benchmarks domain={domain} "
+                    "lists them (benchmarks, indexes, metrics and arenas)")
+    rows = _rankable_list(query=query)
+    if not rows:
+        return ""
+    r = rows[0]
+    kind = _RANKABLE_NOUN.get(str(getattr(r, "kind", "")), "thing")
+    label = str(getattr(r, "label", "") or getattr(r, "key", ""))
+    coverage = _rankable_hint_coverage(r, models)
+    detail = f"{label}, {coverage}" if coverage else label
+    return (f"# {_q(query)} names a {kind}, not a model — there is no slug to "
+            f"resolve\n— {getattr(r, 'how', '')!s} ({detail}); aa_benchmarks "
+            f"query={_q(query)} lists related things")
+
+
 def _search(query: str = "", creator: str = "", open_weights: bool | None = None,
             top: int = 15, refresh: bool = False) -> str:
     n = top if isinstance(top, int) and top > 0 else 15
@@ -4126,13 +4232,9 @@ def _search(query: str = "", creator: str = "", open_weights: bool | None = None
         exclude_deprecated=False,
     )
     shown = found[:n]
-    arena = (_arena_search_rows(query, n, creator, open_weights, refresh)
-             if query else [])
-    if not shown and not arena:
-        return (f"# no models match {_q(query)}"
-                + (f" (creator~{render.clean(creator, None)})" if creator else "")
-                + " — try a shorter substring or aa_reference topic=fields; "
-                "media/speech models live on arena boards (aa_media)")
+    arena, arena_partial, arena_hits = (
+        _arena_search_rows(query, n, creator, open_weights, refresh)
+        if query else ([], False, 0))
     parts: list[str] = []
     if shown:
         cols = _cols(_SEARCH_COLS, "")
@@ -4150,15 +4252,49 @@ def _search(query: str = "", creator: str = "", open_weights: bool | None = None
         head = _header(count=count, note=note, name=cache_name, api=api,
                        source_label=_source_key())
         parts.append(_table_block(head, [lbl for _, lbl in cols], rows))
+        if arena and arena_partial:
+            # the language-model answer is already an exact/AND match — hint at
+            # the fuzzy arena rows in one line instead of a table of near-misses
+            tokens = len(_arena_tokens(query))
+            parts.append(render.note([
+                f"{len(arena)} partial arena matches ({arena_hits}/{tokens} tokens) "
+                f"for this query; aa_media board=<key> lists a board "
+                f"(e.g. {arena[0].board})"]))
+        elif arena:
+            parts.append(_arena_section(query, arena, arena_partial, arena_hits))
+        return "\n".join(parts)
+
+    # no language-model match: a full arena match still answers the name …
+    if arena and not arena_partial:
+        return "\n".join(parts + [_arena_section(query, arena, False, arena_hits)])
+    # … else a rankable name (gpqa, "terminal-bench 4.0") beats fuzzy arena rows
+    hint = _rankable_search_hint(query, models)
+    if hint:
+        return hint
     if arena:
-        plural = "" if len(arena) == 1 else "es"
-        head = (f"# {len(arena)} arena-board match{plural} · "
-                f"name match {render.clean(query, None)} · aa:arena")
-        parts.append(head + "\n" + _arena_search_table(arena))
-        parts.append(render.note([
-            "arena entries are media/speech models, not language models — "
-            "aa_media board=<key> lists a whole board; aa_compare can compare them"]))
-    return "\n".join(parts)
+        return "\n".join(parts + [_arena_section(query, arena, arena_partial, arena_hits)])
+    return (f"# no models match {_q(query)}"
+            + (f" (creator~{render.clean(creator, None)})" if creator else "")
+            + " — try a shorter substring or aa_reference topic=fields; "
+            "media/speech models live on arena boards (aa_media)")
+
+
+def _arena_section(query: str, arena: Sequence[_ArenaEntry], partial: bool,
+                   hits: int) -> str:
+    """The arena table block (heading + rows + notes) for ``aa_search``."""
+    plural = "" if len(arena) == 1 else "es"
+    if partial:
+        label = f"partial arena-board match{plural} ({hits}/{len(_arena_tokens(query))} tokens)"
+    else:
+        label = f"arena-board match{plural}"
+    head = (f"# {len(arena)} {label} · "
+            f"name match {render.clean(query, None)} · aa:arena")
+    notes = ["arena entries are media/speech models, not language models — "
+             "aa_media board=<key> lists a whole board; aa_compare can compare them"]
+    if partial:
+        notes.insert(0, "partial: not every query token appears in these names "
+                        "— treat them as fuzzy suggestions, not an exact match")
+    return head + "\n" + _arena_search_table(arena) + "\n" + render.note(notes)
 
 
 # --------------------------------------------------------------------------- #
