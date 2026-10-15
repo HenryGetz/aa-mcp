@@ -19,6 +19,7 @@ __all__ = [
     "FIELD_ALIASES",
     "METRICS",
     "RANKABLES",
+    "TASK_DOMAINS",
     "UNTRACKED_BENCHMARKS",
     "VALUE_SOURCE",
     "Benchmark",
@@ -30,6 +31,7 @@ __all__ = [
     "metric",
     "rankable",
     "rankables",
+    "task_domain",
 ]
 
 
@@ -316,6 +318,132 @@ UNTRACKED_BENCHMARKS: dict[str, str] = {
     "alpaca eval": "AA does not track AlpacaEval; the closest agentic knowledge-work "
                    "evaluation is the AA-Briefcase Elo.",
 }
+
+
+#: Task words AA publishes no benchmark for, with the closest measures it *does*
+#: publish. A task word is not a benchmark name: the wording stays factual
+#: ("AA does not measure X; closest AA measures are …") and never implies that the
+#: named AA evaluation is equivalent to the task. Keys are every accepted spelling;
+#: :func:`task_domain` matches them against a free-text query.
+TASK_DOMAINS: dict[str, str] = {
+    "classification": (
+        "AA does not measure classification; closest AA measures are IFBench "
+        "(instruction following on 58 verifiable constraints) and the "
+        "MMLU-Pro / Global-MMLU-Lite knowledge suites."
+    ),
+    "classify": (
+        "AA does not measure classification; closest AA measures are IFBench "
+        "(instruction following on 58 verifiable constraints) and the "
+        "MMLU-Pro / Global-MMLU-Lite knowledge suites."
+    ),
+    "text classification": (
+        "AA does not measure text classification; closest AA measures are IFBench "
+        "(instruction following on 58 verifiable constraints) and the "
+        "MMLU-Pro / Global-MMLU-Lite knowledge suites."
+    ),
+    "sentiment analysis": (
+        "AA does not measure sentiment analysis; closest AA measures are IFBench "
+        "(instruction following on 58 verifiable constraints) and the "
+        "MMLU-Pro / Global-MMLU-Lite knowledge suites."
+    ),
+    "summarization": (
+        "AA does not measure summarization; closest AA measures are GDP.pdf "
+        "(all-pass rate on PDF document tasks) and AA-LCR (long-context reasoning "
+        "over 10k-100k-token documents)."
+    ),
+    "summarisation": (
+        "AA does not measure summarization; closest AA measures are GDP.pdf "
+        "(all-pass rate on PDF document tasks) and AA-LCR (long-context reasoning "
+        "over 10k-100k-token documents)."
+    ),
+    "summarize": (
+        "AA does not measure summarization; closest AA measures are GDP.pdf "
+        "(all-pass rate on PDF document tasks) and AA-LCR (long-context reasoning "
+        "over 10k-100k-token documents)."
+    ),
+    "translation": (
+        "AA does not measure translation; the closest AA measure is "
+        "Global-MMLU-Lite (multilingual knowledge) — AA publishes no machine-"
+        "translation quality score."
+    ),
+    "translate": (
+        "AA does not measure translation; the closest AA measure is "
+        "Global-MMLU-Lite (multilingual knowledge) — AA publishes no machine-"
+        "translation quality score."
+    ),
+    "retrieval": (
+        "AA does not measure retrieval; closest AA measures are AA-LCR "
+        "(long-context reasoning over 10k-100k-token documents) and GDP.pdf "
+        "(PDF document tasks)."
+    ),
+    "rag": (
+        "AA does not measure RAG / retrieval-augmented generation; closest AA "
+        "measures are AA-LCR (long-context reasoning over 10k-100k-token documents) "
+        "and GDP.pdf (PDF document tasks)."
+    ),
+    "retrieval augmented generation": (
+        "AA does not measure RAG / retrieval-augmented generation; closest AA "
+        "measures are AA-LCR (long-context reasoning over 10k-100k-token documents) "
+        "and GDP.pdf (PDF document tasks)."
+    ),
+    "sql": (
+        "AA does not measure SQL generation; the closest AA measure is "
+        "AA-AnalystAgent (spreadsheet/document analysis tasks)."
+    ),
+    "data analysis": (
+        "AA does not measure data analysis; the closest AA measure is "
+        "AA-AnalystAgent (spreadsheet/document analysis tasks)."
+    ),
+    "data analytics": (
+        "AA does not measure data analytics; the closest AA measure is "
+        "AA-AnalystAgent (spreadsheet/document analysis tasks)."
+    ),
+    "tool calling": (
+        "AA does not measure tool calling directly; closest AA measures are "
+        "\u03c4\u00b2-Bench (telecom/retail tool use) and \u03c4\u00b3-Banking "
+        "(fintech multi-step tool calls), plus the per-endpoint functionCalling / "
+        "jsonMode flags in aa_providers."
+    ),
+    "function calling": (
+        "AA does not measure function calling directly; closest AA measures are "
+        "\u03c4\u00b2-Bench (telecom/retail tool use) and \u03c4\u00b3-Banking "
+        "(fintech multi-step tool calls), plus the per-endpoint functionCalling / "
+        "jsonMode flags in aa_providers."
+    ),
+    "tool use": (
+        "AA does not measure tool use directly; closest AA measures are "
+        "\u03c4\u00b2-Bench (telecom/retail tool use) and \u03c4\u00b3-Banking "
+        "(fintech multi-step tool calls), plus the per-endpoint functionCalling / "
+        "jsonMode flags in aa_providers."
+    ),
+    "moderation": (
+        "AA does not measure moderation; the closest AA measure is WildGuardTest "
+        "(safety suite, chart-set coverage)."
+    ),
+    "ocr": (
+        "AA does not measure OCR; closest AA measures are GDP.pdf (all-pass rate on "
+        "PDF document tasks) and MMMU-Pro (multimodal academic reasoning)."
+    ),
+}
+
+
+def task_domain(text: str) -> tuple[str, str] | None:
+    """Match a task word/phrase against :data:`TASK_DOMAINS` (AA has no benchmark).
+
+    Normalized-substring matching, so a whole question ("best model for
+    classification") finds ``classification``. Returns ``(task, note)`` naming the
+    closest AA measures, or ``None`` when the text names no known task word.
+    """
+    q = _norm(text)
+    if not q:
+        return None
+    for task, note in TASK_DOMAINS.items():
+        n = _norm(task)
+        if not n:
+            continue
+        if q == n or n in q or (len(q) >= 4 and q in n):
+            return task, note
+    return None
 
 
 # --------------------------------------------------------------------------- #

@@ -21,7 +21,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -265,6 +265,18 @@ def _metric_value(model: Model, key: str) -> float | None:
         return None
 
 
+#: metrics AA publishes on **two** surfaces: the 700-row leaderboard snapshot
+#: (``medianOutputTokensPerSecond`` / ``medianTimeToFirstTokenSeconds`` / …) and the
+#: first-party model page (``timescaleData.medianOutputSpeed`` /
+#: ``medianTimeToFirstChunk`` / ``timeToFirstAnswerToken`` / ``endToEndResponseTime``).
+#: The model-page value wins deterministically so one metric never renders two
+#: numbers for the same call (wave G, G1).
+_DUAL_SOURCE_KEYS = ("tps", "ttft", "ttfa", "e2e")
+#: display precision of a ``usd`` cell: catalog.format_value uses 2 decimals above
+#: $0.01, so a cost shown as ``$0.00`` is below this bound (G9).
+_ZERO_USD = 0.005
+
+
 def _value_of(model: Model, score_key: str) -> float | None:
     """``score / $/task`` for ``model``, computed locally (never memo-mutating)."""
     score = _metric_value(model, score_key)
@@ -309,14 +321,27 @@ def _rich_needed(*, refresh: bool = False, sort_key: str | None = None,
     cost, speed, omniscience…); the 699-model rich dataset only matters for
     chart-set/capability/Elo fields. Loading it otherwise costs 6 model-page
     probes per call (audit M/B6).
+
+    A name resolves through the rankable index first (G1): an alias that only
+    exists as a *rankable* spelling (``time_to_first_token``) is the same key as
+    the canonical one, so it must not be mistaken for "absent from the
+    leaderboard" and silently re-source the whole reply.
     """
     lb = _lb_rows(refresh)
     keys = [k for k in (sort_key, benchmark_key) if k]
     for name in _split(fields):
+        if name.strip().lower() in ("all", "*", "everything", "benchmarks"):
+            return True
+        rank = _rankable(name)
+        if rank is not None and str(getattr(rank, "key", "")):
+            keys.append(str(rank.key))
+            continue
         try:
             keys.append(_metric_key(name, "field"))
         except ValueError:
-            keys.append(name)
+            # a name that resolves to nothing carries no data, so it must not
+            # pull the rich overlay in and re-source the whole reply (G1/G6)
+            continue
     for key in keys:
         if any(select.lookup(m, key) is not None for m in lb):
             continue
@@ -609,15 +634,56 @@ def _col_label(key: str) -> str:
     return metric.label if metric else key.replace("_", " ").title()
 
 
+#: identity field names a ``fields=`` list may use, mapped to the column label the
+#: surface renders them under. Identity is always resolvable from the record, so a
+#: requested identity field must never blank a column or be reported as "no data"
+#: (G2). A name whose label the surface does not carry stays an unknown field.
+_IDENTITY_FIELD_LABELS = {
+    "model": "Model", "name": "Model", "modelname": "Model",
+    "slug": "Slug", "modelslug": "Slug",
+    "host": "Host", "creator": "Creator", "benchmark": "Benchmark",
+}
+
+
+def _identity_key(name: str, surface: Sequence[tuple[str, str]],
+                  identity_map: Mapping[str, str] | None = None) -> str | None:
+    """The surface's own column key for an identity field name (``None`` if absent).
+
+    ``identity_map`` is the surface's explicit name → column-key map (used where a
+    name has no matching column label, e.g. ``slug`` on a providers table whose
+    identity column is ``model_slug``); otherwise the label is matched.
+    """
+    norm = _norm_alias(name)
+    if identity_map and norm in identity_map:
+        return identity_map[norm]
+    label = _IDENTITY_FIELD_LABELS.get(norm)
+    if label is None:
+        return None
+    for key, col_label in surface:
+        if str(col_label).lower() == label.lower():
+            return str(key)
+    return None
+
+
 def _cols(default: Sequence[tuple[str, str]], fields: Any,
           extra: Iterable[str] = (),
-          identity: Sequence[tuple[str, str]] = ()) -> list[tuple[str, str]]:
+          identity: Sequence[tuple[str, str]] = (),
+          unknown: list[str] | None = None,
+          identity_map: Mapping[str, str] | None = None) -> list[tuple[str, str]]:
     """Column list from ``fields`` (metric aliases, plus any non-metric ``extra``).
 
     ``identity`` columns (Model/Slug/Host/...) are always rendered first, even
-    when ``fields`` names only metrics, so a requested table is never anonymous.
+    when ``fields`` names only metrics, so a requested table is never anonymous —
+    and an identity name (``model``/``name``/``slug``/``host``/``creator``/
+    ``benchmark``) resolves to the surface's own identity column rather than to a
+    metric key the rows cannot fill (G2).
+
     A wildcard token (``all``/``*``/``everything``) selects the whole surface:
     its default columns plus every ``extra`` column it can render.
+
+    A name that resolves to nothing is appended to ``unknown`` (when given) and
+    ignored, so a long ``fields=`` list renders what resolves instead of aborting
+    the whole call (G6); with no ``unknown`` sink the name raises, as before.
     """
     if not fields:
         return list(default)
@@ -633,19 +699,30 @@ def _cols(default: Sequence[tuple[str, str]], fields: Any,
             out.append((e, _col_label(e)))
         prefix = [(k, label) for k, label in identity if k not in keys]
         return prefix + out
+    surface = list(default) + list(identity)
+    surface += [(e, _col_label(e)) for e in extra]
     out: list[tuple[str, str]] = []
     keys: set[str] = set()
     for name in names:
-        try:
-            key = _metric_key(name, "field")
-        except ValueError:
-            if name not in extra:
-                raise
-            key = name
+        key = _identity_key(name, surface, identity_map)
+        label = None
+        if key is not None:
+            label = next((lbl for k, lbl in surface if k == key), None)
+        else:
+            try:
+                key = _metric_key(name, "field")
+            except ValueError:
+                if name in extra:
+                    key = name
+                elif unknown is not None:
+                    unknown.append(name)
+                    continue
+                else:
+                    raise
         if key in keys:
             continue
         keys.add(key)
-        out.append((key, _col_label(key)))
+        out.append((key, label or _col_label(key)))
     prefix = [(k, label) for k, label in identity if k not in keys]
     return prefix + out
 
@@ -682,7 +759,8 @@ def _trim(headers: Sequence[str], rows: Sequence[Sequence[str]]
 
 
 def _table_block(head: str, headers: Sequence[str], rows: Sequence[Sequence[str]],
-                 *, trim: bool = True, empty: str = "no values to show") -> str:
+                 *, trim: bool = True, empty: str = "no values to show",
+                 identity: Sequence[str] = ()) -> str:
     """Header + a markdown table, bounded to :data:`MAX_RESPONSE`.
 
     ``trim`` drops all-null columns — but only for *default* column sets; an
@@ -690,6 +768,10 @@ def _table_block(head: str, headers: Sequence[str], rows: Sequence[Sequence[str]
     caller can tell "no data" from "wrong field name". When the table would
     exceed the response cap the rows are dropped (never mid-row) and one note
     says how many were kept.
+
+    ``identity`` names the header labels that identify the row (Model/Slug/Host/…):
+    they are never reported as "no data" (G2) — an identity column that cannot be
+    filled is a record gap, not a wrong field name.
     """
     headers = list(headers)
     rows = [list(row) for row in rows]
@@ -700,8 +782,10 @@ def _table_block(head: str, headers: Sequence[str], rows: Sequence[Sequence[str]
         if not headers:
             return f"{head}\n— {empty}"
     else:
+        exempt = {str(label).lower() for label in identity}
         all_null = [headers[i] for i in range(len(headers))
-                    if all(str(row[i]).strip() in ("", "-") for row in rows)]
+                    if str(headers[i]).lower() not in exempt
+                    and all(str(row[i]).strip() in ("", "-") for row in rows)]
         if all_null:
             head += f"\n— no data for: {', '.join(all_null)} (shown as -)"
     body = render.table(headers, rows)
@@ -871,8 +955,24 @@ def _models(refresh: bool = False) -> list[Model]:
 
 
 def _prov_label(rich_used: bool, source_key: str | None = None) -> str:
+    """The header's source label, naming the rich overlay's own age when used.
+
+    The header's date/``stale`` flag describe the *leaderboard* payload
+    (``AA_CACHE_TTL``); the rich overlay is a separate, longer-lived cache
+    (``AA_RICH_TTL``), so it is labelled separately instead of silently inheriting
+    the leaderboard's age (round-7 §4.5).
+    """
     base = source_key or _source_key()
-    return f"{base} + rich dataset" if rich_used else base
+    if not rich_used:
+        return base
+    age = getattr(loaders, "rich_age", None)
+    seconds = age() if callable(age) else None
+    if not isinstance(seconds, (int, float)):
+        return f"{base} + rich dataset"
+    seed = getattr(loaders, "rich_seed", None)
+    slug = seed() if callable(seed) else None
+    where = f", seed {render.clean(slug, 40)}" if slug else ""
+    return f"{base} + rich dataset (overlay {render.ago(time.time() - seconds)}{where})"
 
 
 
@@ -1344,20 +1444,36 @@ def _axis_value(model: Model, key: str) -> float | None:
     """Value of a Pareto ``x`` axis for ``model`` (``None`` when absent).
 
     ``index_total_cost`` is AA's whole-suite index cost
-    (``cost_breakdown['index_total']``) and ``time_per_task`` the mean of the
-    per-evaluation ``timePerTask`` values — both model-page fields; every other
-    axis is the ordinary metric lookup.
+    (``cost_breakdown['index_total']``) and ``time_per_task`` AA's published
+    ``intelligenceIndexTimePerTask`` (``speed['time_per_task']``, model-page data).
+    A record that predates that field (or a panel/arena row) falls back to the
+    unweighted mean of the per-evaluation ``timePerTask`` values
+    (``speed['time_per_task_derived']``, computed here when absent) — the caller
+    labels which of the two it is, so a recomputation is never passed off as AA's
+    field. Every other axis is the ordinary metric lookup.
     """
     if key == "index_total_cost":
         value = (model.cost_breakdown or {}).get("index_total")
         return float(value) if isinstance(value, (int, float)) else None
     if key == "time_per_task":
+        published = model.speed.get("time_per_task")
+        if isinstance(published, (int, float)):
+            return float(published)
+        derived = model.speed.get("time_per_task_derived")
+        if isinstance(derived, (int, float)):
+            return float(derived)
         rows = getattr(model, "per_eval", None) or model.per_eval_cost or []
         times = [float(r["timePerTask"]) for r in rows
                  if isinstance(r, dict)
                  and isinstance(r.get("timePerTask"), (int, float))]
         return math.fsum(times) / len(times) if times else None
     return _metric_value(model, key)
+
+
+def _time_per_task_derived(model: Model) -> bool:
+    """True when ``model``'s ``s/task`` is our recomputation, not AA's field."""
+    published = model.speed.get("time_per_task")
+    return not isinstance(published, (int, float))
 
 
 def _axis_text(key: str, value: Any) -> str:
@@ -1636,8 +1752,9 @@ def _pareto(
         ("ratio", f"{score_label}/{x_label}"),
     ]
     taken = {key for key, _ in cols}
+    unknown: list[str] = []
     if fields:
-        cols += [c for c in _cols((), fields, (), ()) if c[0] not in taken]
+        cols += [c for c in _cols((), fields, (), cols, unknown) if c[0] not in taken]
     rows: list[list[str]] = []
     for m, xv, sv in shown:
         row = [_txt(m.name), m.slug, _txt(m.creator),
@@ -1672,15 +1789,28 @@ def _pareto(
     if rich_used and x_key in _OVERLAY_AXES:
         footnotes.append(f"{x_label} is model-page data (rich dataset), not a "
                          "leaderboard column")
+    if x_key == "time_per_task":
+        derived = [m.short_name or m.name for m, _x, _s in shown
+                   if _time_per_task_derived(m)]
+        if derived:
+            footnotes.append(
+                "s/task for " + ", ".join(derived[:3]) + " is a recomputed mean of "
+                "the per-evaluation timePerTask values (AA publishes no "
+                "intelligenceIndexTimePerTask for them)")
     if panel_used:
         footnotes.append(f"{score_label} comes from AA's eval chart set / homepage "
                          "panel (top ~20), joined onto the leaderboard rows — not a "
                          "full leaderboard")
     if score_key in ("ttft", "ttfa", "e2e") or x_key == "ttft":
-        footnotes.append("TTFT is AA's long-prompt median; aa_model has the "
-                         "per-prompt-type breakdown")
+        footnotes.append(
+            "TTFT is the 700-row leaderboard snapshot median here (aa_compare "
+            "reports the model page's long-prompt median); aa_model has the "
+            "per-prompt-type breakdown (short/medium/long/100k)")
+    if unknown:
+        footnotes.append(_unknown_field_note(unknown))
     footnotes = list(dict.fromkeys(footnotes))
-    body = _table_block(head, [label for _, label in cols], rows, trim=not fields)
+    body = _table_block(head, [label for _, label in cols], rows, trim=not fields,
+                        identity=_identity_labels(cols))
     return body + "\n" + render.note(footnotes)
 
 
@@ -1829,12 +1959,15 @@ def _leaderboard(
         ("context_tokens", "context window", min_context is not None),
     ])
     value_of: Callable[[Model], float | None] | None = None
+    unknown: list[str] = []
     if mode == "value":
         pairs = [(m, v) for m, v in _value_pairs(models, sort_key) if v is not None]
         pairs.sort(key=lambda t: t[1], reverse=True)
-        models = [m for m, _ in pairs]
+        models = _break_display_ties([m for m, _ in pairs],
+                                     lambda m: render.num(_value_of(m, sort_key), 1))
         value_of = functools.partial(_value_of, score_key=sort_key)
-        cols = _cols(_LB_COLS + [("value", f"{label}/$")], fields, _LB_EXTRA, _LB_IDENTITY)
+        cols = _cols(_LB_COLS + [("value", f"{label}/$")], fields, _LB_EXTRA,
+                     _LB_IDENTITY, unknown)
         note = f"value = {label} per $/task"
         if value_sort:
             note += f" (sort={sort_raw})"
@@ -1845,8 +1978,17 @@ def _leaderboard(
         # unscored row would sort last with a "-" and inflate the coverage claim
         models = [m for m in select.sort_models(models, sort_key)
                   if select.lookup(m, sort_key) is not None]
-        cols = _cols(_LB_COLS, fields, _LB_EXTRA, _LB_IDENTITY)
+        # rows that *display* the same value are ordered by a named secondary key
+        # (G7), so a tie is reproducible instead of following AA's payload order
+        models = _break_display_ties(
+            models, lambda m: _fmt(sort_key, select.lookup(m, sort_key)))
+        cols = _cols(_LB_COLS, fields, _LB_EXTRA, _LB_IDENTITY, unknown)
         note = f"{label}, {where}"
+        tie_note = _tie_note(
+            models[:n], lambda m: _fmt(sort_key, select.lookup(m, sort_key)),
+            unit="/task" if sort_key == "cost_per_task" else "")
+        if tie_note:
+            footnotes.append(tie_note)
 
     if not fields:
         keys = {c[0] for c in cols}
@@ -1859,9 +2001,19 @@ def _leaderboard(
     shown = models[:n]
     if sort_key in ("ttft", "ttfa", "e2e"):
         footnotes.append(
-            f"{label} is AA's long-prompt median; use aa_model for the "
+            f"{label} is the 700-row leaderboard snapshot median (aa_compare "
+            "reports the model page's long-prompt median); use aa_model for the "
             "per-prompt-type breakdown (short/medium/long/100k)"
         )
+    if unknown:
+        footnotes.append(_unknown_field_note(unknown))
+    for key, _lbl in cols:
+        if key in _COMPARE_USD_KEYS:
+            zero_note = _zero_cost_note(key, [
+                (m.short_name or m.name, _compare_numeric(m, key),
+                 bool(m.is_open_weights)) for m in shown])
+            if zero_note:
+                footnotes.append(zero_note)
 
     matching = len(models)
     sort_scored = sum(1 for m in models if select.lookup(m, sort_key) is not None)
@@ -1886,7 +2038,7 @@ def _leaderboard(
                    source_label=source_label)
     out = [_table_block(head, [label for _, label in cols],
                         [_model_cells(m, cols, value_of) for m in shown],
-                        trim=not fields)]
+                        trim=not fields, identity=_identity_labels(cols))]
     footnotes = list(dict.fromkeys(footnotes))
     if footnotes:
         out.append(render.note(footnotes))
@@ -2096,7 +2248,16 @@ def _model_pricing(m: Model) -> str:
     ]
     if all(row[1] == "-" for row in rows):
         return "no pricing recorded"
-    return render.table(["Pricing", "Value"], rows)
+    body = render.table(["Pricing", "Value"], rows)
+    zeros = [_zero_cost_note(key, [(str(m.name or m.slug), value,
+                                    bool(m.is_open_weights))])
+             for key, value in (("cost_per_task", m.cost_per_task),
+                                ("price_in", p.get("in")),
+                                ("price_out", p.get("out")))]
+    zeros = [note for note in dict.fromkeys(zeros) if note]
+    if zeros:
+        body += "\n" + render.note(zeros)
+    return body
 
 
 def _model_speed(m: Model) -> str:
@@ -2220,6 +2381,9 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
     head += f" · aa:{_source_key()}"
 
     blocks = [head, _model_facts(model)]
+    name_notes = _name_notes(query, base, models)
+    if name_notes:
+        blocks.append(render.note(name_notes))
     if "indexes" in chosen:
         blocks.append("## Indices\n" + _model_indices(model))
         caps = _model_capabilities(model)
@@ -2298,10 +2462,20 @@ filters:                      # optional; gate fuzzy name matching
 """
 
 
+def _ratio_score(key: str) -> str:
+    """The score axis of a derived ratio row (``value`` → ``intelligence``)."""
+    return key.split(":", 1)[1] if ":" in key else "intelligence"
+
+
+def _is_ratio_key(key: str) -> bool:
+    """True for a derived ``score / $/task`` row (``value``, ``value:coding``)."""
+    return key == "value" or key.startswith("value:")
+
+
 def _compare_numeric(m: Model, key: str) -> float | None:
-    """Numeric cell value for a comparison row (``value`` = intelligence per $/task)."""
-    if key == "value":
-        return _value_of(m, "intelligence")
+    """Numeric cell value for a comparison row (``value`` = score per $/task)."""
+    if _is_ratio_key(key):
+        return _value_of(m, _ratio_score(key))
     value = _axis_value(m, key)
     if value is None and key == "cache_hit_discount":
         cache_read = select.lookup(m, "cache_read")
@@ -2315,7 +2489,7 @@ def _compare_cell(m: Model, key: str) -> str:
     value = _compare_numeric(m, key)
     if key == "cache_hit_discount":
         return _discount(value)
-    if key == "value":
+    if _is_ratio_key(key):
         return render.num(value, 1)
     return _axis_text(key, value)
 
@@ -2331,8 +2505,75 @@ def _delta_text(key: str, delta: float) -> str:
     return f"{delta:+.1f}"
 
 
+def _close_text(name: str) -> str:
+    """The closest accepted field names for ``name`` (shared error/footnote text)."""
+    pool = list(catalog.METRICS) + list(catalog.FIELD_ALIASES) + list(_EXTRA_ALIASES)
+    return ", ".join(_close(name, pool)) or "none"
+
+
+#: score axes ``metrics=all`` also ratios against $/task: the default view's
+#: ``Intel/$`` plus the same derived row for a non-default score axis (G4).
+_COMPARE_RATIO_AXES = ("intelligence", "coding", "agentic")
+
+
+def _ratio_metric(name: str) -> tuple[str, str] | None:
+    """``score/$`` (or ``score per dollar``) → the derived ratio row for ``score``.
+
+    ``Intel/$`` is the ratio the default comparison view uses; the same form works
+    for any other score axis (``coding/$``, ``agentic/$``), so a ratio is never
+    silently read as the plain score (G4).
+    """
+    text = str(name).strip()
+    low = text.lower()
+    axis = ""
+    if low.endswith("/$") or low.endswith("/usd"):
+        axis = text[:text.rfind("/")]
+    elif " per " in low:
+        head, _, tail = text.rpartition(" per ")
+        if tail.strip().lower() in ("dollar", "usd", "$", "1$"):
+            axis = head
+    if not axis.strip():
+        return None
+    if _norm_alias(axis) in ("intel", "intelligence", "intelligencedollar"):
+        return ("value", "Intel/$")
+    rank = _rankable(axis)
+    key = str(getattr(rank, "key", "")) if rank is not None else ""
+    if not key:
+        try:
+            key = _metric_key(axis, "score")
+        except ValueError:
+            return None
+    if key in _COMPARE_PRICING_KEYS:
+        return None
+    return (f"value:{key}", f"{_col_label(key)}/$")
+
+
+def _insert_ratio_rows(row_specs: Sequence[tuple[str, str]],
+                       models: Sequence[Model]) -> list[tuple[str, str]]:
+    """Add the ``score/$`` rows ``metrics=all`` must carry (G4).
+
+    Each ratio row goes directly after the score axis it derives from, and only
+    when at least one selected model has both the score and a $/task cost — the
+    same rule the default view's ``Intel/$`` row follows.
+    """
+    out = list(row_specs)
+    for axis in _COMPARE_RATIO_AXES:
+        key = "value" if axis == "intelligence" else f"value:{axis}"
+        if any(k == key for k, _ in out):
+            continue
+        if not any(_compare_numeric(m, key) is not None for m in models):
+            continue
+        label = "Intel/$" if axis == "intelligence" else f"{_col_label(axis)}/$"
+        at = next((i for i, (k, _) in enumerate(out) if k == axis), None)
+        out.insert(len(out) if at is None else at + 1, (key, label))
+    return out
+
+
 def _compare_metric_row(name: str) -> tuple[str, str]:
-    """Resolve one requested comparison metric (rankable, then catalog metric)."""
+    """Resolve one requested comparison metric (ratio, rankable, then metric)."""
+    ratio = _ratio_metric(name)
+    if ratio is not None:
+        return ratio
     r = _rankable(name)
     if r is not None:
         return str(r.key), str(r.label)
@@ -2343,6 +2584,9 @@ def _compare_metric_row(name: str) -> tuple[str, str]:
 #: metric keys whose absence means "no published pricing" / "no measured speed"
 _COMPARE_PRICING_KEYS = {"cost_per_task", "index_total_cost", "price_in", "price_out",
                          "cache_read", "cache_write", "cache_hit_discount"}
+#: ``usd``-kind comparison rows that can render as ``$0.00`` (G9)
+_COMPARE_USD_KEYS = {"cost_per_task", "index_total_cost", "price_in", "price_out",
+                     "cache_read", "cache_write"}
 _COMPARE_SPEED_KEYS = {"tps", "ttft", "ttfa", "e2e", "time_per_task",
                        "out_tokens_per_task"}
 
@@ -2390,6 +2634,171 @@ def _safe_text(value: Any, limit: int | None = None) -> str:
     if any("\ud800" <= ch <= "\udfff" for ch in text):
         text = text.translate(_UNSAFE_OUT)
     return render.clean(text, limit)
+
+
+# ---- shared trust footnotes (wave G) ----------------------------------------
+
+#: reasoning-effort suffixes AA appends to a family slug (the bare slug is the
+#: Max / default-fallback row). A slug that extends the base with anything else is
+#: a *different* model, not a variant (``claude-opus-5-5`` is not ``claude-opus-5``).
+_EFFORT_SUFFIXES = ("xhigh", "high", "medium", "low", "non-reasoning", "minimal",
+                    "reasoning", "thinking", "adaptive", "default")
+
+
+def _variant_label(m: Model) -> str:
+    """The reasoning-effort variant a model row represents (``Max``, ``High``…)."""
+    name = str(m.name or "")
+    if "(" in name and ")" in name:
+        inner = name[name.find("(") + 1:name.rfind(")")]
+        label = inner.split(",")[0].strip()
+        if label:
+            return label
+    return str(m.effort or "")
+
+
+def _effort_siblings(m: Model, pool: Sequence[Model]) -> list[Model]:
+    """Rows that add a reasoning-effort variant to ``m``'s own family slug."""
+    siblings = [x for x in pool
+                if x.slug.startswith(m.slug + "-")
+                and x.slug[len(m.slug) + 1:] in _EFFORT_SUFFIXES]
+    order = {s: i for i, s in enumerate(_EFFORT_SUFFIXES)}
+    siblings.sort(key=lambda x: (order.get(x.slug[len(m.slug) + 1:], 99), x.slug))
+    return siblings
+
+
+def _effort_note(m: Model, pool: Sequence[Model], query: str = "") -> str:
+    """Announce a bare-family name that resolved to one effort variant (G5).
+
+    Empty when the row has no effort siblings, or when the query already names the
+    variant (a caller who asked for ``…-high`` is not told about it).
+    """
+    siblings = _effort_siblings(m, pool)
+    if not siblings:
+        return ""
+    variant = _variant_label(m)
+    if variant and _norm_alias(variant) in _norm_alias(query):
+        return ""
+    names = [siblings[0].slug]
+    names += [f"-{x.slug[len(m.slug) + 1:]}" for x in siblings[1:6]]
+    extra = "" if len(siblings) <= 6 else f" (+{len(siblings) - 6} more)"
+    what = f"the {variant} variant" if variant else "the base variant"
+    return f"matched {what} of {m.slug}; siblings: {', '.join(names)}{extra}"
+
+
+def _match_note(query: str, resolved: Model, pool: Sequence[Model]) -> str:
+    """Announce a fuzzy name resolution — never silently correct a name (G5)."""
+    q = str(query).strip()
+    if not q:
+        return ""
+    exact = q.lower() in {resolved.slug.lower(), str(resolved.name or "").lower(),
+                          str(resolved.short_name or "").lower()}
+    if exact:
+        return ""
+    near = [m.slug for m in select.search(pool, q, limit=4)
+            if m.slug != resolved.slug]
+    text = f"matched {_q(q)} → {resolved.slug} (exact slug for that name)"
+    if near:
+        text += f"; closest alternatives: {', '.join(near[:2])}"
+    return text
+
+
+def _name_notes(query: str, resolved: Model, pool: Sequence[Model]) -> list[str]:
+    """Both name-resolution announcements for one resolved query (G5).
+
+    A query that is not the exact slug/name was resolved *for* the caller, so the
+    correction is named. Either way, a row that is one of several reasoning-effort
+    variants says which one it is and lists its siblings — the bare family slug
+    (``gpt-6-luna``) is the Max/default row, and silently comparing that is the
+    documented cold-start hazard. ``_effort_note`` stays quiet when the query
+    already names the variant.
+    """
+    notes = [note for note in (_match_note(query, resolved, pool),
+                               _effort_note(resolved, pool, query)) if note]
+    return list(dict.fromkeys(notes))
+
+
+def _unknown_field_note(unknown: Sequence[str]) -> str:
+    """One footnote for ``fields=``/``metrics=`` names that resolved to nothing (G6).
+
+    A list-valued request renders everything that resolves; the rest is named here
+    with its closest accepted spellings instead of aborting the whole call.
+    """
+    parts = [f"{render.clean(name, 40)} (closest: {_close_text(name)})"
+             for name in dict.fromkeys(str(n) for n in unknown)]
+    return "unknown, ignored: " + "; ".join(parts)
+
+
+def _zero_unit(key: str) -> str:
+    """The unit a cost/price footnote names after ``$0.00`` (G9)."""
+    if key == "cost_per_task":
+        return "/task"
+    if key.startswith("blended_") or key in ("price_in", "price_out", "cache_read",
+                                             "cache_write"):
+        return "/1M tokens"
+    return ""
+
+
+def _zero_cost_note(key: str, cells: Sequence[tuple[str, float | None, bool]]) -> str:
+    """One footnote for cost/price cells that render ``$0.00`` (G9).
+
+    ``cells`` is ``[(model name, value, is_open_weights)]``. A rendered ``$0.00``
+    means the cost is under $0.005 — a bare zero otherwise reads as a measured
+    price, and it silently wins every "cheapest" ranking.
+    """
+    zeros = [(name, value, ow) for name, value, ow in cells
+             if value is not None and _axis_text(key, value) == "$0.00"]
+    if not zeros:
+        return ""
+    names = ", ".join(name for name, _, _ in zeros[:3])
+    if len(zeros) > 3:
+        names += f" +{len(zeros) - 3} more"
+    note = f"$0.00 = measured under ${_ZERO_USD:g}{_zero_unit(key)} ({names}"
+    if all(ow for _, _, ow in zeros):
+        note += ("; AA publishes 0 for open-weights models — self-hosting cost is "
+                 "not included")
+    return note + ")"
+
+
+def _secondary_order(models: Sequence[Model]) -> list[Model]:
+    """Deterministic order *within* a displayed tie: intelligence, then slug (G7)."""
+    return sorted(models, key=lambda m: (
+        -(m.intelligence if m.intelligence is not None else -1.0), m.slug))
+
+
+def _break_display_ties(models: Sequence[Model],
+                        cell_of: Callable[[Model], str]) -> list[Model]:
+    """Order each displayed-tie group by the secondary key (G7).
+
+    ``sort_models`` orders by the raw value, so two rows that *display* the same
+    number (``$0.13``) keep AA's payload order and the tie is invisible and
+    unreproducible. Grouping by the rendered cell makes the order explainable.
+    """
+    groups: dict[str, list[Model]] = {}
+    for m in models:
+        groups.setdefault(cell_of(m), []).append(m)
+    out: list[Model] = []
+    for members in groups.values():
+        out.extend(_secondary_order(members))
+    return out
+
+
+def _tie_note(shown: Sequence[Model], cell_of: Callable[[Model], str],
+              unit: str = "") -> str:
+    """One line naming the first displayed tie and the secondary ordering (G7)."""
+    groups: dict[str, list[Model]] = {}
+    for m in shown:
+        groups.setdefault(cell_of(m), []).append(m)
+    for value, members in groups.items():
+        if len(members) < 2:
+            continue
+        scores = [m.intelligence for m in members]
+        if all(v is not None for v in scores):
+            pair = f"{scores[0]:.1f} vs {scores[1]:.1f}"
+            return (f"{len(members)} models tie at {value}{unit}; ordered by "
+                    f"intelligence ({pair})")
+        return (f"{len(members)} models tie at {value}{unit}; ordered by slug "
+                f"({members[0].slug} vs {members[1].slug})")
+    return ""
 
 
 def _compare_missing_notes(models: Sequence[Model], short: Sequence[str],
@@ -2932,11 +3341,29 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
             f"{', '.join(_COMPARE_FILTER_KEYS)}"
         )
 
-    all_models, rich_used = _models_state(
-        refresh,
-        rich=True if metrics_arg.lower() in ("all", "benchmarks")
-        else _rich_needed(refresh=refresh, fields=metrics_arg),
-    )
+    # Resolve the requested metric names *before* loading data: the deterministic
+    # source choice (G1) and the unknown-name footnote (G6) both depend on which
+    # keys were asked for, and a list-valued request must not abort the call.
+    lower = metrics_arg.strip().lower()
+    unknown_metrics: list[str] = []
+    requested: list[tuple[str, str]] = []
+    if metrics_arg and lower not in ("all", "benchmarks"):
+        for name in _split(metrics_arg):
+            if name.strip().lower() in _COMPARE_VALUE_NAMES:
+                requested.append(("value", "Intel/$"))
+                continue
+            try:
+                requested.append(_compare_metric_row(name))
+            except ValueError:
+                unknown_metrics.append(name)
+    elif not metrics_arg:
+        requested = list(_COMPARE_ROWS if compact else _COMPARE_FULL)
+    # The first-party model-page value wins for the dual-sourced speed metrics, so
+    # `ttft` and `time_to_first_token` — and `all` — can never disagree (G1).
+    rich = (lower in ("all", "benchmarks")
+            or any(key in _DUAL_SOURCE_KEYS for key, _ in requested)
+            or _rich_needed(refresh=refresh, fields=metrics_arg))
+    all_models, rich_used = _models_state(refresh, rich=rich)
     pool = all_models
     if filters:
         pool = select.filter_models(
@@ -2949,13 +3376,16 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
         )
 
     picked: list[Model] = []
+    resolved_pairs: list[tuple[str, Model]] = []
     arena_groups: list[list[_ArenaEntry]] = []
     arena_partial = False
     for raw in names:
         name_board, name = _arena_split_board(raw)
         board = name_board or board_hint or None
         try:
-            picked.append(_resolve_slug(name, pool))
+            resolved = _resolve_slug(name, pool)
+            picked.append(resolved)
+            resolved_pairs.append((raw, resolved))
             continue
         except ValueError as exc:
             lm_error = exc
@@ -2972,7 +3402,9 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
         if pool is all_models:
             raise lm_error
         # an exact name is never dropped because a filter excluded it
-        picked.append(_resolve_slug(name, all_models))
+        resolved = _resolve_slug(name, all_models)
+        picked.append(resolved)
+        resolved_pairs.append((raw, resolved))
 
     if arena_groups:
         if picked:
@@ -3030,7 +3462,6 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
         return _compare_cell(m, key)
 
     row_specs: list[tuple[str, str]] = []
-    lower = metrics_arg.strip().lower()
     if lower in ("all", "benchmarks"):
         kinds = ("benchmark", "index") if lower == "benchmarks" else None
         for r in _rankable_list():
@@ -3047,21 +3478,26 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
             if (kind in ("benchmark", "index") and _compare_extra_candidate(key)
                     and join_extra(key)):
                 row_specs.append((key, label))
+        if lower == "all":
+            row_specs = _insert_ratio_rows(row_specs, models)
     elif metrics_arg:
-        for name in _split(metrics_arg):
-            if name.strip().lower() in _COMPARE_VALUE_NAMES:
-                row_specs.append(("value", "Intel/$"))
-                continue
-            row_specs.append(_compare_metric_row(name))
+        row_specs = list(requested)
         # a named metric the selected models do not carry may still be published
         # on AA's chart set / homepage panel — join it before giving up (D2)
         for key, _label in list(row_specs):
-            if key != "value" and all(_axis_value(m, key) is None for m in models):
+            if key != "value" and not key.startswith("value:") \
+                    and all(_axis_value(m, key) is None for m in models):
                 join_extra(key)
     else:
-        row_specs = list(_COMPARE_ROWS if compact else _COMPARE_FULL)
+        row_specs = list(requested)
 
     if not row_specs:
+        if unknown_metrics:
+            raise ValueError(
+                f"unknown metric {_q(unknown_metrics[0])} — closest: "
+                f"{_close_text(unknown_metrics[0])}\n"
+                "— aa_reference topic=fields lists every accepted name"
+            )
         raise ValueError(
             f"no metric rows: none of the requested metrics has a value for "
             f"{', '.join(m.slug for m in models)}\n"
@@ -3122,6 +3558,8 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
             "metrics=all selects every published row these models have (rich "
             "overlay + AA's eval chart set / homepage panels), metrics=benchmarks "
             "limits to benchmarks/indexes"]
+    if unknown_metrics:
+        footnotes.append(_unknown_field_note(unknown_metrics))
     if metrics_arg and compact:
         if slug_row is False:
             footnotes.append("compact=true: Slug row omitted (compact=false adds it)")
@@ -3138,9 +3576,83 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
         )
     if filters:
         footnotes.append("filters: " + ", ".join(f"{k}={v}" for k, v in filters.items()))
-    if any(key in ("ttft", "ttfa", "e2e") for key, _ in row_specs):
-        footnotes.append("TTFT is AA's long-prompt median; aa_model has the "
-                         "per-prompt-type breakdown")
+    # ---- G5: never correct a name silently (fuzzy match, effort variant) -------
+    for raw, m in resolved_pairs:
+        footnotes += _name_notes(raw, m, all_models)
+    # ---- G1: deterministic sourcing of the dual-sourced speed metrics ----------
+    page_rows: dict[str, Model] = {}
+    if rich_used:
+        for m in _rich_models(refresh):
+            page_rows[m.slug] = m
+        for m in models:
+            if m.slug in page_fetched:
+                page_rows.setdefault(m.slug, m)  # page-fetched: merged == page
+    snapshot_rows = {m.slug: m for m in _lb_rows(refresh)}
+    page_sourced: list[str] = []
+    snapshot_sourced: list[str] = []
+    seen_dual: set[str] = set()
+    for key, label in row_specs:
+        if key not in _DUAL_SOURCE_KEYS or key in seen_dual:
+            continue
+        seen_dual.add(key)
+        differ: list[tuple[float, str, float, float]] = []
+        fell_back: list[str] = []
+        for i, m in enumerate(models):
+            source = page_rows.get(m.slug)
+            page_value = _metric_value(source, key) if source is not None else None
+            base = snapshot_rows.get(m.slug)
+            snap_value = _metric_value(base, key) if base is not None else None
+            if page_value is None:
+                if snap_value is not None:
+                    fell_back.append(_safe_text(short[i], 40))
+                continue
+            page_sourced.append(key)
+            if snap_value is None or snap_value == 0:
+                continue
+            rel = abs(page_value - snap_value) / abs(snap_value)
+            if rel > 0.02:
+                differ.append((rel, _safe_text(short[i], 40), page_value, snap_value))
+        if differ:
+            differ.sort(key=lambda t: (-t[0], t[1]))
+            _rel, who, page_value, snap_value = differ[0]
+            text = (f"{label}: model page {_axis_text(key, page_value)} vs leaderboard "
+                    f"snapshot {_axis_text(key, snap_value)} for {who} (using the "
+                    "model page)")
+            if len(differ) > 1:
+                text += f"; {len(differ) - 1} other model(s) differ"
+            footnotes.append(text)
+        if fell_back:
+            footnotes.append(
+                f"{label}: no first-party model-page value for "
+                f"{', '.join(fell_back[:3])}; leaderboard snapshot shown")
+    page_sourced = list(dict.fromkeys(page_sourced))
+    for key, _label in row_specs:
+        if key in _DUAL_SOURCE_KEYS and key not in page_sourced:
+            snapshot_sourced.append(key)
+    if page_sourced:
+        text = "speed/latency from AA's first-party model page"
+        if "ttft" in page_sourced:
+            text += " (TTFT is the long-prompt median)"
+        footnotes.append(text + "; aa_model has the per-prompt-type breakdown "
+                                "(short/medium/long/100k)")
+    if snapshot_sourced:
+        names_ = ", ".join(_metric_label(k) for k in dict.fromkeys(snapshot_sourced))
+        footnotes.append(
+            f"{names_} from the 700-row leaderboard snapshot (the model page is not "
+            "in this source); aa_model has the per-prompt-type breakdown")
+    # ---- G9: a cost that displays as $0.00 is not a measured zero -------------
+    for key, _label in row_specs:
+        if key in _COMPARE_USD_KEYS:
+            cells = [(short[i], _compare_numeric(m, key), bool(m.is_open_weights))
+                     for i, m in enumerate(models)]
+            zero_note = _zero_cost_note(key, cells)
+            if zero_note:
+                footnotes.append(zero_note)
+    # ---- G4: a score/$ row is ours, not AA's ---------------------------------
+    ratio_labels = [label for key, label in row_specs if _is_ratio_key(key)]
+    if ratio_labels:
+        footnotes.append(f"{', '.join(ratio_labels)}: derived here as score ÷ $/task "
+                         "(AA publishes no such column)")
     if lower in ("all", "benchmarks"):
         footnotes.append(f"metrics={lower}: every {'benchmark/index' if lower == 'benchmarks' else 'rankable'} "
                          "key any of these models has (aa_benchmarks lists them all)")
@@ -3264,6 +3776,15 @@ def _benchmarks(query: str = "", domain: str = "", tag: str = "",
             head = _header(count=f"AA does not track {name}",
                            note=f"query={render.clean(query, None)}")
             return f"{head}\n— {note}"
+        task = getattr(catalog, "task_domain", None)
+        hit = task(query) if query and callable(task) else None
+        if hit is not None:
+            name, note = hit
+            head = _header(count=f"AA does not measure {name}",
+                           note=f"query={render.clean(query, None)}")
+            return (f"{head}\n— {note}\n"
+                    "— aa_benchmarks lists every rankable AA does measure "
+                    "(aa_benchmarks domain=<name> for a task area)")
         wanted = " · ".join(part for part in (
             f"query={render.clean(query, None)}" if query else "",
             f"domain={render.clean(domain, None)}" if domain else "",
@@ -3438,7 +3959,13 @@ def _benchmark_leaderboard(
     pairs.sort(key=lambda t: t[1], reverse=not lower_better)
     if lower_better:
         source_note += " · lower is better"
+    # rows that display the same score are ordered by a named secondary key (G7)
+    order = {m.slug: i for i, m in enumerate(_break_display_ties(
+        [m for m, _ in pairs], lambda m: _fmt(key, select.lookup(m, key))))}
+    pairs.sort(key=lambda t: order[t[0].slug])
     shown = pairs[:n]
+    tie_note = _tie_note([m for m, _ in shown],
+                         lambda m: _fmt(key, select.lookup(m, key)))
 
     request_keys = _split(fields)
     wants_ci = any(k in ("ci_lower", "ci_upper", "ci") for k in request_keys)
@@ -3450,8 +3977,10 @@ def _benchmark_leaderboard(
     default_cols = [("name", "Model"), ("slug", "Slug"), ("creator", "Creator"),
                     ("score", score_label)]
     cols: list[tuple[str, str]]
+    unknown: list[str] = []
     if fields:
-        cols = _cols([], fields, ("score", "ci_lower", "ci_upper", "ci"), _BENCH_IDENTITY)
+        cols = _cols([], fields, ("score", "ci_lower", "ci_upper", "ci"),
+                     _BENCH_IDENTITY + [("benchmark", "Benchmark")], unknown)
     else:
         cols = list(default_cols)
         if include_extra:
@@ -3469,6 +3998,8 @@ def _benchmark_leaderboard(
         for col, _label in cols:
             if col == "score":
                 cells.append(_fmt(key, value) + ("*" if m.estimated else ""))
+            elif col == "benchmark":
+                cells.append(bench.label)
             elif col in ("ci_lower", "ci_upper", "ci"):
                 if col == "ci":
                     cells.append("-" if lo is None and hi is None
@@ -3482,12 +4013,18 @@ def _benchmark_leaderboard(
     count = f"{len(shown)} of {len(pairs)} scored ({len(lb)} tracked)"
     head = _header(count=count, note=source_note, name=cache_name, api=api,
                    source_label=_prov_label(rich_used))
-    body = _table_block(head, [label for _, label in cols], table_rows, trim=not fields)
+    body = _table_block(head, [label for _, label in cols], table_rows, trim=not fields,
+                        identity=_identity_labels(cols))
+    notes = []
+    if tie_note:
+        notes.append(tie_note)
+    if unknown:
+        notes.append(_unknown_field_note(unknown))
+    notes += _missing_notes(lb, [("intelligence", "intelligence",
+                                  min_intelligence is not None)])
     if estimated:
         body += ("\n— * = AA-estimated score (fitted across variants of the same "
                  "model family); include_estimates=false drops them")
-    notes = _missing_notes(lb, [("intelligence", "intelligence",
-                                 min_intelligence is not None)])
     if notes:
         body += "\n" + render.note(notes)
     return body
@@ -3607,15 +4144,45 @@ _PROV_COLS_MODEL = [("host", "Host"), ("model_name", "Model"), ("precision", "Pr
 _PROV_EXTRA = ("host", "model_name", "model_slug", "precision", "cache_read",
                "discount", "e2e", "function_calling", "json_mode",
                "openai_compatible", "source")
+#: identity names → the providers column each resolves to (G2): the endpoint record
+#: carries the model slug/name and the host, and `creator` comes from the model row.
+_PROV_IDENTITY_MAP = {
+    "model": "model_name", "name": "model_name", "modelname": "model_name",
+    "slug": "model_slug", "modelslug": "model_slug", "host": "host",
+    "creator": "creator",
+}
 
 
-def _endpoint_cell(e, key: str) -> str:
+def _identity_labels(cols: Sequence[tuple[str, str]]) -> list[str]:
+    """The header labels of the identity columns in ``cols`` (never "no data", G2)."""
+    return [label for key, label in cols
+            if key in ("name", "slug", "creator", "host", "model_name", "model_slug",
+                       "benchmark")]
+
+
+def _creator_map(refresh: bool = False) -> dict[str, str]:
+    """``{model slug: creator}`` from the leaderboard rows (provider endpoints have
+    no creator of their own, so an identity ``fields=creator`` resolves here)."""
+    return {m.slug: str(m.creator) for m in _lb_rows(refresh) if m.creator}
+
+
+def _endpoint_cell(e, key: str, creators: dict[str, str] | None = None) -> str:
+    """One provider cell. Identity keys resolve from the endpoint record (G2).
+
+    ``fields=model`` (or ``name``/``slug``) resolves to the surface's own identity
+    column, so the Model column can never blank while the payload carries the
+    model slug on every endpoint; ``creator`` comes from the model's record.
+    """
+    if key in ("model_name", "name"):
+        return _txt(e.model_name or e.model_slug)
+    if key in ("model_slug", "slug"):
+        return _txt(e.model_slug)
+    if key == "host":
+        return _txt(e.host)
+    if key == "creator":
+        return _txt((creators or {}).get(e.model_slug))
     if key == "precision":
         return _txt(e.precision)
-    if key == "model_name":
-        return _txt(e.model_name or e.model_slug)  # never a blank Model column
-    if key == "model_slug":
-        return _txt(e.model_slug)
     if key == "cache_read":
         return _fmt("cache_read", e.cache_read)
     if key == "discount":
@@ -3682,6 +4249,38 @@ def _with_sort_col(cols: Sequence[tuple[str, str]],
     return cols + [(sort_key, _col_label(sort_key))]
 
 
+#: an AA providers page that publishes no endpoint list at all
+_NO_ENDPOINT_RE = re.compile(r'"hostModels"\s*:\s*(?:\[\s*\]|null)')
+
+
+def _publishes_no_endpoints(slug: str) -> bool:
+    """True when AA's ``/models/<slug>/providers`` page lists no endpoints (G3).
+
+    The page exists (the fetch succeeded) but AA publishes an empty ``hostModels``
+    array — an absence, not a broken payload, so it must be explained rather than
+    reported as an unusable cache file. The cached copy the failed parse just read
+    is reused (no second network call).
+    """
+    try:
+        path = loaders.SOURCE_URLS["model_providers"].format(slug=slug)
+        text = _get(loaders.url(path), f"providers_{slug}").text
+    except Exception as exc:  # pragma: no cover - offline / missing cache
+        log.debug("providers: could not re-read %s (%s)", slug, exc)
+        return False
+    return bool(_NO_ENDPOINT_RE.search(text))
+
+
+def _no_endpoints_text(base: Model) -> str:
+    """The G3 explanation for a model AA lists no API providers for."""
+    head = _header(count=f"AA lists no API providers for {base.slug}",
+                   note="no published pricing or endpoint measurements",
+                   name=f"providers_{base.slug}")
+    return (f"{head}\n"
+            f"— AA lists no API providers for {base.name} ({base.slug}); it has no "
+            "published pricing or endpoint measurements (see aa_model for what AA "
+            "does publish)")
+
+
 def _providers(model: str = "", host: str = "", top: int = 15,
                sort: str = "cost_per_task", fields: str = "",
                open_weights: bool | None = None, min_context: int | None = None,
@@ -3691,8 +4290,13 @@ def _providers(model: str = "", host: str = "", top: int = 15,
 
     if model:
         base = _resolve_slug(model, _models(refresh))
-        endpoints = _load(f"providers_{base.slug}",
-                          loaders.provider_endpoints, base.slug, refresh=refresh)
+        try:
+            endpoints = _load(f"providers_{base.slug}",
+                              loaders.provider_endpoints, base.slug, refresh=refresh)
+        except (ValueError, AAFetchError):
+            if _publishes_no_endpoints(base.slug):
+                return _no_endpoints_text(base)
+            raise
         # Endpoint payloads often omit the context window; fall back to the
         # model-level value rather than rendering a misleading "-".
         ctx_filled = False
@@ -3708,17 +4312,33 @@ def _providers(model: str = "", host: str = "", top: int = 15,
         if not endpoints:
             return (f"# no provider endpoints recorded for {base.name} (aa.{base.slug}) "
                     "— the model-page providers array was empty or all filtered out")
-        cols = _cols(_PROV_COLS_MODEL, fields, _PROV_EXTRA, [("host", "Host")])
+        creators = _creator_map(refresh)
+        unknown: list[str] = []
+        cols = _cols(_PROV_COLS_MODEL, fields, _PROV_EXTRA, _PROV_IDENTITY, unknown,
+                     _PROV_IDENTITY_MAP)
         if not fields:
             cols = _with_sort_col(cols, sort_key)
-        rows = [[_endpoint_cell(e, k) for k, _ in cols] for e in endpoints[:n]]
+        rows = [[_endpoint_cell(e, k, creators) for k, _ in cols]
+                for e in endpoints[:n]]
         count = f"{len(rows)} of {len(endpoints)} endpoints"
         head = _header(count=count,
                        note=f"{base.name} (aa.{base.slug}), by {sort_key}",
                        name=f"providers_{base.slug}")
-        body = _table_block(head, [lbl for _, lbl in cols], rows, trim=not fields)
+        body = _table_block(head, [lbl for _, lbl in cols], rows, trim=not fields,
+                            identity=_identity_labels(cols))
+        notes = []
         if ctx_filled:
-            body += "\n— context is model-level, not per-endpoint"
+            notes.append("context is model-level, not per-endpoint")
+        if unknown:
+            notes.append(_unknown_field_note(unknown))
+        note = _zero_cost_note("cost_per_task", [
+            (base.name, min((e.cost_per_task for e in endpoints
+                             if e.cost_per_task is not None), default=None),
+             bool(base.is_open_weights))])
+        if note:
+            notes.append(note)
+        if notes:
+            body += "\n" + render.note(notes)
         return body
 
     endpoints = _load("providers_board", loaders.provider_board, refresh=refresh)
@@ -3753,10 +4373,14 @@ def _providers(model: str = "", host: str = "", top: int = 15,
             sel.append(f"ctx>={min_context:g}")
         return f"# no provider endpoints match {', '.join(sel) or 'filters'} — drop one filter"
 
-    cols = _cols(_PROV_COLS, fields, _PROV_EXTRA, _PROV_IDENTITY)
+    unknown: list[str] = []
+    cols = _cols(_PROV_COLS, fields, _PROV_EXTRA, _PROV_IDENTITY, unknown,
+                 _PROV_IDENTITY_MAP)
     if not fields:
         cols = _with_sort_col(cols, sort_key)
-    rows = [[_endpoint_cell(e, k) for k, _ in cols] for e in endpoints[:n]]
+    creators = _creator_map(refresh)
+    rows = [[_endpoint_cell(e, k, creators) for k, _ in cols]
+            for e in endpoints[:n]]
     explicit = bool(host or open_weights is not None or min_context is not None)
     if explicit:
         count = f"{len(rows)} shown of {len(endpoints)} matching"
@@ -3766,9 +4390,20 @@ def _providers(model: str = "", host: str = "", top: int = 15,
         count = f"{len(rows)} of {len(endpoints)} endpoints"
         note = f"cheapest across all hosts, by {sort_key}"
     head = _header(count=count, note=note, name="providers_board", api=False)
-    body = _table_block(head, [lbl for _, lbl in cols], rows, trim=not fields)
+    body = _table_block(head, [lbl for _, lbl in cols], rows, trim=not fields,
+                        identity=_identity_labels(cols))
+    notes = []
     if board_ctx:
-        body += "\n— context is model-level, not per-endpoint"
+        notes.append("context is model-level, not per-endpoint")
+    if unknown:
+        notes.append(_unknown_field_note(unknown))
+    zero = _zero_cost_note("cost_per_task", [
+        (e.model_name or e.model_slug, e.cost_per_task, False)
+        for e in endpoints[:n]])
+    if zero:
+        notes.append(zero)
+    if notes:
+        body += "\n" + render.note(notes)
     return body
 
 
@@ -3799,17 +4434,22 @@ _MEDIA_FIELDS = {
 _MEDIA_CANON = {"model": "name", "release": "release_date"}
 
 
-def _media_cols(fields: Any) -> list[tuple[str, str]]:
+def _media_cols(fields: Any, unknown: list[str] | None = None) -> list[tuple[str, str]]:
     """Media fields are row keys (``elo``/``ci``/``name``), not model metrics.
 
     The ``Model`` identity column is always rendered first so a requested table
-    is never an anonymous list of numbers.
+    is never an anonymous list of numbers. A field the board does not have is
+    appended to ``unknown`` (when given) and ignored, so a long ``fields=`` list
+    renders what resolves instead of aborting the call (G6).
     """
     out: list[tuple[str, str]] = []
     keys: set[str] = set()
     for raw in _split(fields):
         name = re.sub(r"[\s-]+", "_", raw.strip().lower())
         if name not in _MEDIA_FIELDS:
+            if unknown is not None:
+                unknown.append(raw)
+                continue
             raise ValueError(
                 f"unknown field {_q(raw)} — valid: {', '.join(sorted(_MEDIA_FIELDS))}"
             )
@@ -3928,7 +4568,8 @@ def _media(board: str, top: int = 15, fields: str = "", open_weights: bool | Non
         return (f"# no rows on media board {_q(board)} "
                 f"(open_weights={open_weights}) — drop one filter")
 
-    cols = _media_cols(fields) if fields else list(_MEDIA_COLS)
+    unknown: list[str] = []
+    cols = _media_cols(fields, unknown) if fields else list(_MEDIA_COLS)
     table_rows = [[_media_cell(r, k) for k, _ in cols] for r in rows[:n]]
     explicit = bool(fields or open_weights is not None)
     count = (f"{len(table_rows)} shown of {len(rows)} matching" if explicit
@@ -3936,7 +4577,11 @@ def _media(board: str, top: int = 15, fields: str = "", open_weights: bool | Non
     head = _header(count=count,
                    note="human-preference Elo (ask fields=ci_lower,ci_upper,ci for the 95% CI)",
                    name=f"media_{key_name}", api=False)
-    return _table_block(head, [lbl for _, lbl in cols], table_rows, trim=not fields)
+    body = _table_block(head, [lbl for _, lbl in cols], table_rows, trim=not fields,
+                        identity=_identity_labels(cols))
+    if unknown:
+        body += "\n" + render.note([_unknown_field_note(unknown)])
+    return body
 
 
 # --------------------------------------------------------------------------- #
@@ -4281,12 +4926,28 @@ def _rankable_hint_coverage(r: Any, models: Sequence[Model]) -> str:
             "api": "API-only (AA_API_KEY)"}.get(surface, "")
 
 
+def _task_domain_hint(query: str) -> str:
+    """A task word AA does not measure, answered with its closest measures (G8)."""
+    fn = getattr(catalog, "task_domain", None)
+    if not callable(fn):
+        return ""
+    hit = fn(query)
+    if hit is None:
+        return ""
+    task, note = hit
+    return (f"# no model matches {_q(query)} — {task} is a task, not an AA benchmark\n"
+            f"— {note}\n"
+            "— aa_benchmarks lists what AA does measure; aa_leaderboard "
+            "sort=<key> ranks it")
+
+
 def _rankable_search_hint(query: str, models: Sequence[Model]) -> str:
     """One/two-line answer when ``query`` names a rankable thing, not a model.
 
     ``aa_search`` is a name -> slug resolver, but a query like ``gpqa`` names a
     benchmark with no model slug; point at its ``How to query`` call instead of
-    dead-ending on "no models match".
+    dead-ending on "no models match". A *task* word AA publishes no benchmark for
+    ("best model for classification") is answered with its closest measures (G8).
     """
     if not query:
         return ""
@@ -4299,7 +4960,7 @@ def _rankable_search_hint(query: str, models: Sequence[Model]) -> str:
                     "lists them (benchmarks, indexes, metrics and arenas)")
     rows = _rankable_list(query=query)
     if not rows:
-        return ""
+        return _task_domain_hint(query)
     r = rows[0]
     kind = _RANKABLE_NOUN.get(str(getattr(r, "kind", "")), "thing")
     label = str(getattr(r, "label", "") or getattr(r, "key", ""))
@@ -4343,6 +5004,10 @@ def _search(query: str = "", creator: str = "", open_weights: bool | None = None
         head = _header(count=count, note=note, name=cache_name, api=api,
                        source_label=_source_key())
         parts.append(_table_block(head, [lbl for _, lbl in cols], rows))
+        if query:
+            name_notes = _name_notes(query, shown[0], models)
+            if name_notes:
+                parts.append(render.note(name_notes))
         if arena and arena_partial:
             # the language-model answer is already an exact/AND match — hint at
             # the fuzzy arena rows in one line instead of a table of near-misses
@@ -4601,6 +5266,9 @@ def aa_leaderboard(
 
     Answers "which model is smartest / cheapest / fastest / best value right now".
     Returns a compact markdown table sorted by ``sort`` (default: intelligence).
+    Rows that *display* the same value are ordered by a named secondary key
+    (intelligence, then slug) and one footnote says so, so a tie at the published
+    precision is visible and reproducible.
 
     Args:
         mode: "rank" (default), "value" (intelligence per $/task), or "frontier"
@@ -4713,6 +5381,16 @@ def aa_compare(queries: list[str] = [],  # noqa: B006 - the MCP schema wants a l
     count, the per-metric detail while the gap is small, or a whole-model
     "no published pricing or speed" line) so no gap is silent.
 
+    One metric never means two numbers: ``tps``/``ttft``/``ttfa``/``e2e`` always
+    come from the first-party model page (the same value whichever alias you
+    type), and when the 700-row leaderboard snapshot differs by more than 2% one
+    footnote names both numbers. ``metrics=all`` carries every published row
+    including the derived ``Intel/$`` ratio; a ``score/$`` name asks for that
+    ratio on any other score axis. A name that resolves to nothing is ignored
+    with one footnote (``unknown, ignored: …``) instead of aborting the call, and
+    a fuzzy name / bare family slug is announced (which slug, which
+    reasoning-effort variant, its siblings).
+
     Media/speech arena models (e.g. "Grok Voice 3.0") also resolve: comparing
     only arena entries renders their board metrics (Elo / STS / WER, appearances,
     price, release, open weights) with a footer warning that per-board scores are
@@ -4722,12 +5400,12 @@ def aa_compare(queries: list[str] = [],  # noqa: B006 - the MCP schema wants a l
     Args:
         queries: 2-12 model names or slugs (language models, or arena entries on
             one board).
-        metrics: "all" (every rankable key any selected model has), "benchmarks"
-            (benchmark/index kinds only), or a comma list of keys/labels/aliases;
-            empty uses the default rows (Intelligence, Intel/$, $/task, in/out
-            $/1M, tok/s, TTFT, Context). For an arena comparison the names are
-            arena fields (elo, sts, wer, ci, appearances, price, release,
-            open_weights, rank, board, creator).
+        metrics: "all" (every rankable key any selected model has, plus the
+            derived score/$ ratios), "benchmarks" (benchmark/index kinds only),
+            or a comma list of keys/labels/aliases; empty uses the default rows
+            (Intelligence, Intel/$, $/task, in/out $/1M, tok/s, TTFT, Context).
+            For an arena comparison the names are arena fields (elo, sts, wer,
+            ci, appearances, price, release, open_weights, rank, board, creator).
         view: "table" (models as columns) or "diff" (one row per metric, value
             plus the delta vs the first model, e.g. 57.6 (+4.9)).
         compact: default metric set only — keep the core rows instead of the full
@@ -4751,7 +5429,9 @@ def aa_benchmarks(query: str = "", domain: str = "", tag: str = "",
 
     Each hit carries its ``How to query`` hint (the exact tool call), so finding
     "Artificial Analysis Speech to Speech Index" immediately gives you
-    ``aa_media board=speech_to_speech``.
+    ``aa_media board=speech_to_speech``. A task word AA publishes no benchmark for
+    (classification, summarization, translation, retrieval/RAG, SQL/data analysis,
+    tool calling, …) answers with the closest AA measures instead of dead-ending.
 
     Args:
         query: tokenised AND-match over key/label/aliases/description/tags
@@ -4814,7 +5494,9 @@ def aa_providers(model: str = "", host: str = "", top: int = 15,
 
     Pass ``model`` for one model's serving endpoints (with per-endpoint $/task and
     precision), or ``host``/filters for the 1,200-row provider board. With neither,
-    returns the cheapest endpoints globally.
+    returns the cheapest endpoints globally. A model AA lists no API endpoints for
+    is explained rather than errored, and ``fields=model``/``slug``/``host``/
+    ``creator`` always resolve from the endpoint's own record.
 
     Args:
         model: model name or slug — switches to per-model endpoint detail.
@@ -4822,8 +5504,10 @@ def aa_providers(model: str = "", host: str = "", top: int = 15,
         top: rows to return (default 15).
         sort: cost_per_task (default), price_in, price_out, tps, ttft,
             intelligence or context_tokens. Lower-is-better keys sort ascending.
-        fields: comma list of columns; supports precision, cache_read, discount,
-            e2e, function_calling, json_mode, context_tokens.
+        fields: comma list of columns; supports model/name, slug, host, creator,
+            precision, cache_read, discount, e2e, function_calling, json_mode,
+            context_tokens. A name that resolves to nothing is ignored with one
+            footnote.
         open_weights: keep only endpoints for open- or closed-weights models.
         min_context: drop endpoints with a smaller context window (tokens).
         refresh: bypass the cache and re-fetch.
@@ -4878,7 +5562,11 @@ def aa_search(query: str = "", creator: str = "", open_weights: bool | None = No
     Always returns the slug so the next tool call can be exact. Media/speech
     arena models (image/video/speech/music boards) are searched too and returned
     with their board, so a name like "Grok Voice 3.0" resolves instead of coming
-    back empty.
+    back empty. A query that was resolved for you says so — the fuzzy match
+    (``matched 'opus max' → claude-opus-5-5``) and the reasoning-effort variant
+    when a bare family slug matched one. A query that names a task AA publishes
+    no benchmark for ("best model for classification") answers with the closest
+    AA measures instead of dead-ending.
 
     Args:
         query: fuzzy model name or partial slug (e.g. "claude opus").

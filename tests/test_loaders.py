@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import http.server
 import json
+import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -1189,3 +1191,85 @@ def test_open_weights_flag_none_for_homepage_speech_rows() -> None:
     stt = boards["stt"]
     assert stt
     assert all(loaders.open_weights_flag(row) is None for row in stt)
+
+
+# --------------------------------------------------------------------------- #
+# Wave G-B2: the rich overlay has its own age and TTL (AA_RICH_TTL)
+# --------------------------------------------------------------------------- #
+
+def _warm_rich_cache(tmp_path: Path) -> Path:
+    """A cache dir holding a written rich dataset plus its seed record."""
+    records = _rich_fixture_records()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    (cache / "rich_dataset.json").write_text(json.dumps(records), encoding="utf-8")
+    (cache / "rich_seed.json").write_text(json.dumps({"slug": "step-5", "ts": 0}),
+                                         encoding="utf-8")
+    return cache
+
+
+def _probe_counter(calls: list[str]):
+    """A ``fetch.get`` stand-in that records every probe and refuses to serve."""
+    def fake_get(url: str, name: str, **kwargs):
+        calls.append(name)
+        raise fetch.AAFetchError("probe refused")
+    return fake_get
+
+
+def test_rich_age_is_none_without_a_cache(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("AA_CACHE_DIR", str(tmp_path / "empty"))
+    assert loaders.rich_age() is None
+
+
+def test_rich_age_reports_a_warm_cache(monkeypatch, tmp_path) -> None:
+    cache = _warm_rich_cache(tmp_path)
+    monkeypatch.setenv("AA_CACHE_DIR", str(cache))
+    age = loaders.rich_age()
+    assert age is not None and 0.0 <= age < 60.0
+
+
+def test_rich_dataset_is_not_refetched_inside_its_ttl(monkeypatch, tmp_path) -> None:
+    cache = _warm_rich_cache(tmp_path)
+    monkeypatch.setenv("AA_CACHE_DIR", str(cache))
+    monkeypatch.setattr(loaders, "_RICH_MEMO", None)
+    calls: list[str] = []
+    monkeypatch.setattr(loaders.fetch, "get", _probe_counter(calls))
+
+    assert len(loaders.rich_dataset()) >= 600
+    assert calls == []  # warm cache: no probe at all inside AA_RICH_TTL
+
+
+def test_expired_rich_cache_is_refetched(monkeypatch, tmp_path) -> None:
+    cache = _warm_rich_cache(tmp_path)
+    stale = time.time() - 7 * 3600  # past the 6 h AA_RICH_TTL default
+    os.utime(cache / "rich_dataset.json", (stale, stale))
+    monkeypatch.setenv("AA_CACHE_DIR", str(cache))
+    monkeypatch.setattr(loaders, "_RICH_MEMO", None)
+    calls: list[str] = []
+    monkeypatch.setattr(loaders.fetch, "get", _probe_counter(calls))
+
+    assert loaders.rich_dataset() == []
+    assert calls  # the stale overlay was not served
+
+
+def test_rich_dataset_refresh_bypasses_the_ttl(monkeypatch, tmp_path) -> None:
+    cache = _warm_rich_cache(tmp_path)
+    monkeypatch.setenv("AA_CACHE_DIR", str(cache))
+    monkeypatch.setattr(loaders, "_RICH_MEMO", None)
+    calls: list[str] = []
+    monkeypatch.setattr(loaders.fetch, "get", _probe_counter(calls))
+
+    loaders.rich_dataset(refresh=True)
+    assert calls  # refresh=True ignored the warm cache and probed the seed slugs
+
+
+def test_rich_ttl_env_override_expires_a_young_cache(monkeypatch, tmp_path) -> None:
+    cache = _warm_rich_cache(tmp_path)
+    monkeypatch.setenv("AA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("AA_RICH_TTL", "-1")  # any age is stale
+    monkeypatch.setattr(loaders, "_RICH_MEMO", None)
+    calls: list[str] = []
+    monkeypatch.setattr(loaders.fetch, "get", _probe_counter(calls))
+
+    loaders.rich_dataset()
+    assert calls

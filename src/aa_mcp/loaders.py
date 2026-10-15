@@ -72,6 +72,7 @@ __all__ = [
     "parse_sitemap",
     "provider_board",
     "provider_endpoints",
+    "rich_age",
     "rich_dataset",
     "rich_seed",
     "sitemap_paths",
@@ -657,6 +658,22 @@ def rich_seed() -> str | None:
     return None
 
 
+def rich_age() -> float | None:
+    """Seconds since the cached rich overlay was written, or ``None`` if absent.
+
+    The overlay is a **separate, longer-lived cache** than the payloads it is
+    merged into: ``rich_dataset.json`` honours ``AA_RICH_TTL`` (default 21600 s =
+    6 h) while the leaderboard/chart payloads honour ``AA_CACHE_TTL`` (default
+    3600 s). A reply whose header reports the leaderboard's age therefore says
+    nothing about how old the rich numbers it is printing are — callers that show
+    a mixed record must label this age too (the seed page is :func:`rich_seed`).
+    """
+    try:
+        return max(0.0, time.time() - _rich_cache_path().stat().st_mtime)
+    except OSError:
+        return None
+
+
 def _discover_rich_seed() -> list[str]:
     """Candidate slugs to probe: remembered, then known-rich, then newest releases."""
     candidates: list[str] = []
@@ -691,6 +708,11 @@ def _offline() -> bool:
 def rich_dataset(refresh: bool = False) -> list[Model]:
     """The cross-model rich dataset, disk-cached and memoized (``AA_RICH_TTL``).
 
+    This is the one surface with its **own, longer TTL**: ``AA_RICH_TTL`` (default
+    6 h) against ``AA_CACHE_TTL`` (default 1 h) for the leaderboard/chart payloads.
+    Age it with :func:`rich_age` and name its seed (:func:`rich_seed`) whenever a
+    reply mixes rich values into a leaderboard-shaped record.
+
     Offline returns whatever is cached (or ``[]``) without touching the network.
     A cached dataset whose records are implausible (out-of-range index, negative
     cost, a majority without a score) raises :class:`~aa_mcp.fetch.AAFetchError`
@@ -710,11 +732,8 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
     if models:
         _validate(models, path=path, url=_rich_source_url(), min_scored=_MIN_SCORED)
     if models and not refresh:
-        try:
-            age = max(0.0, time.time() - path.stat().st_mtime)
-        except OSError:  # pragma: no cover - race
-            age = 0.0
-        if _offline() or age <= _rich_ttl():
+        age = rich_age()
+        if _offline() or age is None or age <= _rich_ttl():
             _RICH_MEMO = (str(path), models)
             return models
     if _offline():

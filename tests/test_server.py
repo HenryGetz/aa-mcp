@@ -1478,3 +1478,322 @@ def test_search_still_dead_ends_when_nothing_matches(fake, monkeypatch):
     assert "no models match" in out
     assert "names a" not in out
 
+
+
+# --------------------------------------------------------------------------- #
+# Wave G: comparison trust (deterministic sourcing, identity, partial lists,
+# ties, name announcements, task domains, rounding to zero)
+# --------------------------------------------------------------------------- #
+
+def _patch_dual_source(monkeypatch, lb, page):
+    """A leaderboard snapshot (``lb``) plus the first-party model page (``page``).
+
+    ``_models_state(rich=True)`` is the merged record the model page produced and
+    ``_lb_rows`` the snapshot the same metric also exists on (G1). An empty
+    ``page`` means the model page is unavailable in this source.
+    """
+    merged = list(page or lb)
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (list(merged if rich else lb), rich))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: list(lb))
+    monkeypatch.setattr(server, "_rich_models", lambda refresh=False: list(page))
+    monkeypatch.setattr(server, "_lb_cache", lambda: ("leaderboard", False))
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name, api=False: (None, False))
+    monkeypatch.setattr(server, "_extra_score_models", lambda key, refresh=False: [])
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [])
+
+
+def test_rich_needed_resolves_a_rankable_only_alias(fake):
+    """``time_to_first_token`` is the same key as ``ttft`` — not a rich-only one."""
+    assert server._rich_needed(fields="time_to_first_token") is False
+    assert server._rich_needed(fields="ttft") is False
+    assert server._rich_needed(fields="capabilities.legal") is True
+
+
+def test_rich_needed_ignores_a_name_that_resolves_to_nothing(fake):
+    """An unknown field carries no data, so it cannot re-source the reply (G1/G6)."""
+    assert server._rich_needed(fields="tps,ttft,not_a_field") is False
+
+
+@pytest.mark.parametrize("metrics", ["ttft", "time_to_first_token"])
+def test_compare_sources_a_speed_metric_deterministically(monkeypatch, metrics):
+    """One metric, one number: both aliases use the first-party model page (G1)."""
+    lb = [_model("alpha", "Alpha One", cost_per_task=1.0, speed={"ttft": 100.0}),
+          _model("beta", "Beta Two", cost_per_task=1.0, speed={"ttft": 200.0})]
+    page = [_model("alpha", "Alpha One", cost_per_task=1.0, speed={"ttft": 90.0}),
+            _model("beta", "Beta Two", cost_per_task=1.0, speed={"ttft": 200.0})]
+    _patch_dual_source(monkeypatch, lb, page)
+    out = server._compare(["alpha", "beta"], metrics=metrics, compact=False)
+    assert "| Time to First Token | 90.0s | 200.0s |" in out
+    assert "model page 90.0s vs leaderboard snapshot 100.0s" in out
+    assert "using the model page" in out
+    assert "first-party model page" in out and "long-prompt median" in out
+
+
+def test_compare_default_view_agrees_with_an_explicit_speed_metric(monkeypatch):
+    """The default rows include tps/ttft, so they must resolve the same way (G1)."""
+    lb = [_model("alpha", "Alpha One", cost_per_task=1.0, speed={"ttft": 100.0}),
+          _model("beta", "Beta Two", cost_per_task=1.0, speed={"ttft": 200.0})]
+    page = [_model("alpha", "Alpha One", cost_per_task=1.0, speed={"ttft": 90.0}),
+            _model("beta", "Beta Two", cost_per_task=1.0, speed={"ttft": 200.0})]
+    _patch_dual_source(monkeypatch, lb, page)
+    default = server._compare(["alpha", "beta"])
+    explicit = server._compare(["alpha", "beta"], metrics="ttft", compact=False)
+    assert "| TTFT | 90.0s | 200.0s |" in default
+    assert "| Time to First Token | 90.0s | 200.0s |" in explicit
+
+
+def test_compare_states_a_leaderboard_only_speed_value(monkeypatch):
+    """No model-page value: the snapshot is shown and said to be the snapshot (G1)."""
+    lb = [_model("alpha", "Alpha One", cost_per_task=1.0, speed={"ttft": 100.0}),
+          _model("beta", "Beta Two", cost_per_task=1.0, speed={"ttft": 200.0})]
+    _patch_dual_source(monkeypatch, lb, [])
+    out = server._compare(["alpha", "beta"], metrics="ttft", compact=False)
+    assert "| Time to First Token | 100.0s | 200.0s |" in out
+    assert "700-row leaderboard snapshot" in out
+    assert "long-prompt median" not in out
+
+
+def test_compare_metrics_all_includes_the_derived_ratio_rows(fake):
+    """``all`` must carry the row the default view shows (G4)."""
+    out = server._compare(["alpha", "beta"], metrics="all", compact=False)
+    assert "| Intel/$ |" in out
+    assert "derived here as score ÷ $/task" in out
+
+
+def test_compare_ratio_row_for_a_non_default_score_axis(fake, monkeypatch):
+    """``score/$`` is a derived ratio for any axis, not the plain score (G4)."""
+    models = [_model("alpha", "Alpha One", cost_per_task=2.0,
+                     indices={"coding": 50.0}),
+              _model("beta", "Beta Two", cost_per_task=1.0,
+                     indices={"coding": 40.0})]
+    _patch_dual_source(monkeypatch, models, models)
+    explicit = server._compare(["alpha", "beta"], metrics="coding/$", compact=False)
+    assert "| Coding/$ | 25.0 | 40.0 |" in explicit
+    assert "derived here as score ÷ $/task" in explicit
+    everything = server._compare(["alpha", "beta"], metrics="all", compact=False)
+    assert "| Coding/$ |" in everything
+
+
+def test_compare_partial_metric_list_renders_what_resolves(fake):
+    """One bad name in a list must not abort the whole comparison (G6)."""
+    out = server._compare(["alpha", "beta"],
+                          metrics=["gpqa", "swe-bench-verified", "tps"],
+                          compact=False)
+    assert "| GPQA Diamond |" in out and "| Speed (output tokens/s) |" in out
+    assert "unknown, ignored: swe-bench-verified (closest:" in out
+
+
+def test_compare_all_unknown_metrics_still_errors_with_candidates(fake):
+    with pytest.raises(ValueError) as exc:
+        server._compare(["alpha", "beta"], metrics="nonsense,alsononsense")
+    assert "closest" in str(exc.value)
+
+
+def test_compare_announces_a_fuzzy_name_and_an_effort_variant(monkeypatch):
+    """A silently corrected name (or picked variant) is announced (G5)."""
+    rows = [_model("luna-prime", "Luna Prime (Max)", cost_per_task=1.0, intelligence=50.0),
+            _model("luna-prime-high", "Luna Prime (High)", cost_per_task=1.0,
+                   intelligence=48.0),
+            _model("luna-prime-xhigh", "Luna Prime (Xhigh)", cost_per_task=1.0,
+                   intelligence=49.0),
+            _model("other", "Other Model", cost_per_task=1.0, intelligence=40.0)]
+    _patch_dual_source(monkeypatch, rows, rows)
+    fuzzy = server._compare(["Luna Prime", "other"], metrics="intelligence")
+    assert "matched 'Luna Prime' → luna-prime (exact slug for that name)" in fuzzy
+    assert "matched the Max variant of luna-prime; siblings: luna-prime-xhigh, -high" in fuzzy
+    exact = server._compare(["luna-prime-high", "other"], metrics="intelligence")
+    assert "matched " not in exact          # the caller named the variant itself
+    assert "siblings" not in exact
+
+
+def test_compare_notes_a_cost_that_rounds_to_zero(monkeypatch):
+    """``$0.00`` is explained instead of standing as a measured zero (G9)."""
+    rows = [_model("free", "Free Model", cost_per_task=0.0, is_open_weights=True),
+            _model("paid", "Paid Model", cost_per_task=0.5)]
+    _patch_dual_source(monkeypatch, rows, rows)
+    out = server._compare(["free", "paid"], metrics="cost_per_task", compact=False)
+    assert "$0.00 = measured under $0.005/task" in out
+    assert "open-weights models" in out
+
+
+def test_zero_cost_note_ignores_a_value_that_displays_further_precision():
+    assert server._zero_cost_note("cache_read", [("m", 0.0036, True)]) == ""
+    assert "under $0.005" in server._zero_cost_note("cost_per_task", [("m", 0.0, False)])
+
+
+def test_tie_note_names_the_secondary_ordering(fake):
+    tie = [_model("a", "A", cost_per_task=0.13, intelligence=46.3),
+           _model("b", "B", cost_per_task=0.13, intelligence=41.0),
+           _model("c", "C", cost_per_task=0.20, intelligence=50.0)]
+    note = server._tie_note(tie, lambda m: f"${m.cost_per_task:.2f}", unit="/task")
+    assert note == "2 models tie at $0.13/task; ordered by intelligence (46.3 vs 41.0)"
+    assert server._tie_note(tie[:1], lambda m: "$0.13") == ""
+
+
+def test_break_display_ties_orders_by_intelligence_then_slug(fake):
+    rows = [_model("b", "B", cost_per_task=0.13, intelligence=41.0),
+            _model("a", "A", cost_per_task=0.13, intelligence=46.3),
+            _model("c", "C", cost_per_task=0.9, intelligence=None)]
+    out = server._break_display_ties(rows, lambda m: f"{m.cost_per_task:.2f}")
+    assert [m.slug for m in out] == ["a", "b", "c"]
+
+
+def test_tie_note_is_silent_without_a_tie(fake):
+    rows = [_model("sol", "Sol Low", cost_per_task=0.1267, intelligence=42.1),
+            _model("haiku", "Haiku", cost_per_task=0.12, intelligence=41.2)]
+    assert server._tie_note(rows, lambda m: f"${m.cost_per_task:.2f}") == ""
+
+
+def test_leaderboard_orders_a_displayed_tie_by_intelligence(fake, monkeypatch):
+    rows = [_model("sol", "Sol Low", cost_per_task=0.1267, intelligence=42.1),
+            _model("mimo", "MiMo", cost_per_task=0.1332, intelligence=46.3),
+            _model("haiku", "Haiku", cost_per_task=0.12, intelligence=41.2)]
+    _patch_dual_source(monkeypatch, rows, rows)
+    out = server._leaderboard(sort="cost_per_task", top=3)
+    assert out.index("MiMo") < out.index("Sol Low")   # displayed tie, by intelligence
+    assert "2 models tie at $0.13/task; ordered by intelligence (46.3 vs 42.1)" in out
+
+
+def test_leaderboard_identity_fields_resolve_and_are_never_no_data(fake):
+    out = server._leaderboard(top=2, fields="model,slug,creator,tps")
+    assert "| Model | Slug | Creator | tok/s |" in out
+    assert "no data for" not in out
+    assert "| Alpha One | alpha | LabA |" in out
+
+
+def test_leaderboard_ignores_an_unknown_field_and_names_it(fake):
+    out = server._leaderboard(top=2, fields="tps,not_a_field")
+    assert "| tok/s |" in out
+    assert "unknown, ignored: not_a_field (closest:" in out
+
+
+def test_cols_resolves_identity_names_to_the_surface_column():
+    surface = [("host", "Host"), ("model_name", "Model")]
+    model_cols = server._cols([], "model", (), surface)
+    assert ("model_name", "Model") in model_cols
+    assert not any(key == "name" for key, _ in model_cols)
+    assert ("host", "Host") in server._cols([], "host", (), surface)
+    # a surface whose identity column is `model_slug` resolves `slug` via its map
+    mapped = server._cols([], "slug", (), surface, None, {"slug": "model_slug"})
+    assert ("model_slug", "Model Slug") in mapped
+    assert not any(key == "slug" for key, _ in mapped)
+
+
+def test_cols_ignores_unknown_fields_when_given_a_sink():
+    sink: list[str] = []
+    cols = server._cols([("name", "Model")], "name,not_a_field", (), (), sink)
+    assert cols == [("name", "Model")]
+    assert sink == ["not_a_field"]
+    with pytest.raises(ValueError):
+        server._cols([("name", "Model")], "name,not_a_field")
+
+
+def test_endpoint_cells_resolve_identity_fields():
+    e = _endpoint("alpha", "hostA", precision="bf16")
+    assert server._endpoint_cell(e, "name") == "alpha"
+    assert server._endpoint_cell(e, "model_name") == "alpha"
+    assert server._endpoint_cell(e, "slug") == "alpha"
+    assert server._endpoint_cell(e, "host") == "hostA"
+    assert server._endpoint_cell(e, "creator", {"alpha": "Lab"}) == "Lab"
+
+
+def test_providers_model_fields_model_is_never_blank(fake, monkeypatch):
+    eps = [_endpoint("alpha", "hostA"), _endpoint("alpha", "hostB")]
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: eps)
+    out = server._providers(model="alpha", fields="model,price_in", top=3)
+    assert "| Model | In $/M |" in out
+    assert "no data for" not in out
+    assert out.count("| alpha |") == 2
+
+
+def test_providers_explains_a_model_with_no_endpoints(fake, monkeypatch):
+    def boom(*a, **k):
+        raise server.AAFetchError("no JSON array of dicts containing keys [...]")
+
+    monkeypatch.setattr(server, "_load", boom)
+    monkeypatch.setattr(server, "_publishes_no_endpoints", lambda slug: True)
+    out = server._providers(model="alpha", fields="model,price_in")
+    assert "AA lists no API providers for Alpha One (alpha)" in out
+    assert "no published pricing or endpoint measurements" in out
+    assert "aa_model" in out
+
+
+def test_providers_still_errors_on_a_broken_payload(fake, monkeypatch):
+    def boom(*a, **k):
+        raise server.AAFetchError("payload unusable")
+
+    monkeypatch.setattr(server, "_load", boom)
+    monkeypatch.setattr(server, "_publishes_no_endpoints", lambda slug: False)
+    with pytest.raises(server.AAFetchError):
+        server._providers(model="alpha")
+
+
+def test_media_ignores_an_unknown_field(fake, monkeypatch):
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: [
+        {"name": "Ideogram 4.0", "elo": 1024.0, "creator": "Ideogram"}])
+    out = server._media("text_to_image", fields="elo,nonsense")
+    assert "| Elo |" in out
+    assert "unknown, ignored: nonsense (closest:" in out
+
+
+def test_search_answers_a_task_word_aa_does_not_measure(fake, monkeypatch):
+    """A task word is answered with the closest AA measures, never a dead end (G8)."""
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [])
+    out = server.aa_search(query="best model for classification")
+    assert "AA does not measure classification" in out
+    assert "IFBench" in out
+
+
+def test_benchmarks_answers_a_task_word_aa_does_not_measure(fake):
+    out = server._benchmarks(query="classif")
+    assert "AA does not measure classification" in out
+    assert "closest AA measures" in out
+
+
+def test_benchmarks_still_errors_for_a_word_with_no_task_domain(fake):
+    with pytest.raises(ValueError) as exc:
+        server._benchmarks(query="zzzqqq")
+    assert "closest" in str(exc.value)
+
+
+def test_unknown_field_note_lists_the_closest_names():
+    note = server._unknown_field_note(["gpqqa"])
+    assert note.startswith("unknown, ignored: gpqqa (closest: ")
+    assert "gpqa" in note
+
+
+def test_axis_value_prefers_aa_published_time_per_task():
+    published = _model("m", speed={"time_per_task": 797.5})
+    derived = _model("m", speed={"time_per_task_derived": 697.1})
+    fallback = _model("m", per_eval=[{"slug": "a", "timePerTask": 10.0},
+                                     {"slug": "b", "timePerTask": 20.0}])
+    assert server._axis_value(published, "time_per_task") == 797.5
+    assert server._axis_value(derived, "time_per_task") == 697.1
+    assert server._axis_value(fallback, "time_per_task") == 15.0
+    assert server._time_per_task_derived(published) is False
+    assert server._time_per_task_derived(derived) is True
+
+
+def test_pareto_labels_a_recomputed_time_per_task(monkeypatch):
+    rows = [_model("m", "M", intelligence=50.0, cost_per_task=1.0,
+                   speed={"time_per_task_derived": 12.0})]
+    _patch_dual_source(monkeypatch, rows, rows)
+    out = server._pareto(x="time_per_task", top=3)
+    assert "recomputed mean of the per-evaluation timePerTask values" in out
+
+
+def test_prov_label_names_the_rich_overlay_age(monkeypatch):
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(loaders, "rich_age", lambda: 180.0, raising=False)
+    monkeypatch.setattr(loaders, "rich_seed", lambda: "step-5", raising=False)
+    label = server._prov_label(True)
+    assert label.startswith("rsc + rich dataset (overlay 3m ago, seed step-5")
+    assert server._prov_label(False) == "rsc"
+
+
+def test_prov_label_falls_back_without_the_overlay_age(monkeypatch):
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(loaders, "rich_age", lambda: None, raising=False)
+    assert server._prov_label(True) == "rsc + rich dataset"

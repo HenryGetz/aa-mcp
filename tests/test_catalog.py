@@ -634,3 +634,54 @@ def test_query_ordering_is_deterministic():
     a = [r.key for r in catalog.rankables(query="index")]
     b = [r.key for r in catalog.rankables(query="index")]
     assert a == b and a
+
+
+# --------------------------------------------------------------------------- #
+# task domains AA publishes no benchmark for (wave G, G8)
+# --------------------------------------------------------------------------- #
+
+def test_task_domains_are_factual_and_never_claim_equivalence():
+    assert catalog.TASK_DOMAINS
+    for task, note in catalog.TASK_DOMAINS.items():
+        assert note.startswith(f"AA does not measure {task}") or \
+            "AA does not measure" in note, task
+        assert "closest AA measure" in note or "the closest AA measure" in note, task
+        assert "does not track" not in note
+
+
+def test_task_domains_cover_the_briefed_task_words():
+    for word in ("classification", "summarization", "translation", "retrieval",
+                 "rag", "sql", "data analysis", "tool calling"):
+        hit = catalog.task_domain(word)
+        assert hit is not None, word
+        assert hit[0] in catalog.TASK_DOMAINS
+
+
+def test_task_domains_name_only_measures_aa_publishes():
+    """Every AA measure named in a task note is a real catalog key or a flag set."""
+    known = set(catalog.BENCHMARKS) | set(catalog.METRICS) | {
+        "IFBench", "MMLU-Pro", "Global-MMLU-Lite", "GDP.pdf", "AA-LCR",
+        "AA-AnalystAgent", "\u03c4\u00b2-Bench", "\u03c4\u00b3-Banking",
+        "WildGuardTest", "MMMU-Pro", "functionCalling", "jsonMode",
+    }
+    for note in catalog.TASK_DOMAINS.values():
+        for named in ("IFBench", "MMLU-Pro", "Global-MMLU-Lite", "GDP.pdf", "AA-LCR",
+                      "AA-AnalystAgent", "\u03c4\u00b2-Bench", "\u03c4\u00b3-Banking",
+                      "WildGuardTest", "MMMU-Pro"):
+            if named in note:
+                assert named in known, named
+
+
+def test_task_domain_matches_a_free_text_query():
+    assert catalog.task_domain("best model for classification")[0] == "classification"
+    assert catalog.task_domain("classif")[0] == "classification"
+    assert catalog.task_domain("SUMMARIZATION")[0] == "summarization"
+    assert catalog.task_domain("function calling")[0] == "function calling"
+    assert catalog.task_domain("") is None
+    assert catalog.task_domain("a") is None
+    assert catalog.task_domain("zzzqqq") is None
+
+
+def test_task_domain_is_exported():
+    assert "TASK_DOMAINS" in catalog.__all__
+    assert "task_domain" in catalog.__all__

@@ -76,6 +76,12 @@ def cases() -> list[tuple[str, dict]]:
         ("aa_leaderboard", {"sort": "intel_per_cost", "top": 3}),
         ("aa_leaderboard", {"sort": "intel/$", "top": 2}),
         ("aa_leaderboard", {"fields": "all", "top": 2}),
+        # Wave G: identity fields always resolve, and an unknown list entry is
+        # ignored with a footnote instead of aborting the call
+        ("aa_leaderboard", {"top": 3, "fields": "model,slug,creator,tps"}),
+        ("aa_leaderboard", {"top": 3, "fields": "tps,ttft,not_a_field"}),
+        # Wave G: a displayed tie is ordered by a named secondary key and footnoted
+        ("aa_leaderboard", {"sort": "cost_per_task", "min_intelligence": 40, "top": 6}),
         ("aa_leaderboard", {"sort": "nonsense_sort", "top": 2}),   # expected fail
     ]
 
@@ -127,6 +133,23 @@ def cases() -> list[tuple[str, dict]]:
                         "metrics": "all", "compact": False}),
         ("aa_compare", {"queries": ["mimo-v2-6-pro", "deepseek-v4-1-flash",
                                     "gpt-6-luna-xhigh", "muse-wonder-full"]}),
+        # Wave G: one metric never means two numbers — the ttft alias, the key and
+        # metrics=all all resolve to the same (model-page) value
+        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-5-2"],
+                        "metrics": "ttft,time_to_first_token,tps"}),
+        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-5-2"], "metrics": "ttft",
+                        "compact": False}),
+        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-5-2"], "metrics": "tps",
+                        "compact": False}),
+        # Wave G: a bare family slug says which effort variant it is
+        ("aa_compare", {"queries": ["gpt-6-luna", "gpt-5-2"], "metrics": "intelligence"}),
+        # Wave G: one unknown name in a list must not abort the whole call
+        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-6-astra"],
+                        "metrics": ["livecodebench", "frontierCode", "terminalBench40",
+                                    "lcr", "swe-bench-verified"]}),
+        # Wave G: score/$ is a derived ratio, and metrics=all carries it
+        ("aa_compare", {"queries": ["claude-opus-5-5", "mimo-v2-6-pro"],
+                        "metrics": "intel/$,coding/$", "compact": False}),
         # documented error paths (listed in EXPECTED_FAILURES): never a broken table
         ("aa_compare", {"queries": ["Grok Voice 3.0", "claude-opus-5-5"]}),
         # YAML / JSON spec round-trip (the emitted `spec:` block is re-runnable)
@@ -187,6 +210,9 @@ def cases() -> list[tuple[str, dict]]:
         ("aa_benchmarks", {"query": "gpqa"}),
         ("aa_benchmarks", {"query": "gpqa", "verbose": True}),
         ("aa_benchmarks", {"query": "BFCL"}),
+        # Wave G: a task word AA does not measure answers instead of dead-ending
+        ("aa_benchmarks", {"query": "classif"}),
+        ("aa_benchmarks", {"query": "tool calling"}),
     ]
     bench_keys = [b.key for b in catalog.BENCHMARKS.values()][:14]
     for key in bench_keys:
@@ -213,6 +239,11 @@ def cases() -> list[tuple[str, dict]]:
     out += [
         # the sorted-by column must be visible, and fields=all must work
         ("aa_providers", {"model": "kimi-k3", "sort": "ttft", "fields": "all", "top": 3}),
+        # Wave G: identity fields resolve from the endpoint record (never blank)
+        ("aa_providers", {"model": "mimo-v2-6-pro", "top": 3,
+                          "fields": "model,slug,host,creator,price_in"}),
+        # Wave G: a model AA lists no endpoints for is explained, not errored
+        ("aa_providers", {"model": "muse-wonder-full", "fields": "model,price_in"}),
         ("aa_providers", {"model": "kimi-k3", "sort": "nope", "top": 2}),  # expected fail
     ]
 
@@ -224,6 +255,9 @@ def cases() -> list[tuple[str, dict]]:
     out.append(("aa_media", {"board": "text-to-image", "top": 2}))   # hyphen form
     out.append(("aa_media", {"board": "text_to_image", "top": 2,
                              "fields": "name,elo,ci_lower,ci_upper,ci,price,release"}))
+    # Wave G: a media field the board does not have is ignored, not fatal
+    out.append(("aa_media", {"board": "text_to_image", "top": 2,
+                             "fields": "elo,nonsense"}))
 
     # --- agents: every board ------------------------------------------------
     for board in sorted(loaders.AGENT_BOARDS):
@@ -244,6 +278,9 @@ def cases() -> list[tuple[str, dict]]:
     # a query naming a rankable thing answers with its hint instead of dead-ending
     out.append(("aa_search", {"query": "gpqa"}))
     out.append(("aa_search", {"query": "terminal-bench 4.0"}))
+    # Wave G: a task word AA does not measure answers with its closest measures
+    out.append(("aa_search", {"query": "best model for classification"}))
+    out.append(("aa_search", {"query": "summarization"}))
 
     # --- reference: every topic --------------------------------------------
     for topic in sorted(reference.TOPICS):

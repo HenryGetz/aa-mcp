@@ -302,3 +302,58 @@ def test_every_eval_numeric_benchmark_is_reachable(eval_records):
 def test_non_dict_records_raise_type_error(fn):
     with pytest.raises(TypeError):
         fn("$e:props:children:0:props:currentModel")
+
+
+# --------------------------------------------------------------------------- #
+# Wave G-B1: AA's published time-per-task vs our derived mean
+# --------------------------------------------------------------------------- #
+
+def test_chart_reads_aa_published_time_per_task(chart_records):
+    rec = chart_records["claude-opus-5-5"]
+    m = normalize.from_chart(rec)
+    assert m.speed["time_per_task"] == pytest.approx(rec["intelligenceIndexTimePerTask"])
+    assert m.speed["time_per_task"] == pytest.approx(789.2354834132094)
+
+
+def test_derived_time_per_task_is_the_per_eval_mean(chart_records):
+    m = normalize.from_chart(chart_records["claude-opus-5-5"])
+    times = [r["timePerTask"] for r in m.per_eval if r["timePerTask"] is not None]
+    assert len(times) == 10
+    assert m.speed["time_per_task_derived"] == pytest.approx(sum(times) / len(times))
+    # The published aggregate and our mean are different numbers (median -6.7 %
+    # across the 189 rich records carrying both): the fallback must not shadow it.
+    assert m.speed["time_per_task_derived"] == pytest.approx(689.9289088216383)
+    assert abs(m.speed["time_per_task"] - m.speed["time_per_task_derived"]) > 1.0
+
+
+def test_derived_mean_is_the_only_value_when_aa_publishes_none(chart_records):
+    rec = dict(chart_records["step-5"])
+    assert rec.pop("intelligenceIndexTimePerTask") is not None
+    m = normalize.from_chart(rec)
+    assert m.speed["time_per_task"] is None
+    assert m.speed["time_per_task_derived"] == pytest.approx(606.145853280145)
+
+
+def test_both_time_per_task_values_are_none_without_chart_data(chart_records):
+    # no published field and every per-eval timePerTask is null
+    m = normalize.from_chart(chart_records["muse-wonder-full"])
+    assert m.speed["time_per_task"] is None
+    assert m.speed["time_per_task_derived"] is None
+
+
+def test_leaderboard_and_legacy_carry_no_time_per_task(leaderboard_records, legacy_record):
+    lb = normalize.from_leaderboard(leaderboard_records[0])
+    assert lb.speed["time_per_task"] is None
+    assert lb.speed["time_per_task_derived"] is None
+    legacy = normalize.from_legacy(legacy_record)
+    assert legacy.speed["time_per_task"] is None
+    assert legacy.speed["time_per_task_derived"] is None
+
+
+def test_merge_keeps_the_published_time_per_task(chart_records, leaderboard_records):
+    chart = normalize.from_chart(chart_records["claude-opus-5-5"])
+    leader = next(m for m in map(normalize.from_leaderboard, leaderboard_records)
+                  if m.slug == "claude-opus-5-5")
+    for merged in (normalize.merge(leader, chart), normalize.merge(chart, leader)):
+        assert merged.speed["time_per_task"] == pytest.approx(789.2354834132094)
+        assert merged.speed["time_per_task_derived"] == pytest.approx(689.9289088216383)

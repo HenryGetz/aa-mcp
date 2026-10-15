@@ -13,6 +13,21 @@ Eval values in :attr:`Model.evals` are stored **raw**: percentages stay as
 fractions (0-1) and Elo values are **not** divided by 100. The formatting layer
 (:func:`catalog.format_value`) scales fractions to ``%``. This is deliberate and
 must not change.
+
+Two distinct numbers travel in ``speed`` for the time of one Intelligence Index
+task, and they are **not** interchangeable:
+
+* ``speed["time_per_task"]`` — AA's own published aggregate
+  (``intelligenceIndexTimePerTask``, seconds). This is the number the site's
+  "Intelligence Index vs. Time per Task" chart plots, and the one to report.
+* ``speed["time_per_task_derived"]`` — **our fallback only**: the unweighted mean
+  of the ten per-evaluation ``timePerTask`` values. Measured against AA's field
+  across the 189 rich records carrying both, it differs by a median of −6.7 %
+  (range −25.7 % … +10.6 %), so it must never be preferred.
+
+``time_per_task`` is ``None`` on surfaces that do not publish it (leaderboard
+rows, most legacy objects) and ``time_per_task_derived`` is ``None`` when no
+per-evaluation rows carry a ``timePerTask``.
 """
 
 from __future__ import annotations
@@ -263,6 +278,9 @@ def from_leaderboard(rec: dict) -> Model:
             "ttft_q25": _num(rec.get("quartile25TimeToFirstTokenSeconds")),
             "ttft_q75": _num(rec.get("quartile75TimeToFirstTokenSeconds")),
             "ttft_p95": _num(rec.get("percentile95TimeToFirstTokenSeconds")),
+            # neither number exists on this surface (no chart data, no per-eval rows)
+            "time_per_task": None,
+            "time_per_task_derived": None,
         },
         cost_per_task=_num(rec.get("intelligenceIndexCostPerTask")),
         cost_breakdown=None,
@@ -321,7 +339,13 @@ def _cost_fields(rec):
     return total, breakdown, per_eval
 
 
-def _speed_chart(rec) -> dict[str, float | None]:
+def _mean_per_eval_time(per_eval: list[dict] | None) -> float | None:
+    """Unweighted mean of the per-evaluation ``timePerTask`` values (fallback)."""
+    times = [r["timePerTask"] for r in per_eval or [] if r.get("timePerTask") is not None]
+    return sum(times) / len(times) if times else None
+
+
+def _speed_chart(rec, per_eval: list[dict] | None = None) -> dict[str, float | None]:
     ts = rec.get("timescaleData") or {}
     e2e = rec.get("endToEndResponseTime") or {}
     ttfa = rec.get("timeToFirstAnswerToken") or {}
@@ -335,6 +359,9 @@ def _speed_chart(rec) -> dict[str, float | None]:
         "reasoning_s": _num(e2e.get("reasoning")),
         "out_tokens_per_task": out_val,
         "reasoning_tokens": _num(rec.get("reasoningTokens")),
+        # AA's published aggregate (preferred); the per-eval mean is our fallback.
+        "time_per_task": _num(rec.get("intelligenceIndexTimePerTask")),
+        "time_per_task_derived": _mean_per_eval_time(per_eval),
     }
 
 
@@ -360,7 +387,8 @@ def from_chart(rec: dict) -> Model:
         indices["openness"] = _num(openness.get("opennessIndex"))
     indices.update(_capability_indices(rec))
 
-    total, breakdown, per_eval = _cost_fields(rec)
+    total, breakdown, per_eval_cost = _cost_fields(rec)
+    per_eval = _per_eval(rec)
     return Model(
         slug=slug,
         name=name,
@@ -388,11 +416,11 @@ def from_chart(rec: dict) -> Model:
         indices=indices,
         evals=evals,
         pricing=_pricing(rec),
-        speed=_speed_chart(rec),
+        speed=_speed_chart(rec, per_eval),
         cost_per_task=total,
         cost_breakdown=breakdown,
-        per_eval_cost=per_eval,
-        per_eval=_per_eval(rec),
+        per_eval_cost=per_eval_cost,
+        per_eval=per_eval,
         source="chart",
     )
 
@@ -444,7 +472,7 @@ def from_legacy(rec: dict) -> Model:
         indices=indices,
         evals=evals,
         pricing=_pricing(rec),
-        speed=_speed_chart(rec),
+        speed=_speed_chart(rec, _per_eval(rec)),
         cost_per_task=None,
         cost_breakdown=None,
         per_eval_cost=None,

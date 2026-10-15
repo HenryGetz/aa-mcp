@@ -49,7 +49,33 @@ while the gap is small, or "<model> has no published pricing or speed on AA"). T
 included); `compact` selects the core rows for the default metric set, and with
 `metrics=` it omits the Slug row and any all-null row (`compact=false` includes
 them). The default metric set is a subset (13 rows); its footer says so and
-points at `metrics=all` for every published row.
+points at `metrics=all` for every published row. `metrics=all` carries every
+rankable row the models have — including the derived `Intel/$` (and `score/$` for the
+other score axes), which the default view shows and `all` used to omit.
+
+One metric never means two numbers, and a correction is never silent:
+
+- The dual-sourced speed/latency metrics (`tps`, `ttft`, `ttfa`, `e2e`) resolve to
+  the **first-party model page** in `aa_compare` whatever alias you type, with a
+  footnote naming the leaderboard snapshot value when the two differ by >2%
+  (`— TTFT: model page 661.2s vs leaderboard snapshot 679.2s for <model> (using the
+  model page)`). See topic `speed`.
+- A query that is not the exact slug/name says how it resolved (`— matched
+  'opus max' → claude-opus-5-5 (exact slug for that name)`), and a bare family slug
+  says which reasoning-effort variant it is plus its siblings (`— matched the Max
+  variant of gpt-6-luna; siblings: gpt-6-luna-xhigh, -high, -medium, -low,
+  -non-reasoning`).
+- Ranked tables order rows that *display* the same value by a named secondary key
+  and say so: `— 2 models tie at $0.13/task; ordered by intelligence (46.3 vs
+  42.1)`.
+- A task word AA publishes no benchmark for is answered with its closest measures:
+  `AA does not measure classification; closest AA measures are IFBench …`
+  (`aa_search`, `aa_benchmarks`).
+- A cost or price that renders `$0.00` is explained (`— $0.00 = measured under
+  $0.005/task …`) instead of standing as a bare zero that wins every "cheapest"
+  ranking.
+- Identity fields always resolve in `fields=` (topic `fields`), and a list-valued
+  `metrics=`/`fields=` renders what resolves plus one footnote for the rest.
 
 `aa_leaderboard sort=<key>` is the uniform ranking path: it ranks any key with
 per-model values on any surface it can reach — the 700-row leaderboard, the rich
@@ -155,6 +181,13 @@ benchmark AA fetches live is never labelled "not fetched" — and
 `aa_leaderboard sort=<key>` ranks that same chain, stating the real coverage
 (`n of m scored`, `700 tracked`) and the surface it joined.
 
+A task word AA publishes no benchmark for is never a dead end. `aa_benchmarks
+query=<word>` and `aa_search` answer with the closest AA measures — "AA does not
+measure <task>; closest AA measures are …" — for classification, summarization,
+translation, retrieval/RAG, SQL/data analysis, tool calling, moderation and OCR
+(e.g. classification → IFBench / MMLU-Pro, tool calling → τ²-Bench / τ³-Banking plus
+the provider FnCall/JSON flags). Never invent a score for a task AA does not measure.
+
 ## pricing
 
 USD per 1M tokens: input, output, cache-read (cache hit) and cache-write. `cacheHit
@@ -177,6 +210,18 @@ Measured by AA on the provider in `performanceDataSource` (usually first-party A
   q25/q75 variance bands come with model pages: a model can be inconsistent even
   when its median looks good.
 
+AA publishes `tok/s`, `TTFT`, `TTFA` and `E2E` on **two** surfaces: the 700-row
+leaderboard snapshot (`medianOutputTokensPerSecond`, `medianTimeToFirstTokenSeconds`,
+…) and the first-party model page (`timescaleData.medianOutputSpeed` /
+`medianTimeToFirstChunk`, `timeToFirstAnswerToken.total`, `endToEndResponseTime.total`).
+They are genuinely different measurements (for claude-opus-5-5 the leaderboard
+snapshot TTFT is 679.2 s, the model-page long-prompt median 661.2 s).
+`aa_compare` always reports the **model page** value — the same number whichever
+alias you type (`ttft` or `time_to_first_token`) — and adds one footnote naming both
+numbers when they differ by more than 2%. `aa_leaderboard`/`aa_pareto` report the
+leaderboard snapshot and say so in their footer. `aa_model` shows the model page and
+breaks TTFT out by prompt type (short/medium/long/100k).
+
 ## providers
 
 Per model x provider endpoint: host, precision/quantization tag (from the endpoint
@@ -188,6 +233,11 @@ The provider board holds 1,201 endpoints across ~453 models and 64 hosts (measur
 2026-10-14) with pricing, performance and feature flags, but without precision tags
 or per-endpoint cost per task — use the per-model view for those. The table always
 shows the column it is sorted by (`sort=ttft` appends a TTFT column).
+Identity names always resolve in `fields=` (`model`/`name`, `slug`, `host`,
+`creator`) — they are never blank and never reported as "no data". A model AA
+lists no API endpoints for is explained, not errored: `— AA lists no API providers
+for <model>; it has no published pricing or endpoint measurements (see aa_model for
+what AA does publish)`.
 
 ## media
 
@@ -213,13 +263,27 @@ omniscience_accuracy, omniscience_non_hallucination, openness, capabilities.<nam
 cost_per_task (alias cost; shown as $/Task), index_total_cost (whole-suite index cost,
 `aa_pareto x=index_total_cost`), price_in, price_out, cache_read,
 cache_write, cache_hit_discount, blended_*, tps, ttft, ttfa, e2e, reasoning_time,
-out_tokens_per_task, time_per_task (mean per-eval time per index task),
+out_tokens_per_task, time_per_task (AA-published seconds per index task),
 context_tokens (ctx), params_b, active_params_b, release_date,
 knowledge_cutoff, license, weights_url, is_open_weights (open), is_reasoning,
 effort, deprecated, size_class, modalities_in, modalities_out, creator, slug, name
 plus every benchmark key listed in `benchmarks` (e.g. gpqa, hle, mmmuPro,
 briefcaseElo, terminalBench40, cyberIndex, cyberRefusalRate, cyberMitigationStatus). Media arenas also accept `ci_lower`, `ci_upper`
 and `ci` (the 95% confidence interval).
+
+Identity names resolve in every `fields=` list whatever the surface calls the
+column: `model`/`name` → the Model column, `slug`, `host`, `creator`, and
+`benchmark` (aa_benchmark_leaderboard). They are never blank and never reported as
+"no data". A list-valued `fields=`/`metrics=` request renders everything that
+resolves and footnotes the rest (`— unknown, ignored: <name> (closest: …)`) instead
+of aborting the call; single-purpose arguments (`sort=`, `benchmark=`, `board=`,
+`domain=`) still fail with the accepted values.
+
+A `score/$` form asks for the derived score-per-$/task ratio instead of the plain
+score: `intel/$` (the default axis, same as `value`), `coding/$`, `agentic/$`. It is
+computed here (`score ÷ cost_per_task`) — AA publishes no such column — and
+`aa_compare metrics=all` includes `Intel/$` and the same ratio for the other score
+axes the models carry.
 
 ## sources
 
@@ -229,13 +293,31 @@ and `ci` (the 95% confidence interval).
   `/sitemap.xml` (the eval catalog is the union of the `/evaluations` cards and the
   sitemap `/evaluations/*` paths, so every published eval page is discoverable),
   media/agent leaderboards, homepage (speech + security panels).
+- Surfaces, what each carries and how fresh it is (TTL, then default seconds):
+  - leaderboard (`aa_leaderboard`, `aa_pareto`) — 700 variants x
+    ~50 columns: index, prices, speed, per-benchmark scores [1 h, `AA_CACHE_TTL`].
+  - rich overlay (`aa_compare`, `aa_pareto`, `aa_model`) — 700 x ~94: capability
+    indexes, AA-Briefcase Elo, whole-suite cost and per-evaluation costs/times,
+    and the first-party model-page speed/latency medians [6 h, `AA_RICH_TTL`]. It
+    is a separate cache file, so it can be hours older than the leaderboard age
+    the header prints: two numbers can disagree on age alone. The header labels
+    it separately — `aa:rsc + rich dataset (overlay 12m ago, seed <slug>)`.
+  - eval chart sets + homepage panels (`aa_benchmark_leaderboard`, speech and
+    security panels) — the top ~20-30 models per evaluation [1 h].
+  - provider board (`aa_providers` board view) — 1,201 endpoints x 64 hosts [1 h].
+  - model providers (`aa_providers model=<slug>`) — per-endpoint pricing,
+    performance and feature flags [1 h].
+  - media arenas (`aa_media`) — Elo and appearance counts per arena [1 h].
+  - agents boards (`aa_agents`) — coding-agent, chatbot and search-API tables [1 h].
+  - eval catalog (`aa_benchmarks` index) — `/evaluations` cards + sitemap paths [1 h].
 - Transport: `RSC: 1` request header returns the Next.js flight payload (JSON-ish,
   ~1.2 MB gzip-transfer for the leaderboard). AA redeploys often; never hardcode
   chunk or build-id URLs.
 - JSON API: https://artificialanalysis.ai/api/v2 (`x-api-key`), public schema at
   `/api/v2/openapi`. Free tier covers `language/models/free` + free media endpoints.
 - Cache: `~/.cache/aa-mcp` (`AA_CACHE_DIR`), TTL `AA_CACHE_TTL` (default 3600 s),
-  API TTL `AA_API_TTL` (default 21600 s). `AA_OFFLINE=1` serves cache only.
+  API TTL `AA_API_TTL` (default 21600 s), rich overlay TTL `AA_RICH_TTL` (default
+  21600 s). `AA_OFFLINE=1` serves cache only.
 - Recovery: if the site answers with a Cloudflare challenge or the payload structure
   changed, the error states the cache path to overwrite — render the URL in a browser
   and save the HTML there, then retry. Offline/stale data is labelled in the header.
