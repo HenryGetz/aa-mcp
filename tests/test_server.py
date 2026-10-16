@@ -1317,6 +1317,8 @@ def test_every_rankable_how_hint_is_accepted_by_its_tool():
         elif tool == "aa_media":
             assert (value in server.loaders.MEDIA_BOARDS
                     or value in server._SPEECH_BOARDS), (key, r.how)
+        elif tool == "aa_agents":
+            assert value in server.loaders.AGENT_BOARDS, (key, r.how)
         elif tool == "aa_pareto":
             assert server._pareto_axis(value) == value, (key, r.how)
         else:  # pragma: no cover - the tool set is asserted in test_catalog
@@ -1797,3 +1799,382 @@ def test_prov_label_falls_back_without_the_overlay_age(monkeypatch):
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
     monkeypatch.setattr(loaders, "rich_age", lambda: None, raising=False)
     assert server._prov_label(True) == "rsc + rich dataset"
+
+
+def test_source_key_is_always_rsc_and_warns_once(monkeypatch, caplog):
+    """The keyed backend is gone: the label is always ``aa:rsc`` and a stray
+    ``AA_API_KEY``/``AA_SOURCE`` is reported exactly once per process."""
+    monkeypatch.setenv("AA_API_KEY", "bogus")
+    monkeypatch.setenv("AA_SOURCE", "api")
+    monkeypatch.setattr(server, "_keyed_env_warned", False)
+    with caplog.at_level("WARNING", logger="aa_mcp.server"):
+        assert server._source_key() == "rsc"
+        assert server._source_key() == "rsc"
+    msgs = [r.getMessage() for r in caplog.records if r.name == "aa_mcp.server"]
+    assert len(msgs) == 1
+    assert "AA_API_KEY" in msgs[0] and "AA_SOURCE" in msgs[0]
+    assert "aa:api" not in server._header(count="1 of 1")
+
+
+def test_lb_cache_and_cache_ttl_ignore_api_settings(monkeypatch):
+    """No keyed cache: ``_lb_cache`` is constant and ``AA_API_TTL`` is ignored."""
+    monkeypatch.setenv("AA_API_TTL", "123")
+    monkeypatch.delenv("AA_CACHE_TTL", raising=False)
+    assert server._lb_cache() == ("leaderboard", False)
+    assert server._cache_ttl(True) == 3600      # AA_API_TTL no longer read
+    assert server._cache_ttl(False) == 3600
+    monkeypatch.setenv("AA_CACHE_TTL", "456")
+    assert server._cache_ttl(True) == 456
+    assert server._cache_ttl(False) == 456
+
+
+# --------------------------------------------------------------------------- #
+# AA's index pages: the six Capability Indexes + the Openness / Decision indexes
+# --------------------------------------------------------------------------- #
+
+def _index_page_model(slug: str, value: float, subs: dict | None = None, **overrides):
+    """A model shaped like ``loaders.capability_models`` output (score + sub-scores)."""
+    indices = {"capabilities.legal": value}
+    for key, sub_value in (subs or {}).items():
+        indices[f"capabilities.legal.{key}"] = sub_value
+    return _model(slug, **{**overrides, "indices": indices, "source": "capability"})
+
+
+def _own_page(monkeypatch, key: str, models: list, source: str, published: int):
+    """Point the index-page join for ``key`` at ``models``."""
+    monkeypatch.setattr(server, "_extra_score_models",
+                        lambda k, refresh=False: models if k == key else [])
+    monkeypatch.setattr(server, "_extra_score_meta",
+                        lambda k: (source, len(models)) if k == key else ("", 0))
+    monkeypatch.setattr(server, "_index_page_meta",
+                        lambda k: (source, len(models), published) if k == key else ("", 0, 0))
+
+
+def test_join_lets_the_index_page_win_its_own_key(monkeypatch):
+    """AA's own page for an index is authoritative for that index's value."""
+    page = _index_page_model("alpha", 63.26, {"knowledge": 64.2})
+    _own_page(monkeypatch, "capabilities.legal", [page], "/models/capabilities/legal", 26)
+    base = [_model("alpha", indices={"capabilities.legal": 40.0}, cost_per_task=1.0)]
+
+    joined, source = server._join_extra_scores(base, "capabilities.legal")
+    assert source == "/models/capabilities/legal"
+    assert joined[0].indices["capabilities.legal"] == pytest.approx(63.26)   # page wins
+    assert joined[0].indices["capabilities.legal.knowledge"] == pytest.approx(64.2)
+    # everything the leaderboard/rich record knows survives the join
+    assert joined[0].cost_per_task == 1.0
+    assert joined[0].source == "leaderboard"
+
+
+def test_join_keeps_the_merged_value_for_a_chart_surface(monkeypatch):
+    """A chart-set / panel record is merged *under* the merged record, as before."""
+    panel = _model("alpha", evals={"cyberIndex": 99.0})
+    _own_page(monkeypatch, "cyberIndex", [panel], "homepage panel", 1)
+    base = [_model("alpha", evals={"cyberIndex": 12.0}, cost_per_task=1.0)]
+
+    joined, source = server._join_extra_scores(base, "cyberIndex")
+    assert source == "homepage panel"
+    assert joined[0].evals["cyberIndex"] == 12.0     # the merged record still wins
+
+
+def test_join_appends_a_model_only_the_index_page_has(monkeypatch):
+    page = _index_page_model("newbie", 55.0)
+    _own_page(monkeypatch, "capabilities.legal", [page], "/models/capabilities/legal", 26)
+    base = [_model("alpha", indices={"capabilities.legal": 40.0})]
+
+    joined, _source = server._join_extra_scores(base, "capabilities.legal")
+    assert [m.slug for m in joined] == ["alpha", "newbie"]
+
+
+def test_leaderboard_ranks_a_capability_index(monkeypatch, fake):
+    """``sort=capabilities.legal`` ranks on real values and says where they came from."""
+    models = [_model("alpha", "Alpha One", indices={"capabilities.legal": 60.0}),
+              _model("beta", "Beta Two", indices={"capabilities.legal": 70.0}),
+              _model("gamma", "Gamma Three")]
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, True))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    _own_page(monkeypatch, "capabilities.legal",
+              [_index_page_model("beta", 70.0, {"knowledge": 71.0})],
+              "/models/capabilities/legal", 26)
+
+    out = server.aa_leaderboard(sort="capabilities.legal", top=5)
+    assert out.index("Beta Two") < out.index("Alpha One")
+    assert "Cap Legal" in out
+    # honest coverage: how many variants carry a value, and where the sub-scores are
+    assert "Cap Legal: 2 of 3 tracked variants have a value" in out
+    assert "/models/capabilities/legal" in out
+    assert "sub-scores for 1 of the 2 rows shown" in out
+    # the unscored model is not listed as if it had a value
+    assert "Gamma Three" not in out
+
+
+def test_capability_index_aliases_resolve_to_the_same_ranking(monkeypatch, fake):
+    models = [_model("alpha", "Alpha One", indices={"capabilities.legal": 60.0})]
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, True))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    _own_page(monkeypatch, "capabilities.legal", [], "/models/capabilities/legal", 0)
+    # the payload's own field name, AA's human label and the bare domain word all
+    # reach the same ranking
+    for alias in ("capabilities.legal", "Legal", "Legal Index", "legal"):
+        assert server._metric_key(alias, "sort") == "capabilities.legal"
+        assert "Cap Legal" in server.aa_leaderboard(sort=alias, top=3)
+    for alias, key in (("Finance & Accounting", "capabilities.financeAndAccounting"),
+                       ("financeAndAccounting", "capabilities.financeAndAccounting"),
+                       ("Strategy & Ops", "capabilities.strategyAndOps"),
+                       ("strategyAndOps", "capabilities.strategyAndOps"),
+                       ("Healthcare & Medical", "capabilities.healthcareAndMedical"),
+                       ("healthcareAndMedical", "capabilities.healthcareAndMedical"),
+                       ("Engineering", "capabilities.engineering"),
+                       ("engineering", "capabilities.engineering"),
+                       ("Economics", "capabilities.economics"),
+                       ("economics", "capabilities.economics")):
+        assert server._metric_key(alias, "sort") == key
+
+
+def test_benchmark_leaderboard_ranks_a_capability_index(monkeypatch, fake):
+    models = [_model("alpha", "Alpha One", indices={"capabilities.legal": 60.0}),
+              _model("beta", "Beta Two", indices={"capabilities.legal": 70.0})]
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, True))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    _own_page(monkeypatch, "capabilities.legal",
+              [_index_page_model("beta", 70.0, {"knowledge": 71.0})],
+              "/models/capabilities/legal", 26)
+
+    out = server.aa_benchmark_leaderboard(benchmark="capabilities.legal", top=5)
+    assert out.index("Beta Two") < out.index("Alpha One")
+    assert "Cap Legal" in out
+    assert "/models/capabilities/legal + rich dataset" in out
+    assert "sub-scores for 1 of the 2 rows shown" in out
+
+
+def test_pareto_and_compare_reach_a_capability_index(monkeypatch, fake):
+    models = [_model("alpha", "Alpha One", indices={"capabilities.legal": 60.0},
+                     cost_per_task=1.0),
+              _model("beta", "Beta Two", indices={"capabilities.legal": 70.0},
+                     cost_per_task=2.0)]
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, True))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    _own_page(monkeypatch, "capabilities.legal", [], "/models/capabilities/legal", 0)
+
+    frontier = server.aa_pareto(score="capabilities.legal", top=5)
+    assert "Legal Index vs $/task" in frontier
+    compared = server.aa_compare(queries=["alpha", "beta"], metrics="capabilities.legal")
+    assert "Legal Index" in compared and "70.0" in compared
+
+
+def test_model_section_shows_capability_sub_scores(monkeypatch, fake):
+    """``aa_model sections=indexes`` shows the six scores + the page's sub-scores."""
+    base = _model("alpha", "Alpha One", intelligence=50.0,
+                  indices={"capabilities.legal": 63.26,
+                           "capabilities.economics": 65.6})
+    monkeypatch.setattr(server, "_models", lambda refresh=False: [base])
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: {})
+    monkeypatch.setattr(server, "_capability_page_subs",
+                        lambda key, slug, refresh=False: (
+                            [("capabilities.legal.knowledge", 64.2)]
+                            if key == "capabilities.legal" else []))
+
+    out = server.aa_model(query="alpha", sections="indexes")
+    assert "| Legal | 63.3 |" in out
+    assert "Legal: Knowledge 64.2" in out
+    # the index AA does not publish free is stated plainly, with no key talk
+    assert "Coding Index, Agentic Index: AA publishes these composites only" in out
+    assert "AA_API_KEY" not in out and "JSON API" not in out
+    assert "no sub-scores for Economics" in out
+
+
+def test_paid_only_indexes_explain_themselves_without_a_key(monkeypatch, fake):
+    """``sort=coding``/``sort=agentic``: honest text, no key talk, free alternatives."""
+    for key, constituent in (("coding", "scicode"),
+                             ("agentic", "terminalBench40")):
+        with pytest.raises(ToolError) as exc:
+            server.aa_leaderboard(sort=key, top=3)
+        text = str(exc.value)
+        assert "paid data API" in text
+        assert "no public page carries a per-model value" in text
+        assert constituent in text
+        assert "AA_API_KEY" not in text and "JSON API" not in text and "env" not in text
+        with pytest.raises(ToolError) as exc2:
+            server.aa_benchmark_leaderboard(benchmark=key)
+        assert "paid data API" in str(exc2.value)
+
+
+def test_no_hint_for_a_paid_only_index_claims_a_leaderboard_path():
+    """A hint must never propose a call that cannot work."""
+    for key in ("coding", "agentic"):
+        rank = catalog.RANKABLES[key]
+        assert rank.surface == "none"
+        assert not rank.how.startswith("aa_leaderboard sort="), rank.how
+        tool, _, arg = rank.how.partition(" ")
+        assert tool == "aa_benchmark_leaderboard"
+        constituent = arg.partition("=")[2]
+        assert catalog.benchmark(constituent) is not None
+        assert catalog.benchmark(constituent).source_hint != "none"
+        assert key in catalog.API_ONLY_INDEXES
+
+
+def test_openness_and_decision_index_rankables_are_registered():
+    for key, unit in (("openness", "index"), ("decisionIndex", "index")):
+        rank = catalog.RANKABLES[key]
+        assert rank.unit == unit and rank.label and rank.desc
+        tool, _, arg = rank.how.partition(" ")
+        assert tool in ("aa_leaderboard", "aa_benchmark_leaderboard")
+        assert server._metric_key(arg.partition("=")[2], "sort") == key
+    # the Openness page's own array is the source of `openness`
+    assert loaders.INDEX_PAGES["openness"] == "artificial-analysis-openness-index"
+    assert loaders.INDEX_PAGES["decisionIndex"] == "artificial-analysis-decision-index"
+    assert {"openness", "decisionIndex"} <= server._OWN_PAGE_KEYS
+
+
+def test_leaderboard_ranks_the_decision_index(monkeypatch, fake):
+    models = [_model("alpha", "Alpha One"), _model("beta", "Beta Two")]
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, True))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    page = [_model("beta", "Beta Two", indices={"decisionIndex": 79.0}),
+            _model("alpha", "Alpha One", indices={"decisionIndex": 62.0})]
+    _own_page(monkeypatch, "decisionIndex", page,
+              "/evaluations/artificial-analysis-decision-index", 28)
+
+    out = server.aa_leaderboard(sort="decisionIndex", top=3)
+    assert out.index("Beta Two") < out.index("Alpha One")
+    assert "Decision" in out
+    assert "28 rows it publishes" in out
+
+
+def test_leaderboard_ranks_the_openness_index_from_its_own_page(monkeypatch, fake):
+    models = [_model("alpha", "Alpha One"), _model("beta", "Beta Two")]
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, True))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    page = [_model("alpha", "Alpha One", indices={"openness": 88.9}),
+            _model("beta", "Beta Two", indices={"openness": 40.0})]
+    _own_page(monkeypatch, "openness", page,
+              "/evaluations/artificial-analysis-openness-index", 326)
+
+    out = server.aa_leaderboard(sort="openness", top=3)
+    assert out.index("Alpha One") < out.index("Beta Two")
+    assert "/evaluations/artificial-analysis-openness-index" in out
+
+
+def test_rankable_coverage_reports_a_paid_only_index_and_a_page(monkeypatch, fake):
+    monkeypatch.setattr(server, "_extra_score_models", lambda key, refresh=False: [])
+    assert "paid data API" in server._rankable_coverage(
+        catalog.RANKABLES["coding"], [], [])
+
+    page = [_model("alpha", "Alpha One", indices={"decisionIndex": 79.0})]
+    _own_page(monkeypatch, "decisionIndex", page,
+              "/evaluations/artificial-analysis-decision-index", 28)
+    coverage = server._rankable_coverage(catalog.RANKABLES["decisionIndex"], [], [])
+    assert "28 rows are tracked models" in coverage
+
+
+def test_agents_board_presents_the_coding_agent_index(monkeypatch):
+    """The coding board's ``indexScore`` is the Coding Agent Index (0-100, agents)."""
+    rows = [{"rank": 1, "agent": "Claude Code", "model": "Sonnet 5.5 (max)",
+             "creator": "Anthropic", "score": 0.6835783373750831,
+             "cost_per_task": 14.19}]
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: rows)
+
+    out = server.aa_agents(board="coding_agents", top=3)
+    assert "Coding Agent Index" in out
+    assert "| 1 | Claude Code | Sonnet 5.5 (max) | Anthropic | 68.4 | $14.19 |" in out
+    assert "agents, not models" in out
+    # the other agent boards keep their own score rendering
+    other = server.aa_agents(board="chatbots", top=3)
+    assert "Coding Agent Index" not in other
+
+
+def test_coding_agent_index_rankable_points_at_aa_agents():
+    rank = catalog.RANKABLES["coding_agents"]
+    assert rank.kind == "arena" and rank.unit == "index"
+    assert rank.how == "aa_agents board=coding_agents"
+    assert "Coding Agent Index" in rank.label
+    assert catalog.rankable("Coding Agent Index") is not None
+
+
+# --------------------------------------------------------------------------- #
+# coverage is a property of the dataset, never of a filtered view
+# --------------------------------------------------------------------------- #
+
+def _capability_dataset(monkeypatch, fake):
+    """5 scored models (2 of them deprecated) + 1 unscored, as the merged dataset."""
+    models = [
+        _model("alpha", "Alpha One", creator="LabA",
+               indices={"capabilities.legal": 60.0}),
+        _model("beta", "Beta Two", indices={"capabilities.legal": 70.0}),
+        _model("gamma", "Gamma Three", indices={"capabilities.legal": 55.0}),
+        _model("delta", "Delta Four", indices={"capabilities.legal": 40.0},
+               deprecated=True),
+        _model("epsilon", "Epsilon Five", indices={"capabilities.legal": 30.0},
+               deprecated=True),
+        _model("zeta", "Zeta Six"),
+    ]
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, True))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    _own_page(monkeypatch, "capabilities.legal", [],
+              "/models/capabilities/legal", 26)
+    return models
+
+
+def test_capability_coverage_is_the_dataset_count_when_unfiltered(monkeypatch, fake):
+    _capability_dataset(monkeypatch, fake)
+    out = server.aa_leaderboard(sort="capabilities.legal", top=2)
+    # 5 of the 6 variants carry a value; only 3 of them are active
+    assert "Cap Legal: 5 of 6 tracked variants have a value (3 active)" in out
+    assert "match your filters" not in out
+
+
+def test_capability_coverage_survives_a_filter(monkeypatch, fake):
+    _capability_dataset(monkeypatch, fake)
+    out = server.aa_leaderboard(sort="capabilities.legal", name="Alpha", top=2)
+    # the coverage line still describes the dataset …
+    assert "Cap Legal: 5 of 6 tracked variants have a value (3 active)" in out
+    # … and the filter's effect is a separate, clearly labelled match count
+    assert "1 of 3 scored models match your filters" in out
+    assert out.startswith("# 1 shown of 1 matching")
+
+
+def test_capability_coverage_survives_a_filter_that_matches_nothing(
+    monkeypatch, fake,
+):
+    _capability_dataset(monkeypatch, fake)
+    out = server.aa_leaderboard(sort="capabilities.legal", name="zzz-nope", top=2)
+    assert out.startswith("# no models match")
+    assert "Cap Legal: 5 of 6 tracked variants have a value (3 active)" in out
+    assert "match your filters" not in out       # nothing matched, so no count
+
+
+def test_benchmark_leaderboard_coverage_survives_a_filter(monkeypatch, fake):
+    models = _capability_dataset(monkeypatch, fake)
+    unfiltered = server.aa_benchmark_leaderboard(benchmark="capabilities.legal", top=2)
+    assert "Cap Legal: 5 of 6 tracked variants have a value" in unfiltered
+    assert "2 of 5 scored (6 tracked)" in unfiltered
+
+    filtered = server.aa_benchmark_leaderboard(benchmark="capabilities.legal",
+                                               creator="LabA", top=2)
+    # the coverage still describes the dataset; the filter is a match count
+    assert "Cap Legal: 5 of 6 tracked variants have a value" in filtered
+    assert "1 of 5 scored models match your filters" in filtered
+    assert "1 shown of 1 matching (6 tracked)" in filtered
+    assert models  # the dataset is unchanged by either call
+
+
+def test_dataset_scored_ignores_filters(monkeypatch, fake):
+    models = _capability_dataset(monkeypatch, fake)
+    assert server._dataset_scored(models, "capabilities.legal") == 5
+    assert server._dataset_scored(models, "capabilities.engineering") == 0
+    # the helper is a plain count over whatever dataset it is handed
+    assert server._dataset_scored([m for m in models if not m.deprecated],
+                                  "capabilities.legal") == 3
+
+
+def test_filter_match_note_is_never_a_coverage_claim():
+    assert server._filter_match_note(5, 133, True) == \
+        "5 of 133 scored models match your filters"
+    assert server._filter_match_note(133, 133, True) == ""   # no narrowing
+    assert server._filter_match_note(5, 133, False) == ""    # no explicit filter

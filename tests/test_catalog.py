@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pathlib
-import re
 
 import pytest
 
@@ -75,7 +74,8 @@ def test_field_aliases(alias, key):
     assert catalog.metric(alias).key == key
 
 
-def test_openapi_vocabulary_aliases():
+def test_api_vocabulary_field_names_resolve():
+    """AA's published API field names resolve to our canonical keys."""
     for name, key in [
         ("artificial_analysis_intelligence_index", "intelligence"),
         ("gpqa_diamond", "gpqa"),
@@ -88,13 +88,17 @@ def test_openapi_vocabulary_aliases():
         assert catalog.metric(name).key == key
 
 
-def test_openapi_fixture_lists_our_keys():
-    """The captured OpenAPI fixture must contain fields we knowingly map."""
-    text = (FIXTURES / "openapi.yaml").read_text(encoding="utf-8")
-    props = re.findall(r"^        ([a-z][a-z0-9_]*):$", text, re.MULTILINE)
-    assert "artificial_analysis_intelligence_index" in props
-    assert "gpqa_diamond" in props
-    assert catalog.metric("artificial_analysis_intelligence_index") is not None
+def test_live_payload_fixtures_list_fields_we_map():
+    """The captured live payloads carry the AA fields our registry maps."""
+    payloads = (
+        (FIXTURES / "leaderboard.rsc").read_text(encoding="utf-8")
+        + (FIXTURES / "model_page_chart.rsc").read_text(encoding="utf-8")
+    )
+    for field in ("intelligenceIndex", "gpqa", "mmmuPro", "terminalBench21",
+                  "gdpvalNormalized", "releaseDate"):
+        assert field in payloads, field
+    assert catalog.metric("intelligence") is not None
+    assert catalog.benchmark("terminalBench21") is not None
 
 
 def test_benchmark_lookup():
@@ -211,8 +215,9 @@ def test_source_hint_classification():
         "briefcaseElo": "rich",
         "aime25": "rich",
         "capabilities.legal": "rich",
-        "coding": "api",
-        "agentic": "api",
+        "coding": "none",
+        "agentic": "none",
+        "decisionIndex": "chart",
         "mmluPro": "chart",
         "wildguardtest": "chart",
     }
@@ -224,10 +229,12 @@ def test_source_hint_values_are_known_and_counted():
     from collections import Counter
 
     hints = Counter(b.source_hint for b in catalog.BENCHMARKS.values())
-    assert set(hints) <= {"leaderboard", "rich", "api", "chart"}
+    assert set(hints) <= {"leaderboard", "rich", "api", "chart", "none"}
     assert hints["leaderboard"] == 20
-    assert hints["api"] == 2
-    assert hints["rich"] + hints["chart"] + hints["leaderboard"] + hints["api"] == len(catalog.BENCHMARKS)
+    # "none" = AA publishes the composite only through its paid data API
+    assert hints["none"] == 2
+    assert hints["api"] == 0
+    assert sum(hints.values()) == len(catalog.BENCHMARKS)
 
 
 def test_untracked_benchmarks_notes_are_factual():
@@ -386,7 +393,8 @@ def test_rankable_entries_have_valid_shape():
         assert r.key == key
         assert r.kind in ("benchmark", "index", "derived", "arena", "view"), key
         assert r.unit in units, (key, r.unit)
-        assert r.surface in ("leaderboard", "rich", "chart", "api", "board"), key
+        assert r.surface in ("leaderboard", "rich", "chart", "api", "board",
+                             "none"), key
         assert r.tags and r.label and r.desc and r.how, key
         assert r.how.split()[0].startswith("aa_"), key
 
@@ -499,6 +507,7 @@ _HOW_TOOLS = {
     "aa_leaderboard": "sort",
     "aa_benchmark_leaderboard": "benchmark",
     "aa_media": "board",
+    "aa_agents": "board",
     "aa_pareto": "x",
 }
 #: axes ``aa_pareto x=`` accepts (mirrors server._PARETO_AXES)
@@ -524,7 +533,7 @@ def test_every_rankable_how_hint_is_well_formed():
             assert catalog.metric(value) is not None or catalog.rankable(value) is not None
         elif tool == "aa_benchmark_leaderboard":
             assert catalog.benchmark(value) is not None, (key, r.how)
-        elif tool == "aa_media":
+        elif tool in ("aa_media", "aa_agents"):
             assert r.kind == "arena" and value == r.key and value in arena_keys, key
         elif tool == "aa_pareto":
             assert value in _PARETO_AXES, (key, r.how)

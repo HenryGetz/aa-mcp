@@ -1,8 +1,8 @@
 """MCP server for artificialanalysis.ai — tools, resources, prompts, ``main()``.
 
 This is the integration point: it wires the frozen modules (:mod:`fetch`,
-:mod:`loaders`, :mod:`catalog`, :mod:`normalize`, :mod:`select`, :mod:`render`,
-:mod:`source`) into the eleven agent-facing tools and renders every answer as
+:mod:`loaders`, :mod:`catalog`, :mod:`normalize`, :mod:`select`, :mod:`render`)
+into the eleven agent-facing tools and renders every answer as
 compact markdown. Nothing here talks to the network at import time; data is
 only loaded inside tool calls, and stdout carries nothing but the MCP protocol.
 """
@@ -37,7 +37,6 @@ from . import (
     reference,
     render,
     select,
-    source,
 )
 from .fetch import AAFetchError
 from .normalize import Model
@@ -393,28 +392,43 @@ def _discount(value: Any) -> str:
     return f"{v:.0f}%" if v > 1 else f"{v * 100:.0f}%"
 
 
-def _api_available() -> bool:
-    try:
-        return source.api_key() is not None
-    except Exception:  # pragma: no cover - defensive
-        return False
+_keyed_env_warned = False
+
+
+def _warn_keyed_env_once() -> None:
+    """One-time notice that ``AA_API_KEY``/``AA_SOURCE`` are no longer read."""
+    global _keyed_env_warned
+    if _keyed_env_warned:
+        return
+    _keyed_env_warned = True
+    stale = [name for name in ("AA_API_KEY", "AA_SOURCE") if os.environ.get(name)]
+    if stale:
+        log.warning(
+            "%s set, but the keyed JSON-API backend has been removed; ignoring "
+            "it and using the keyless RSC source",
+            ", ".join(stale),
+        )
 
 
 def _source_key() -> str:
-    try:
-        return loaders.data_source().split(":", 1)[-1]
-    except Exception:  # pragma: no cover - defensive
-        return "rsc"
+    """Provenance key for tool headers — always ``"rsc"`` (keyless source)."""
+    _warn_keyed_env_once()
+    return "rsc"
 
 
-def _cache_ttl(api: bool) -> int:
-    raw = os.environ.get("AA_API_TTL" if api else "AA_CACHE_TTL")
+def _cache_ttl(api: bool = False) -> int:
+    """Cache TTL in seconds (``AA_CACHE_TTL``).
+
+    ``api`` is accepted for call-site compatibility; the keyed API backend is
+    gone, so the former ``AA_API_TTL`` branch no longer exists.
+    """
+    raw = os.environ.get("AA_CACHE_TTL")
     if raw:
         try:
             return int(raw)
         except ValueError:
             pass
-    return 21600 if api else 3600
+    return 3600
 
 
 def _fresh(name: str, *, api: bool = False) -> tuple[float | None, bool]:
@@ -434,8 +448,7 @@ def _fresh(name: str, *, api: bool = False) -> tuple[float | None, bool]:
 
 
 def _lb_cache() -> tuple[str, bool]:
-    if _source_key() == "api":
-        return "api_models_free", True
+    """``(cache name, is_api)`` for the leaderboard — always the RSC payload."""
     return "leaderboard", False
 
 
@@ -478,27 +491,17 @@ def _close(query: str, pool: Iterable[str], n: int = 5) -> list[str]:
     return hits
 
 
-#: server-side aliases that catalog.py does not carry (capability + speech forms)
+#: normalized spellings that catalog.py does not carry (the capability-index
+#: vocabulary lives in ``catalog._CAPABILITY_ALIASES``; these are the remaining
+#: loose phrasings, kept so an agent's own wording resolves)
 _EXTRA_ALIASES: dict[str, str] = {
-    "caplegal": "capabilities.legal",
-    "legalindex": "capabilities.legal",
     "legalcapability": "capabilities.legal",
-    "capmedical": "capabilities.healthcareAndMedical",
     "medicalindex": "capabilities.healthcareAndMedical",
     "healthcareindex": "capabilities.healthcareAndMedical",
-    "healthcaremedicalindex": "capabilities.healthcareAndMedical",
-    "capfinance": "capabilities.financeAndAccounting",
     "financeindex": "capabilities.financeAndAccounting",
-    "financeaccountingindex": "capabilities.financeAndAccounting",
-    "capstrategy": "capabilities.strategyAndOps",
     "strategyindex": "capabilities.strategyAndOps",
-    "strategyopsindex": "capabilities.strategyAndOps",
     "capengineer": "capabilities.engineering",
-    "capengineering": "capabilities.engineering",
-    "engineeringindex": "capabilities.engineering",
     "capeconomic": "capabilities.economics",
-    "capeconomics": "capabilities.economics",
-    "economicsindex": "capabilities.economics",
 }
 
 
@@ -981,13 +984,21 @@ def _is_index_key(key: str) -> bool:
 
 
 def _no_rank_text(key: str, label: str) -> str:
-    if _is_index_key(key):
+    constituents = catalog.API_ONLY_INDEXES.get(key)
+    if constituents:
         return (
-            f"{label!r}: AA exposes this index per model only on the scrape source "
-            "(model pages) and through the JSON API (AA_API_KEY) — there is no "
+            f"{label!r}: AA publishes this composite only through its paid data API, "
+            "and no public page carries a per-model value — there is no cross-model "
+            "ranking to sort by.\n"
+            f"— rank the free constituents instead: {', '.join(constituents)} "
+            "(aa_benchmark_leaderboard benchmark=<one of those>)"
+        )
+    if key in _OWN_PAGE_KEYS:
+        return (
+            f"{label!r}: AA publishes this index on a page of its own, which could not "
+            "be read just now — no per-model values are available, so there is no "
             "cross-model ranking to sort by.\n"
-            "— read one model with aa_model <slug>, or set AA_API_KEY; "
-            "aa_benchmark_leaderboard has no slug for these."
+            "— retry with refresh=true, or read one model with aa_model <slug>."
         )
     if catalog.benchmark(key) is None:
         return (
@@ -1245,17 +1256,19 @@ def _build_fallback_rankables() -> dict[str, _Rankable]:
     out: dict[str, _Rankable] = {}
     for key, bench in catalog.BENCHMARKS.items():
         kind = "index" if bench.unit == "index" else "benchmark"
-        if bench.unit == "mixed":
+        constituents = catalog.API_ONLY_INDEXES.get(key)
+        if constituents:
+            # no free per-model surface exists: point at a call that works
+            how = f"aa_benchmark_leaderboard benchmark={constituents[0]}"
+        elif bench.unit == "mixed":
             how = f"aa_model <model-slug> sections=benchmarks ({bench.label} breakdown)"
-        elif (bench.source_hint != "api"
+        elif (bench.source_hint not in ("api", "none")
               and (bench.source_hint != "chart" or bench.slug)):
             # mirrors catalog's rule: the leaderboard path reaches leaderboard /
             # rich / chart-set / panel keys (the join is by eval-page slug)
             how = f"aa_leaderboard sort={key}"
         else:
             how = f"aa_benchmark_leaderboard benchmark={key}"
-            if bench.source_hint == "api":
-                how += " (needs AA_API_KEY)"
         aliases = tuple(dict.fromkeys((bench.label, *_BENCH_ALIASES.get(key, ()))))
         out[key] = _Rankable(key, bench.label, kind, bench.unit, tuple(bench.tags),
                              how, str(bench.source_hint or "leaderboard"), bench.desc,
@@ -1265,8 +1278,9 @@ def _build_fallback_rankables() -> dict[str, _Rankable]:
             continue
         out[key] = _Rankable(key, label, "derived", unit, tags, how, "rich", label, ())
     for board, (label, unit, tags, aliases) in _ARENAS.items():
+        tool = "aa_agents" if board in loaders.AGENT_BOARDS else "aa_media"
         out.setdefault(board, _Rankable(board, label, "arena", unit, tags,
-                                        f"aa_media board={board}", "board", label,
+                                        f"{tool} board={board}", "board", label,
                                         aliases))
     return out
 
@@ -1561,35 +1575,88 @@ def _axis_missing_text(key: str, label: str) -> str:
             f"{label!r} is model-page data, not a leaderboard column: AA reports it in "
             "the per-model cost/time breakdown (the rich dataset merged over the "
             "leaderboard).\n— nothing to plot in the current source: load the model "
-            "page with aa_model <slug> sections=cost, set AA_API_KEY, or retry with "
-            "refresh=true"
+            "page with aa_model <slug> sections=cost, or retry with refresh=true"
         )
     return (f"{label!r} has no values in the current source — "
             "see aa_reference topic=sources")
 
 
+#: index keys AA publishes on a page of their own (see ``loaders.index_models``):
+#: the six Capability Indexes plus the Openness and Decision indexes.  Their page
+#: is authoritative for its own key and, for a capability index, is the only
+#: source of that index's sub-scores.
+_OWN_PAGE_KEYS = frozenset(loaders.CAPABILITY_INDEXES) | frozenset(loaders.INDEX_PAGES)
+#: the six Capability Indexes (the ones with sub-scores)
+_CAPABILITY_KEYS = frozenset(loaders.CAPABILITY_INDEXES)
+
+
+def _index_page_surface(key: str, refresh: bool = False) -> tuple[list[Model], str]:
+    """Models carrying ``key`` from AA's own page for that index, or ``([], "")``.
+
+    AA gives each Capability Index a keyless page (``/models/capabilities/<slug>``,
+    a curated ~26-model chart set that also carries the index's sub-scores) and the
+    Openness / Decision indexes a full per-model array on their eval page.  A key
+    with no such page returns ``([], "")``; an unreadable page is logged and
+    treated as absent so a ranking degrades instead of failing.
+    """
+    fn = getattr(loaders, "index_models", None)
+    if not callable(fn):
+        return [], ""
+    try:
+        models, source, published = fn(key, refresh=refresh)
+    except (AAFetchError, ValueError) as exc:
+        log.warning("index page for %s unavailable (%s); continuing without it", key, exc)
+        return [], ""
+    models = [m for m in models or [] if m.slug]
+    if not models:
+        return [], ""
+    _call_cache().setdefault("index_page", {})[key] = (source, len(models), published)
+    return models, source
+
+
+def _index_page_meta(key: str) -> tuple[str, int, int]:
+    """``(source, joined, published)`` recorded for ``key`` by this call's join."""
+    return _call_cache().get("index_page", {}).get(key, ("", 0, 0))
+
+
+def _capability_subs(model: Model, key: str) -> list[tuple[str, float]]:
+    """``[(sub_key, value)]`` for capability index ``key`` on ``model`` (may be empty).
+
+    Only the index's own page publishes sub-scores, so a model outside that page's
+    chart set has none — the caller says so instead of inventing them.
+    """
+    prefix = f"{key}."
+    return [(k, v) for k, v in sorted(model.indices.items())
+            if k.startswith(prefix) and isinstance(v, (int, float))
+            and not isinstance(v, bool)]
+
+
 def _score_surface(key: str, refresh: bool = False) -> tuple[list[Model], str]:
-    """Models carrying ``key`` from AA's eval chart set and homepage panel(s).
+    """Models carrying ``key`` from AA's own index page, eval chart set and panel(s).
 
     Returns ``(models, source)`` where ``source`` names the surfaces that
-    contributed (``"chart set"``, ``"homepage panel"``, or both joined with
-    ``" + "``), or ``""`` when AA publishes no per-model values for ``key``.
-    Every surface is unioned in one pass — the eval page's chart set and the
-    homepage panel(s) (which AA publishes per eval slug, sometimes twice) — so a
-    companion scalar carried by only one of them is still reachable. The chart
-    record wins where both carry a value (it is the richer record); panel-only
-    models are appended rather than dropped.
+    contributed (e.g. ``"/models/capabilities/legal"``, ``"chart set"``,
+    ``"homepage panel"``, joined with ``" + "``), or ``""`` when AA publishes no
+    per-model values for ``key``.  Every surface is unioned in one pass — the
+    index's own page, the eval page's chart set and the homepage panel(s) — so a
+    value carried by only one of them is still reachable.  The first surface that
+    carries a model keeps it, so the wider / more authoritative record wins.
     """
+    scored, source = _index_page_surface(key, refresh)
+    sources = [source] if source else []
     bench = catalog.BENCHMARKS.get(key)
     if bench is None or not bench.slug:
-        return [], ""
+        return scored, " + ".join(sources)
     try:
         chart = _load(f"eval_{bench.slug}", loaders.eval_models, bench.slug,
                       refresh=refresh)
     except (AAFetchError, ValueError):
         chart = []
-    scored = [m for m in chart if select.lookup(m, key) is not None]
-    sources = ["chart set"] if scored else []
+    chart_scored = [m for m in chart if select.lookup(m, key) is not None]
+    if chart_scored:
+        sources.append("chart set")
+        have = {m.slug for m in scored}
+        scored = scored + [m for m in chart_scored if m.slug not in have]
     panel = _home_rows(refresh).get(f"eval:{bench.slug}") or []
     panel_models: list[Model] = []
     for item in panel:
@@ -1625,25 +1692,39 @@ def _extra_score_meta(key: str) -> tuple[str, int]:
 def _join_extra_scores(
     models: Sequence[Model], key: str, refresh: bool = False
 ) -> tuple[list[Model], str]:
-    """Join AA's eval chart-set / homepage-panel values for ``key`` onto ``models``.
+    """Join AA's index-page / eval chart-set / homepage-panel values for ``key``.
 
     Returns ``(models, source)``; ``source`` is ``""`` when AA publishes no
     per-model surface for ``key`` (so the caller keeps its honest no-rank error).
-    The 700-row leaderboard record is the base and the chart/panel record is
-    merged under it (same slug), so leaderboard-only columns (cost, speed) survive
-    while the chart/panel score is added. Models AA publishes only on a panel /
-    chart set are appended, so a ranking is never silently truncated to the rows
-    the leaderboard happens to carry.
+    The merged 700-row record is the base and the extra record is merged under it
+    (same slug), so leaderboard-only columns (cost, speed, identity) survive while
+    the extra score is added.  For a key that has its **own page** (a capability
+    index, or the Openness / Decision index) that page is authoritative for its own
+    key — and for a capability index it also supplies the sub-scores, which no
+    other surface publishes.  Models AA publishes only on the extra surface are
+    appended, so a ranking is never silently truncated to the rows the leaderboard
+    happens to carry.
     """
     extra = _extra_score_models(key, refresh)
     if not extra:
         return list(models), ""
+    own_page = key in _OWN_PAGE_KEYS
     base = {m.slug: m for m in models}
     joined: dict[str, Model] = {}
     for m in extra:
         if not m.slug:
             continue
-        joined[m.slug] = normalize.merge(m, base[m.slug]) if m.slug in base else m
+        if m.slug not in base:
+            joined[m.slug] = m
+            continue
+        merged = normalize.merge(m, base[m.slug])
+        if own_page:
+            # AA's own page for this index wins its own key (and carries the
+            # sub-scores); every other field keeps the merged record's value.
+            for k, v in m.indices.items():
+                if v is not None:
+                    merged.indices[k] = v
+        joined[m.slug] = merged
     out = [joined.get(m.slug, m) for m in models]
     out += [joined[slug] for slug in joined if slug not in base]
     return out, (_extra_score_meta(key)[0] or "chart set")
@@ -1902,7 +1983,11 @@ def _leaderboard(
         except ValueError:
             continue
     for key in dict.fromkeys(wanted):
-        if any(select.lookup(m, key) is not None for m in all_models):
+        # A key AA publishes on its own index page is always joined: that page is
+        # authoritative for its own key and carries the capability sub-scores,
+        # which the leaderboard/rich rows never do.
+        if key not in _OWN_PAGE_KEYS and any(
+                select.lookup(m, key) is not None for m in all_models):
             continue
         joined, source = _join_extra_scores(all_models, key, refresh)
         if not source:
@@ -1938,7 +2023,13 @@ def _leaderboard(
                     min_context is not None, released_after))
 
     if not models:
-        return f"# no models match {where} — drop one filter"
+        out = f"# no models match {where} — drop one filter"
+        if sort_key in _CAPABILITY_KEYS:
+            # the coverage describes the dataset, so it survives a filter that
+            # matches nothing (the empty-result note alone would hide it)
+            out += "\n" + render.note([_capability_coverage_note(
+                sort_key, label, all_models, include_deprecated=include_deprecated)])
+        return out
 
     # A sort key the merged source cannot supply must explain itself, never
     # silently reorder (the rich overlay already covers capability/Elo fields).
@@ -2018,11 +2109,42 @@ def _leaderboard(
     matching = len(models)
     sort_scored = sum(1 for m in models if select.lookup(m, sort_key) is not None)
     if sort_source:
-        footnotes.append(
-            f"{label} comes from AA's eval chart set / homepage panel "
-            f"({sort_scored} scored), joined onto the leaderboard rows — not a "
-            "full leaderboard"
-        )
+        source, page_joined, page_published = _index_page_meta(sort_key)
+        if page_joined:
+            count = f"{page_joined} model" + ("" if page_joined == 1 else "s")
+            if page_published > page_joined:
+                count += f" of the {page_published} rows it publishes"
+            # the capability note below states the coverage for its own key; for
+            # every other surface the dataset count belongs here (never the
+            # filtered view's)
+            if sort_key not in _CAPABILITY_KEYS:
+                count += f", {_dataset_scored(all_models, sort_key)} scored in the dataset"
+            footnotes.append(
+                f"{label} comes from {sort_source} ({count}), joined onto the "
+                "leaderboard rows"
+            )
+        else:
+            footnotes.append(
+                f"{label} comes from {sort_source} "
+                f"({_dataset_scored(all_models, sort_key)} scored in the dataset), "
+                "joined onto the leaderboard rows"
+            )
+    if sort_key in _CAPABILITY_KEYS:
+        footnotes.append(_capability_coverage_note(
+            sort_key, label, all_models, include_deprecated=include_deprecated,
+            shown=shown))
+    if explicit:
+        # the coverage above is the dataset's; the filter's effect is a separate,
+        # clearly labelled count
+        match_note = _filter_match_note(
+            sort_scored,
+            _dataset_scored(
+                select.filter_models(all_models,
+                                     exclude_deprecated=not include_deprecated),
+                sort_key),
+            explicit)
+        if match_note:
+            footnotes.append(match_note)
     if mode == "value":
         count = (f"{len(shown)} of {matching} scored by value "
                  f"({tracked} tracked)")
@@ -2049,7 +2171,8 @@ def _leaderboard(
 # aa_model
 # --------------------------------------------------------------------------- #
 
-_INDEX_ORDER = ("intelligence", "coding", "agentic", "openness", "omniscience")
+_INDEX_ORDER = ("intelligence", "coding", "agentic", "openness", "omniscience",
+                "decisionIndex")
 _SECTIONS = ("identity", "indexes", "benchmarks", "pricing", "speed",
              "cost", "openness", "modalities")
 
@@ -2096,13 +2219,16 @@ def _model_indices(m: Model) -> str:
     if not rows:
         return "no index scores for this model"
     body = render.table(["Index", "Score"], rows)
-    if not _api_available():
-        missing = [label for key, label in (("coding", "Coding Index"),
-                                            ("agentic", "Agentic Index"))
-                   if select.lookup(m, key) is None]
-        if missing:
-            body += ("\n— " + ", ".join(missing)
-                     + " need AA_API_KEY (JSON API); unavailable on the scrape source")
+    missing = [label for key, label in (("coding", "Coding Index"),
+                                        ("agentic", "Agentic Index"))
+               if select.lookup(m, key) is None]
+    if missing:
+        body += (
+            "\n— " + ", ".join(missing) + ": AA publishes these composites only "
+            "through its paid data API, so no free page carries a per-model value. "
+            "The free constituents are rankable — aa_benchmarks query=coding "
+            "(SciCode, LiveCodeBench, FrontierCode, Terminal-Bench, τ²-Bench)"
+        )
     return body
 
 
@@ -2116,22 +2242,125 @@ _CAP_LABELS = {
 }
 
 
-def _model_capabilities(m: Model) -> str | None:
-    """The AA capability indexes (aa:api, plus whatever a model page carries)."""
+def _dataset_scored(models: Sequence[Model], key: str) -> int:
+    """How many models in a dataset carry ``key``.
+
+    Coverage is always measured over a whole dataset, never over a filtered view:
+    a filter must not be able to shrink the published coverage claim (an empty or
+    narrow filter would otherwise report "1 of 703 scored" as if that were the
+    index's coverage).
+    """
+    return sum(1 for m in models if select.lookup(m, key) is not None)
+
+
+def _capability_coverage_note(
+    key: str, label: str, dataset: Sequence[Model], *,
+    include_deprecated: bool, shown: Sequence[Model] | None = None,
+) -> str:
+    """The honest coverage line for one capability index.
+
+    States how many variants in the **dataset** carry a value (plus the active
+    count when deprecation filtering would hide some), then how many of the rows
+    actually shown have sub-scores on the index's own page.
+    """
+    page = loaders.CAPABILITY_INDEXES.get(key, "")
+    scored = _dataset_scored(dataset, key)
+    active = _dataset_scored(
+        select.filter_models(dataset, exclude_deprecated=not include_deprecated), key)
+    text = f"{label}: {scored} of {len(dataset)} tracked variants have a value"
+    if active != scored:
+        text += f" ({active} active)"
+    text += (f"; the index's own page (/models/capabilities/{page}) publishes "
+             "its sub-scores")
+    if shown is None:
+        return text
+    subs = sum(1 for m in shown if _capability_subs(m, key))
+    text += f" for {subs} of the {len(shown)} rows shown"
+    if not subs:
+        text += " (none of these is on that page's chart set)"
+    return text
+
+
+def _filter_match_note(scored: int, available: int, explicit: bool) -> str:
+    """The post-filter count, labelled as matches — never as coverage."""
+    if not explicit or scored >= available:
+        return ""
+    return f"{scored} of {available} scored models match your filters"
+
+
+def _capability_page_subs(key: str, slug: str,
+                          refresh: bool = False) -> list[tuple[str, float]]:
+    """``[(sub_key, value)]`` for ``slug`` from capability index ``key``'s own page.
+
+    The sub-scores are published on that page alone, so this is the only way to
+    read them.  An empty list means AA does not list this model in that index's
+    chart set (or the page could not be read — the reason is logged).
+    """
+    if not slug:
+        return []
+    fn = getattr(loaders, "capability_models", None)
+    if not callable(fn):
+        return []
+    try:
+        rows = fn(key, refresh=refresh)
+    except (AAFetchError, ValueError) as exc:
+        log.warning("capability page for %s unavailable (%s)", key, exc)
+        return []
+    for row in rows:
+        if row.slug == slug:
+            return _capability_subs(row, key)
+    return []
+
+
+def _model_capabilities(m: Model, refresh: bool = False) -> str | None:
+    """The six AA Capability Indexes for one model, plus their sub-scores.
+
+    Scores come from the merged record (the model page's chart set / the rich
+    dataset); the sub-scores come from each index's own page
+    (``/models/capabilities/<slug>``), which is the only surface that publishes
+    them.  An index the model has a score for but whose page does not list it has
+    no sub-scores, and the footer says so rather than leaving a silent gap.
+    """
     rows: list[list[str]] = []
-    for key in sorted(k for k in m.indices if k.startswith("capabilities.")):
+    sub_lines: list[str] = []
+    without: list[str] = []
+    for key in sorted(_CAPABILITY_KEYS):
         value = m.indices.get(key)
         if value is None:
             continue
         name = _CAP_LABELS.get(key.split(".", 1)[1], key.split(".", 1)[1])
-        rows.append([f"{name} (capability)", _fmt(key, value)])
+        rows.append([name, _fmt(key, value)])
+        subs = _capability_subs(m, key) or _capability_page_subs(key, m.slug, refresh)
+        if not subs:
+            without.append(name)
+            continue
+        sub_lines.append(f"{name}: {_sub_scores_text(subs)}")
     if not rows:
         return None
     body = render.table(["Capability index", "Score"], rows)
-    if not _api_available():
-        body += ("\n— capability scores from the model page (rich dataset); "
-                 "AA_API_KEY adds the Coding/Agentic indexes and cross-model ranking")
+    if sub_lines:
+        # a table cell is capped at 120 chars, which would truncate the six
+        # sub-scores of the widest index; one line per index keeps them complete
+        body += ("\n— sub-scores, from each index's own page "
+                 "(/models/capabilities/<slug>):\n  " + "\n  ".join(sub_lines))
+    if without:
+        body += ("\n— no sub-scores for " + ", ".join(without)
+                 + ": AA publishes them only on that index's own page, which does "
+                   "not list this model")
+    body += ("\n— the six capability indexes are rankable: "
+             "aa_leaderboard sort=capabilities.legal (any of the six)")
     return body
+
+
+def _sub_scores_text(subs: Sequence[tuple[str, float]]) -> str:
+    """One compact cell for a capability index's sub-scores (empty when none)."""
+    if not subs:
+        return "-"
+    return " · ".join(
+        f"{loaders.CAPABILITY_SUBLABELS.get(key.rsplit('.', 1)[-1], key.rsplit('.', 1)[-1])} "
+        f"{render.num(value, 1)}"
+        for key, value in subs
+    )
 
 
 def _model_chart_evals(slug: str, have: set[str],
@@ -2150,7 +2379,7 @@ def _model_chart_evals(slug: str, have: set[str],
         panel_slugs = set()
     out: dict[str, float] = {}
     for key, bench in catalog.BENCHMARKS.items():
-        if key in have or not bench.slug or bench.source_hint == "api":
+        if key in have or not bench.slug or bench.source_hint in ("api", "none"):
             continue
         if bench.source_hint != "chart" and bench.slug not in panel_slugs:
             continue
@@ -2386,7 +2615,7 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
         blocks.append(render.note(name_notes))
     if "indexes" in chosen:
         blocks.append("## Indices\n" + _model_indices(model))
-        caps = _model_capabilities(model)
+        caps = _model_capabilities(model, refresh)
         if caps:
             blocks.append("## Capability indexes\n" + caps)
     if "benchmarks" in chosen:
@@ -2592,9 +2821,11 @@ _COMPARE_SPEED_KEYS = {"tps", "ttft", "ttfa", "e2e", "time_per_task",
 
 
 def _compare_extra_candidate(key: str) -> bool:
-    """True when AA may publish ``key`` on an eval chart set / homepage panel."""
+    """True when AA may publish ``key`` on its own index page / chart set / panel."""
     bench = catalog.BENCHMARKS.get(key)
-    if bench is None or not bench.slug or bench.source_hint == "api":
+    if bench is None or bench.source_hint in ("api", "none"):
+        return False
+    if not bench.slug and key not in _OWN_PAGE_KEYS:
         return False
     rank = _rankable(key)
     return rank is not None and str(getattr(rank, "unit", "")) != "text"
@@ -3742,11 +3973,15 @@ def _rankable_coverage(r: Any, lb: Sequence[Model], merged: Sequence[Model]) -> 
         return f"rich dataset ({rich}/{len(merged)})"
     extra = _extra_score_models(key)
     if extra:
-        source = _extra_score_meta(key)[0] or "chart set"
+        source, joined, published = _index_page_meta(key)
+        if not source:
+            source = _extra_score_meta(key)[0] or "chart set"
+        if published and joined and published > joined:
+            return f"{source} ({joined} of {published} rows are tracked models)"
         return f"{source} ({len(extra)} scored)"
     surface = str(getattr(r, "surface", "") or "")
-    if surface == "api":
-        return "api only (AA_API_KEY)"
+    if surface in ("api", "none"):
+        return "not published free (AA's paid data API only)"
     if surface == "chart":
         return "chart set (no live values in current source)"
     if surface == "rich":
@@ -3887,7 +4122,7 @@ def _benchmark_leaderboard(
 
     lb_plain = _lb_rows(refresh)
     needs_rich = _rich_needed(refresh=refresh, benchmark_key=key)
-    if needs_rich:
+    if needs_rich or key in _OWN_PAGE_KEYS:
         lb, rich_used = _models_state(refresh, rich=True)
     else:
         lb, rich_used = list(lb_plain), False
@@ -3896,21 +4131,38 @@ def _benchmark_leaderboard(
     source_note: str
     lower_better = _lower_is_better(key)
 
+    # AA's own page for this index (a capability chart set, or the Openness /
+    # Decision index array) is authoritative for its own key and is the only
+    # source of a capability index's sub-scores; join it onto the merged rows.
+    index_source = ""
+    if key in _OWN_PAGE_KEYS:
+        joined, index_source = _join_extra_scores(lb, key, refresh)
+        if index_source:
+            lb = joined
+
     if _is_index_key(key):
-        # Capability / Coding / Agentic indexes have no leaderboard column; they
-        # come from the rich overlay, or there is no ranking to give.
+        # Capability / Coding / Agentic indexes have no leaderboard column: the
+        # merged source covers the six capability indexes far more widely than
+        # their own 26-row chart sets, and AA publishes Coding/Agentic nowhere free.
         pairs = scored(lb)
         if not pairs:
             raise ValueError(_no_rank_text(key, bench.label))
-        source_note = f"{bench.label} · rich dataset — not a full leaderboard"
+        origin = " + ".join(part for part in (index_source, "rich dataset") if part)
+        source_note = f"{bench.label} · {origin} — not a full leaderboard"
     else:
         pairs = scored(lb)
         if pairs:
             native = scored(lb_plain)
-            if rich_used and len(pairs) > len(native):
-                source_note = f"{bench.label} · rich dataset — not a full leaderboard"
+            if index_source and len(pairs) > len(native):
+                origin = " + ".join(part for part in (
+                    index_source, "rich dataset" if rich_used else "") if part)
+            elif rich_used and len(pairs) > len(native):
+                origin = "rich dataset"
             else:
-                source_note = f"{bench.label} · leaderboard"
+                origin = "leaderboard"
+            source_note = f"{bench.label} · {origin}"
+            if origin != "leaderboard":
+                source_note += " — not a full leaderboard"
         else:
             # AA's own chart set for the eval page
             pairs = []
@@ -4010,7 +4262,15 @@ def _benchmark_leaderboard(
                 cells.append(_fmt(col, select.lookup(m, col)))
         table_rows.append(cells)
 
-    count = f"{len(shown)} of {len(pairs)} scored ({len(lb)} tracked)"
+    # the coverage number describes the dataset; a filter only narrows the view
+    dataset_scored = _dataset_scored(lb, key)
+    filtered = bool(creator or open_weights is not None
+                    or min_intelligence is not None or not include_estimates)
+    if filtered:
+        count = (f"{len(shown)} shown of {len(pairs)} matching "
+                 f"({len(lb)} tracked)")
+    else:
+        count = f"{len(shown)} of {len(pairs)} scored ({len(lb)} tracked)"
     head = _header(count=count, note=source_note, name=cache_name, api=api,
                    source_label=_prov_label(rich_used))
     body = _table_block(head, [label for _, label in cols], table_rows, trim=not fields,
@@ -4020,6 +4280,13 @@ def _benchmark_leaderboard(
         notes.append(tie_note)
     if unknown:
         notes.append(_unknown_field_note(unknown))
+    if key in _CAPABILITY_KEYS:
+        notes.append(_capability_coverage_note(
+            key, bench.label, lb, include_deprecated=True,
+            shown=[m for m, _v in shown]))
+    match_note = _filter_match_note(len(pairs), dataset_scored, filtered)
+    if match_note:
+        notes.append(match_note)
     notes += _missing_notes(lb, [("intelligence", "intelligence",
                                   min_intelligence is not None)])
     if estimated:
@@ -4604,6 +4871,19 @@ def _agents(board: str = "coding_agents", top: int = 15, refresh: bool = False) 
     rows = _load(f"agents_{board_key}", loaders.agents,
                  board_key, refresh=refresh)
     shown = rows[:n]
+    # the coding board's ``indexScore`` *is* the Artificial Analysis Coding Agent
+    # Index (a 0-1 composite AA publishes on a 0-100 scale); the other boards'
+    # scores are their own indexes, shown as a percentage as before.
+    index_board = board_key == "coding_agents"
+    cols = [(key, "Coding Agent Index" if index_board and key == "score" else label)
+            for key, label in _AGENT_COLS]
+
+    def score_cell(row: dict) -> str:
+        value = row.get("score")
+        if index_board and isinstance(value, (int, float)):
+            return render.num(value * 100, 1)
+        return render.pct(value)
+
     table_rows = []
     for row in shown:
         table_rows.append([
@@ -4611,12 +4891,20 @@ def _agents(board: str = "coding_agents", top: int = 15, refresh: bool = False) 
             _no_ref(row.get("agent") or row.get("name")),
             _no_ref(row.get("model")),
             _no_ref(row.get("creator")),
-            render.pct(row.get("score")),
+            score_cell(row),
             _fmt("cost_per_task", row.get("cost_per_task")),
         ])
-    head = _header(count=f"{len(shown)} of {len(rows)} rows", note=board_key,
+    note = board_key if not index_board else (
+        "Artificial Analysis Coding Agent Index (DeepSWE v1.1 + Terminal-Bench 4.0 + "
+        "SWE-Atlas-QnA) · agents, not models")
+    head = _header(count=f"{len(shown)} of {len(rows)} rows", note=note,
                    name=f"agents_{board_key}", api=False)
-    return _table_block(head, [lbl for _, lbl in _AGENT_COLS], table_rows)
+    body = _table_block(head, [lbl for _, lbl in cols], table_rows)
+    if index_board:
+        body += ("\n— the Coding Agent Index ranks agent x model combinations (AA's "
+                 "harness plus the model it drives); for the model-level coding "
+                 "scores that ARE free, see aa_benchmarks query=coding")
+    return body
 
 
 # --------------------------------------------------------------------------- #
@@ -4923,7 +5211,7 @@ def _rankable_hint_coverage(r: Any, models: Sequence[Model]) -> str:
         return f"{native}/{len(models)} scored"
     surface = str(getattr(r, "surface", "") or "")
     return {"chart": "chart-set only", "rich": "rich/model-page data",
-            "api": "API-only (AA_API_KEY)"}.get(surface, "")
+            "none": "not published free (paid data API only)"}.get(surface, "")
 
 
 def _task_domain_hint(query: str) -> str:
@@ -5070,10 +5358,13 @@ def _reference(topic: str = "overview") -> str:
         raise ValueError(
             f"unknown topic {_q(topic)} — topics: {', '.join(reference.TOPICS)}, all"
         )
-    if name in ("indexes", "all") and not _api_available():
-        text += ("\n\n— note: coding/agentic/capability indexes need AA_API_KEY "
-                 "(JSON API); unavailable on the scrape source (a model page may "
-                 "still carry some capability scores).")
+    if name in ("indexes", "all"):
+        text += ("\n\n— note: AA publishes its Coding and Agentic indexes only through "
+                 "its paid data API, so no free page carries a per-model value for "
+                 "them; the six Capability Indexes (aa_leaderboard "
+                 "sort=capabilities.legal), the Openness Index and the Decision Index "
+                 "are free, and the Coding *Agent* Index is on aa_agents "
+                 "board=coding_agents.")
     return text
 
 

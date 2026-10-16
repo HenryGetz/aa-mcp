@@ -1,9 +1,11 @@
 """Metric + benchmark registry and the single source of truth for formatting.
 
-Everything here is plain Python data (no runtime dependency on the OpenAPI
-fixture). Field names come from AA's public API vocabulary (``openapi.yaml``,
-Pro ``Evaluations`` schema), the benchmarks reference in the skill metrics.md,
-and the keys actually present in the captured RSC payloads.
+Everything here is plain Python data (no runtime dependency on any fixture).
+Field names come from AA's published API vocabulary (its ``/api-reference``
+schema), the benchmarks reference in the skill metrics.md, and the keys actually
+present in the captured RSC payloads under ``tests/fixtures/``
+(``leaderboard.rsc``, ``model_page_chart.rsc``, ``home.rsc``,
+``capability_legal.rsc``, ``eval_index_openness.rsc``, ``eval_index_decision.rsc``).
 
 ``format_value`` is the only place user-visible numbers are rendered.
 """
@@ -54,7 +56,11 @@ class Benchmark:
     desc: str
     tags: tuple[str, ...]
     index_member: bool
-    source_hint: str = "leaderboard"  # "leaderboard" | "rich" | "api" | "chart"
+    #: best free surface for a cross-model value:
+    #: "leaderboard" (700-row array) | "rich" (~700-model model-page dataset) |
+    #: "chart" (eval-page chart set / homepage panel) | "board" (arena board) |
+    #: "none" (AA publishes it only through its paid data API — no public page).
+    source_hint: str = "leaderboard"
 
 
 # --------------------------------------------------------------------------- #
@@ -71,6 +77,10 @@ _B = [
      "AA Coding Index: composite weighted toward coding evaluations.", ("index", "coding"), False),
     ("agentic", "Agentic", None, "index",
      "AA Agentic Index: composite weighted toward agentic evaluations.", ("index", "agentic"), False),
+    ("decisionIndex", "AA Decision Index", None, "index",
+     "AA Decision Index: weighted average of AA-Omniscience-Decision, "
+     "HLE-MultiChoice, When2Call and WildGuardTest across decision models.",
+     ("index", "decision"), False),
     ("omniscience", "AA-Omniscience", "omniscience", "index",
      "AA-Omniscience Index: factual recall minus hallucination (roughly -70..+70).",
      ("knowledge", "hallucination", "intelligence-index"), True),
@@ -231,9 +241,13 @@ _B = [
 #: benchmark key -> best surface that yields a *cross-model* value.
 #: Everything not listed defaults to "leaderboard" (the 700-row array).
 _SOURCE_HINTS: dict[str, str] = {
-    # only the keyed JSON API carries these composites
-    "coding": "api",
-    "agentic": "api",
+    # AA publishes these two composites only through its paid data API: no public
+    # page carries a per-model value, so there is no free surface to hint at
+    # (see catalog.API_ONLY_INDEXES for the free constituents that ARE rankable).
+    "coding": "none",
+    "agentic": "none",
+    # AA's own eval page for the index carries its full per-model array
+    "decisionIndex": "chart",
     # present in the ~700 x 94 rich dataset (model pages), incl. derived fields
     "aime25": "rich",
     "automationBenchPartialScore": "rich",
@@ -289,6 +303,17 @@ BENCHMARKS: dict[str, Benchmark] = {
     key: Benchmark(key, label, slug, unit, desc, tuple(tags), member,
                    _SOURCE_HINTS.get(key, "leaderboard"))
     for key, label, slug, unit, desc, tags, member in _B
+}
+
+#: Composites AA publishes **only through its paid data API**: no public page
+#: carries a per-model value (verified against `sitemap.xml` and every scraped RSC
+#: payload — no `codingIndex`/`agenticIndex` key exists on any free page, and no
+#: `/…/coding-index` route is published).  Each maps to the free constituents that
+#: ARE rankable, best first, so a caller always gets a call that works.
+API_ONLY_INDEXES: dict[str, tuple[str, ...]] = {
+    "coding": ("scicode", "livecodebench", "frontierCode", "terminalBench40"),
+    "agentic": ("terminalBench40", "tau2", "tauBanking",
+                "automationBenchPartialScore"),
 }
 
 #: Lowercased benchmark names AA does not track, with the closest thing AA measures.
@@ -478,6 +503,8 @@ _M = [
     ("coding", "Coding", "index", "index", "AA Coding Index (0-100).", "high"),
     ("agentic", "Agentic", "index", "index", "AA Agentic Index (0-100).", "high"),
     ("openness", "Openness", "index", "index", "AA Openness Index (0-100).", "high"),
+    ("decisionIndex", "Decision", "index", "index",
+     "AA Decision Index: composite across decision models (0-100).", "high"),
     ("omniscience", "Omniscience", "index", "index",
      "AA-Omniscience Index (roughly -70..+70).", "high"),
     ("cost_per_task", "Cost", "usd", "pricing",
@@ -643,7 +670,8 @@ for _m in METRICS.values():
 for _alias, _key in _SHORTHANDS.items():
     FIELD_ALIASES[_alias] = _key
 
-# Field names as they appear in AA's public OpenAPI vocabulary (openapi.yaml).
+# Field names as they appear in AA's published API vocabulary (the schema its
+# /api-reference page documents); every one also has a live-payload spelling.
 _OPENAPI_ALIASES = {
     "artificial_analysis_intelligence_index": "intelligence",
     "artificial_analysis_intelligence_index_cost": "cost_per_task",
@@ -680,6 +708,28 @@ _OPENAPI_ALIASES = {
 for _alias, _key in _OPENAPI_ALIASES.items():
     if _key in METRICS or _key in BENCHMARKS:
         FIELD_ALIASES[_alias] = _key
+
+# Short spellings for the six Capability Indexes: the payload's own field name
+# (``capabilities.legal``), that name without the prefix (``legal``), AA's human
+# label ("Legal Index") and the label without the trailing "Index".
+_CAPABILITY_ALIASES = {
+    "capabilities.financeAndAccounting": ("financeAndAccounting", "Finance & Accounting",
+                                          "Finance and Accounting",
+                                          "Finance & Accounting Index"),
+    "capabilities.strategyAndOps": ("strategyAndOps", "Strategy & Ops",
+                                    "Strategy and Ops", "Strategy & Ops Index"),
+    "capabilities.legal": ("legal", "Legal", "Legal Index"),
+    "capabilities.healthcareAndMedical": ("healthcareAndMedical", "Healthcare & Medical",
+                                          "Healthcare and Medical",
+                                          "Healthcare & Medical Index"),
+    "capabilities.engineering": ("engineering", "Engineering", "Engineering Index"),
+    "capabilities.economics": ("economics", "Economics", "Economics Index"),
+    "decisionIndex": ("decisionIndex", "Decision Index", "AA Decision Index"),
+}
+for _key, _aliases in _CAPABILITY_ALIASES.items():
+    if _key in BENCHMARKS:
+        for _alias in _aliases:
+            _add_alias(_alias, _key)
 
 _ALIAS_NORM: dict[str, str] = {}
 for _alias, _key in FIELD_ALIASES.items():
@@ -799,7 +849,8 @@ class Rankable:
     unit: str
     tags: tuple[str, ...]
     how: str
-    surface: str               # "leaderboard" | "rich" | "chart" | "api" | "board"
+    #: "leaderboard" | "rich" | "chart" | "board" | "none" (paid API only)
+    surface: str
     desc: str
     aliases: tuple[str, ...] = ()
 
@@ -816,6 +867,13 @@ _LABEL_OVERRIDES = {
     "openness": "Artificial Analysis Openness Index",
     "omniscience": "AA-Omniscience Index",
     "cyberIndex": "Artificial Analysis Cyber Index",
+    "decisionIndex": "Artificial Analysis Decision Index",
+    "capabilities.financeAndAccounting": "Finance & Accounting Index",
+    "capabilities.strategyAndOps": "Strategy & Ops Index",
+    "capabilities.legal": "Legal Index",
+    "capabilities.healthcareAndMedical": "Healthcare & Medical Index",
+    "capabilities.engineering": "Engineering Index",
+    "capabilities.economics": "Economics Index",
 }
 
 #: extra spellings a user is likely to type (incl. version-suffixed names)
@@ -836,6 +894,16 @@ _EXTRA_ALIASES = {
     "terminalBenchScience": ("Terminal-Bench-Science 0.1", "Terminal-Bench Science 0.1"),
     "frontierCode": ("FrontierCode 1.1", "FrontierCode v1.1"),
     "aa3dElo": ("AA-3D", "AA 3D", "AA-3D Elo"),
+    "decisionIndex": ("Decision Index", "AA Decision Index"),
+    "capabilities.financeAndAccounting": ("Finance & Accounting", "Finance and Accounting",
+                                          "Finance & Accounting Index"),
+    "capabilities.strategyAndOps": ("Strategy & Ops", "Strategy and Ops",
+                                    "Strategy & Ops Index"),
+    "capabilities.legal": ("Legal", "Legal Index"),
+    "capabilities.healthcareAndMedical": ("Healthcare & Medical", "Healthcare and Medical",
+                                          "Healthcare & Medical Index"),
+    "capabilities.engineering": ("Engineering", "Engineering Index"),
+    "capabilities.economics": ("Economics", "Economics Index"),
 }
 
 
@@ -858,16 +926,22 @@ for _key, _b in BENCHMARKS.items():
     # ``aa_leaderboard sort=`` is the default ranking path for every key that has
     # per-model values on some surface it can reach (the 700-row leaderboard, the
     # rich overlay, or an eval chart set / homepage panel — joined by slug). Keys
-    # AA serves only through the JSON API, container/breakdown kinds, and the few
-    # chart keys with no eval-page slug stay on ``aa_benchmark_leaderboard``.
+    # AA serves only through its paid data API, container/breakdown kinds, and the
+    # few chart keys with no eval-page slug stay on ``aa_benchmark_leaderboard``.
     _lb_reachable = (
         _b.unit != "mixed"
-        and _b.source_hint != "api"
+        and _b.source_hint not in ("api", "none")
         and (_b.source_hint != "chart" or bool(_b.slug))
     )
-    _how = (f"aa_leaderboard sort={_key}"
-            if _lb_reachable
-            else f"aa_benchmark_leaderboard benchmark={_key}")
+    # A hint must always name a call that works: for a composite with no public
+    # values, point at the free constituents instead of an empty leaderboard.
+    _constituents = API_ONLY_INDEXES.get(_key)
+    if _constituents:
+        _how = f"aa_benchmark_leaderboard benchmark={_constituents[0]}"
+    elif _lb_reachable:
+        _how = f"aa_leaderboard sort={_key}"
+    else:
+        _how = f"aa_benchmark_leaderboard benchmark={_key}"
     RANKABLES[_key] = Rankable(
         key=_key, label=_label, kind=_kind,
         unit=_BENCH_UNIT.get(_b.unit, "text"),
@@ -979,6 +1053,31 @@ for _key, _label, _tags, _aliases in _ARENA:
         key=_key, label=_label, kind="arena", unit="Elo", tags=_dedupe(_tags),
         how=f"aa_media board={_key}", surface="board",
         desc=f"Human-preference Elo for the {_label.replace(' Arena Elo', '')} arena board.",
+        aliases=tuple(a for a in _dedupe((_key, *_aliases)) if a != _label),
+    )
+
+# agent boards (kind="arena"): ranked by ``aa_agents``, and their headline score is
+# an index rather than an Elo. The coding board's ``indexScore`` *is* the Artificial
+# Analysis Coding Agent Index — the one coding index AA publishes for free (it ranks
+# agent x model combinations, not the model variants ``aa_leaderboard`` ranks).
+# key, label, tags, extra aliases
+_AGENT_BOARDS = [
+    ("coding_agents", "Artificial Analysis Coding Agent Index",
+     ("agentic", "coding", "agents", "arena"),
+     ("Coding Agent Index", "Coding Agents Index", "AA Coding Agent Index",
+      "Coding Agents Board")),
+    ("chatbots", "Chatbot Arena Preference", ("arena", "agents"),
+     ("Chatbot Board", "Chatbots")),
+    ("search_api", "Search API Index", ("agents", "tool-use", "arena"),
+     ("Search API Board", "Search Index")),
+]
+
+for _key, _label, _tags, _aliases in _AGENT_BOARDS:
+    RANKABLES[_key] = Rankable(
+        key=_key, label=_label, kind="arena", unit="index", tags=_dedupe(_tags),
+        how=f"aa_agents board={_key}", surface="board",
+        desc=(f"{_label}: AA's agent-board composite (it ranks agent x model "
+              "combinations, not the model variants aa_leaderboard ranks)."),
         aliases=tuple(a for a in _dedupe((_key, *_aliases)) if a != _label),
     )
 

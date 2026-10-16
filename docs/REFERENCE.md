@@ -2,15 +2,12 @@
 
 Canonical text served by the `aa_reference` tool and the `aa://reference/*`
 resources. Source: artificialanalysis.ai (live, scraped) and its published
-methodology + public OpenAPI schema. Coverage counts measured 2026-10-14.
+methodology. Coverage counts measured 2026-10-15 and drift as AA adds or retires
+models.
 
 ## overview
 
-Live AI benchmark data from artificialanalysis.ai (AA). Two backends, same records:
-
-- `aa:rsc` (default, no key): the site's Next.js RSC flight payloads.
-- `aa:api` (requires `AA_API_KEY`): AA's JSON API `/api/v2/language/models/free`.
-  Adds the six Capability Indexes plus Coding/Agentic Indexes; 100 req/24 h free tier.
+Live AI benchmark data from artificialanalysis.ai (AA). One keyless source: the site's Next.js RSC flight payloads (no API key, no quota).
 
 Tool routing:
 
@@ -29,6 +26,8 @@ Tool routing:
 | image / video / TTS / music leaderboards | `aa_media` |
 | speech-to-text / realtime voice | `aa_media` (`speech_to_text`, `speech_to_text_streaming`, `speech_to_speech`) |
 | AA coding agents / chatbots / search API boards | `aa_agents` |
+| the six Capability Indexes (Finance & Accounting, Strategy & Ops, Legal, Healthcare & Medical, Engineering, Economics) — one model's score + sub-scores, or a cross-model ranking | `aa_model` (per model); `aa_benchmarks query=capabilities` prints the exact ranking call |
+| the AA Coding Agent Index (agent x harness rows, not models) | `aa_agents board=coding_agents` |
 | unsure of a model's exact name or slug (incl. media/speech) | `aa_search` (resolves language models and arena entries; when no model matches but the query names a benchmark/metric/board it answers with that thing's hint; always resolve names first) |
 | definitions, field names, provenance | `aa_reference` |
 | raw JSON for anything not covered | `aa_raw` (token-expensive, last resort) |
@@ -78,12 +77,12 @@ One metric never means two numbers, and a correction is never silent:
   `metrics=`/`fields=` renders what resolves plus one footnote for the rest.
 
 `aa_leaderboard sort=<key>` is the uniform ranking path: it ranks any key with
-per-model values on any surface it can reach — the 700-row leaderboard, the rich
+per-model values on any surface it can reach — the 703-row leaderboard, the rich
 overlay, or an eval chart set / homepage panel (joined by slug) — so a
 chart/panel-backed index (the AA Cyber Index, its refusal-rate and
 mitigation-status companions, the cyber boards, AA-3D, MMLU-Pro, …) ranks exactly
 like `intelligence`, with `mode=value`/`mode=frontier`/`fields=` too. The header
-states the real coverage (`n of m scored`, `700 tracked`) and the source, and the
+states the real coverage (`n of m scored`, `703 tracked`) and the source, and the
 footnote names the surface joined; a key AA has no cross-model values for returns
 an explanatory error, never a bare failure.
 
@@ -118,38 +117,58 @@ Scraped records (the majority of models):
 - **AA-Omniscience** — factual recall minus hallucination across economically
   relevant domains. Range roughly -70..+70 (can be negative). `AA-Omniscience
   Accuracy` and `Hallucination Rate` break it out.
-- **Openness Index** (model pages) — availability, transparency, licensing (0-100).
+- **Openness Index** — availability, transparency, licensing (0-100); a full
+  326-model array on `/evaluations/artificial-analysis-openness-index`.
+- **Decision Index** — AA's decision-quality composite (its own eval page).
+- **Cyber Index** — safety composite, with refusal-rate and mitigation-status
+  companions (eval page / homepage panel).
+- **Capability Indexes** (six, all free) — Finance & Accounting, Strategy & Ops,
+  Legal, Healthcare & Medical, Engineering, Economics. Each is a weighted composite
+  with published sub-scores drawn from `knowledge`, `reasoning`, `longContext`,
+  `agenticKnowledgeWork`, `agenticToolUse`, `agenticTerminalUse` and
+  `nonHallucination` (the exact set differs per index). Every model page carries the
+  six values under `capabilities.<name>`; each index also has a public cross-model
+  page at `/models/capabilities/<index>` (index = `finance-and-accounting`,
+  `strategy-and-ops`, `legal`, `healthcare-and-medical`, `engineering`, `economics`)
+  with `weightedIndex`/`headlineValue` for a curated subset — 26 models each, 20 for
+  Healthcare & Medical. Full coverage comes from the rich model-page array:
+  221/221/221/82/220/228 of the 703 variants. A member is null for a model missing
+  any constituent evaluation.
+- **AA Coding Agent Index** (agent-level, not model-level) — 41 agent x harness rows
+  on `/agents/coding-agents`, `indexScore` as a 0-1 fraction (x100 for display).
 - **AA-Briefcase Elo** — long-horizon knowledge-work benchmark, reported as Elo
   (95% CI via `fields=ci_lower,ci_upper,ci`; private set; not a full public leaderboard).
 
-API-only (require `AA_API_KEY`): **Coding Index**, **Agentic Index**, and the six
-Capability Indexes — Finance & Accounting, Strategy & Ops, Legal, Healthcare &
-Medical, Engineering, Economics. Members of a capability index are null for models
-missing any constituent evaluation.
+AA does not publish model-level **Coding Index** or **Agentic Index** values on any
+public page — no route, payload key or sitemap entry exists for them (they are
+exposed only through AA's paid data API), so this server does not provide them. The
+free substitutes are the constituent benchmarks: SciCode, Terminal-Bench 4.0,
+LiveCodeBench, FrontierCode, tau2-Bench / tau3-Banking and AutomationBench, which
+`aa_benchmark_leaderboard` ranks. Use those for a coding/agentic comparison.
 
 ## benchmarks
 
-Per-benchmark scores held by aa-mcp (label · unit · coverage in the 700 tracked
-variants on 2026-10-14 · what it tests):
+Per-benchmark scores held by aa-mcp (label · unit · coverage in the 703 tracked
+variants on 2026-10-15 · what it tests):
 
 Leaderboard-wide (full cross-model ranking available):
-- GPQA Diamond · % · 616 · 198 graduate-level science questions (PhD experts ~65%).
-- Humanity's Last Exam (HLE) · % · 662 · 2,500 expert-written frontier questions.
-- SciCode · % · 229 · 288 scientist-curated coding subproblems, 16 disciplines.
-- Terminal-Bench 2.1 · % · 241 · 89 agentic terminal tasks.
-- Terminal-Bench 4.0 · % · 218 · newer, harder agentic terminal suite.
+- GPQA Diamond · % · 617 · 198 graduate-level science questions (PhD experts ~65%).
+- Humanity's Last Exam (HLE) · % · 665 · 2,500 expert-written frontier questions.
+- SciCode · % · 232 · 288 scientist-curated coding subproblems, 16 disciplines.
+- Terminal-Bench 2.1 · % · 242 · 89 agentic terminal tasks.
+- Terminal-Bench 4.0 · % · 221 · newer, harder agentic terminal suite.
 - Terminal-Bench Hard · % · 432 · hardest subset of the terminal suite.
 - τ²-Bench · % · 440 · tool-use agent benchmark (telecom/retail).
 - τ³-Banking · % · 209 · fintech support: unstructured KB + multi-step tool calls.
-- AA-LCR · % · 573 · long-context reasoning over 10k-100k-token documents.
+- AA-LCR · % · 576 · long-context reasoning over 10k-100k-token documents.
 - IFBench · % · 450 · instruction following on 58 verifiable constraints.
-- CritPt · % · 577 · 71 composite research-level physics challenges.
-- MMMU-Pro · % · 287 · multimodal academic reasoning, 30 disciplines.
-- GDPval-AA (normalized) · % · 291 · real-world occupational tasks, 44 occupations.
-- AA-AnalystAgent · % · 47 · spreadsheet/document analysis tasks.
+- CritPt · % · 580 · 71 composite research-level physics challenges.
+- MMMU-Pro · % · 288 · multimodal academic reasoning, 30 disciplines.
+- GDPval-AA (normalized) · % · 295 · real-world occupational tasks, 44 occupations.
+- AA-AnalystAgent · % · 49 · spreadsheet/document analysis tasks.
 - APEX-Agents-AA · % · 33 · long-horizon cross-application agent tasks.
 - ITBench-AA (SRE) · % · 45 · Kubernetes incident root-cause analysis.
-- AA-Omniscience · index · 574 · see `indexes`.
+- AA-Omniscience · index · 577 · see `indexes`.
 
 Chart-set / homepage-panel (AA exposes these for a curated model list, typically
 5-32 models per eval page — a subset, not a full leaderboard; `aa_leaderboard
@@ -176,10 +195,10 @@ sort=<key>` joins them by slug and the header/footnote state the real coverage):
 
 Index membership (v4.3.2) is marked per benchmark in `aa_benchmarks`. The
 `Coverage` column is computed live from the source chain the ranking tools use
-(700-row leaderboard → rich overlay → eval chart set / homepage panel), so a
+(703-row leaderboard → rich overlay → eval chart set / homepage panel), so a
 benchmark AA fetches live is never labelled "not fetched" — and
 `aa_leaderboard sort=<key>` ranks that same chain, stating the real coverage
-(`n of m scored`, `700 tracked`) and the surface it joined.
+(`n of m scored`, `703 tracked`) and the surface it joined.
 
 A task word AA publishes no benchmark for is never a dead end. `aa_benchmarks
 query=<word>` and `aa_search` answer with the closest AA measures — "AA does not
@@ -195,7 +214,7 @@ discount` = cache-read discount vs full input price. Blended prices are AA's fix
 input:output:cached ratios (0:3:1, 7:2:1, …).
 
 `cost_per_task` = AA's measured cost to complete one average Intelligence Index task,
-cache-aware (186 of 700 variants have it; unscored/deprecated models do not).
+cache-aware (194 of 703 variants have it; unscored/deprecated models do not).
 Model pages add a full breakdown (input / cache-read / cache-write / reasoning /
 answer) plus per-evaluation weighted cost and output tokens per task.
 
@@ -210,7 +229,7 @@ Measured by AA on the provider in `performanceDataSource` (usually first-party A
   q25/q75 variance bands come with model pages: a model can be inconsistent even
   when its median looks good.
 
-AA publishes `tok/s`, `TTFT`, `TTFA` and `E2E` on **two** surfaces: the 700-row
+AA publishes `tok/s`, `TTFT`, `TTFA` and `E2E` on **two** surfaces: the 703-row
 leaderboard snapshot (`medianOutputTokensPerSecond`, `medianTimeToFirstTokenSeconds`,
 …) and the first-party model page (`timescaleData.medianOutputSpeed` /
 `medianTimeToFirstChunk`, `timeToFirstAnswerToken.total`, `endToEndResponseTime.total`).
@@ -229,8 +248,8 @@ slug — shown only when AA's payload discloses it, which is rare), $/1M
 input/output/cache-read, cache discount, cache-hit rate, cost per task,
 tok/s, TTFT, E2E, function-calling and JSON-mode support, and context window (the
 model-level value when the endpoint does not report one).
-The provider board holds 1,201 endpoints across ~453 models and 64 hosts (measured
-2026-10-14) with pricing, performance and feature flags, but without precision tags
+The provider board holds 1,199 endpoints across ~453 models and 64 hosts (measured
+2026-10-15) with pricing, performance and feature flags, but without precision tags
 or per-endpoint cost per task — use the per-model view for those. The table always
 shows the column it is sorted by (`sort=ttft` appends a TTFT column).
 Identity names always resolve in `fields=` (`model`/`name`, `slug`, `host`,
@@ -292,11 +311,13 @@ axes the models carry.
   `/leaderboards/providers`, `/evaluations/<slug>`, `/evaluations` (catalog),
   `/sitemap.xml` (the eval catalog is the union of the `/evaluations` cards and the
   sitemap `/evaluations/*` paths, so every published eval page is discoverable),
-  media/agent leaderboards, homepage (speech + security panels).
+  media/agent leaderboards, homepage (speech + security panels),
+  `/models/capabilities/<index>` (the six Capability Indexes), `/agents/coding-agents`
+  (the AA Coding Agent Index).
 - Surfaces, what each carries and how fresh it is (TTL, then default seconds):
-  - leaderboard (`aa_leaderboard`, `aa_pareto`) — 700 variants x
+  - leaderboard (`aa_leaderboard`, `aa_pareto`) — 703 variants x
     ~50 columns: index, prices, speed, per-benchmark scores [1 h, `AA_CACHE_TTL`].
-  - rich overlay (`aa_compare`, `aa_pareto`, `aa_model`) — 700 x ~94: capability
+  - rich overlay (`aa_compare`, `aa_pareto`, `aa_model`) — 703 x ~94: capability
     indexes, AA-Briefcase Elo, whole-suite cost and per-evaluation costs/times,
     and the first-party model-page speed/latency medians [6 h, `AA_RICH_TTL`]. It
     is a separate cache file, so it can be hours older than the leaderboard age
@@ -304,19 +325,20 @@ axes the models carry.
     it separately — `aa:rsc + rich dataset (overlay 12m ago, seed <slug>)`.
   - eval chart sets + homepage panels (`aa_benchmark_leaderboard`, speech and
     security panels) — the top ~20-30 models per evaluation [1 h].
-  - provider board (`aa_providers` board view) — 1,201 endpoints x 64 hosts [1 h].
+  - provider board (`aa_providers` board view) — 1,199 endpoints x 64 hosts [1 h].
   - model providers (`aa_providers model=<slug>`) — per-endpoint pricing,
     performance and feature flags [1 h].
   - media arenas (`aa_media`) — Elo and appearance counts per arena [1 h].
   - agents boards (`aa_agents`) — coding-agent, chatbot and search-API tables [1 h].
   - eval catalog (`aa_benchmarks` index) — `/evaluations` cards + sitemap paths [1 h].
+  - capability index pages (`/models/capabilities/<index>`) — the curated
+    26-row (20 for Healthcare & Medical) cross-model subset per index; the full
+    per-model values ride the rich overlay's `capabilities.<name>` [1 h].
 - Transport: `RSC: 1` request header returns the Next.js flight payload (JSON-ish,
   ~1.2 MB gzip-transfer for the leaderboard). AA redeploys often; never hardcode
   chunk or build-id URLs.
-- JSON API: https://artificialanalysis.ai/api/v2 (`x-api-key`), public schema at
-  `/api/v2/openapi`. Free tier covers `language/models/free` + free media endpoints.
 - Cache: `~/.cache/aa-mcp` (`AA_CACHE_DIR`), TTL `AA_CACHE_TTL` (default 3600 s),
-  API TTL `AA_API_TTL` (default 21600 s), rich overlay TTL `AA_RICH_TTL` (default
+  rich overlay TTL `AA_RICH_TTL` (default
   21600 s). `AA_OFFLINE=1` serves cache only.
 - Recovery: if the site answers with a Cloudflare challenge or the payload structure
   changed, the error states the cache path to overwrite — render the URL in a browser

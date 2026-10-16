@@ -41,8 +41,25 @@ def cases() -> list[tuple[str, dict]]:
         out.append(("aa_leaderboard", {"mode": mode, "top": 3}))
     for sort in ("intelligence", "cost_per_task", "tps", "ttft", "e2e", "context_tokens",
                  "price_in", "price_out", "params_b", "release_date", "omniscience",
-                 "briefcaseElo", "capabilities.legal", "gpqa", "terminalBench40"):
+                 "briefcaseElo", "gpqa", "terminalBench40"):
         out.append(("aa_leaderboard", {"sort": sort, "top": 2}))
+    # keyless capability indexes: all six canonical keys, plus a human-label alias
+    for sort in ("capabilities.legal", "capabilities.engineering", "capabilities.economics",
+                 "capabilities.financeAndAccounting", "capabilities.strategyAndOps",
+                 "capabilities.healthcareAndMedical", "Legal Index"):
+        out.append(("aa_leaderboard", {"sort": sort, "top": 2}))
+    out += [
+        ("aa_benchmark_leaderboard", {"benchmark": "capabilities.legal", "top": 2}),
+        ("aa_leaderboard", {"sort": "openness", "top": 2}),
+        ("aa_leaderboard", {"sort": "decisionIndex", "top": 2}),
+    ]
+    # paid-data-API-only composites: every call must explain the gap and point at
+    # the free constituents (see EXPECTED_FAILURES + CONTENT_CHECKS)
+    out += [
+        ("aa_leaderboard", {"sort": "coding"}),
+        ("aa_leaderboard", {"sort": "agentic"}),
+        ("aa_benchmark_leaderboard", {"benchmark": "agentic"}),
+    ]
     # Wave F: every chart/panel-backed key ranks through the default leaderboard
     for sort in ("cyberIndex", "cyberRefusalRate", "cyberMitigationStatus",
                  "cweBench", "deepsecBench", "cybergymE2e", "cweBenchRefusalRate",
@@ -303,10 +320,25 @@ def cases() -> list[tuple[str, dict]]:
 #: Anything not listed here is a real failure and fails the run.
 EXPECTED_FAILURES: dict[tuple[str, str], str] = {
     ("aa_benchmark_leaderboard", '{"benchmark": "coding", "top": 2}'):
-        "Coding Index is API-only (AA_API_KEY): no cross-model ranking on the "
-        "scrape source — aa_benchmark_leaderboard raises an explanatory error",
+        "AA publishes no model-level Coding Index on any public page (it exists "
+        "only behind AA's paid data API), so there is no cross-model ranking to "
+        "give — aa_benchmark_leaderboard raises an explanatory error pointing at "
+        "the constituent benchmarks (SciCode, Terminal-Bench 4.0, LiveCodeBench, "
+        "FrontierCode)",
     ("aa_benchmark_leaderboard", '{"benchmark": "agentic", "top": 2}'):
-        "Agentic Index is API-only (AA_API_KEY): same as coding",
+        "AA publishes no model-level Agentic Index on any public page; same "
+        "explanatory error as coding",
+    ("aa_benchmark_leaderboard", '{"benchmark": "agentic"}'):
+        "AA publishes no model-level Agentic Index on any public page (no top given); "
+        "same explanatory error as coding",
+    ("aa_leaderboard", '{"sort": "coding"}'):
+        "AA publishes no model-level Coding Index on any public page (paid data API "
+        "only) — the error names the free constituents to rank instead "
+        "(scicode, livecodebench, frontierCode, terminalBench40)",
+    ("aa_leaderboard", '{"sort": "agentic"}'):
+        "AA publishes no model-level Agentic Index on any public page (paid data API "
+        "only) — the error names the free constituents to rank instead "
+        "(terminalBench40, tau2, tauBanking, automationBenchPartialScore)",
     ("aa_benchmark_leaderboard", '{"benchmark": "hleDiamond", "top": 2}'):
         "HLE Diamond has no values in the 700-row leaderboard, the eval chart "
         "set or the homepage panels — '+' reported as 'no data for benchmark'",
@@ -350,6 +382,23 @@ EXPECTED_FAILURES: dict[tuple[str, str], str] = {
 }
 
 
+#: Reply-text contract for the paid-data-API-only composites.  Every such call must
+#: explain the gap in free terms and must never point at a key, an env var or the
+#: removed JSON API.  ``(must_contain_all, must_not_contain_any)``, case-insensitive;
+#: a violation is reported like an unexpected failure.
+_CONTENT_CHECKS: dict[tuple[str, str], tuple[tuple[str, ...], tuple[str, ...]]] = {
+    key: (("paid data api", "constituent"),
+          ("aa_api_key", "api key", "json api", "env"))
+    for key in (
+        ("aa_leaderboard", '{"sort": "coding"}'),
+        ("aa_leaderboard", '{"sort": "agentic"}'),
+        ("aa_benchmark_leaderboard", '{"benchmark": "coding", "top": 2}'),
+        ("aa_benchmark_leaderboard", '{"benchmark": "agentic", "top": 2}'),
+        ("aa_benchmark_leaderboard", '{"benchmark": "agentic"}'),
+    )
+}
+
+
 def _case_key(r: dict) -> tuple[str, str]:
     args = {k: v for k, v in r["args"].items() if v not in ("", None)}
     return (r["tool"], json.dumps(args, sort_keys=True))
@@ -357,6 +406,24 @@ def _case_key(r: dict) -> tuple[str, str]:
 
 def _result_text(result) -> str:
     return "\n".join(getattr(b, "text", "") or "" for b in (result.content or []))
+
+
+def _content_violations(results: list[dict]) -> list[str]:
+    """Cases whose reply text breaks the paid-only content contract."""
+    by_key = {_case_key(r): r for r in results}
+    out: list[str] = []
+    for key, (need, forbid) in _CONTENT_CHECKS.items():
+        label = f"{key[0]} {key[1]}"
+        r = by_key.get(key)
+        if r is None:
+            out.append(f"{label}: case did not run")
+            continue
+        low = r["text"].lower()
+        missing = [s for s in need if s not in low]
+        present = [s for s in forbid if s in low]
+        if missing or present:
+            out.append(f"{label}: missing={missing} forbidden={present}")
+    return out
 
 
 async def run(extra_env: dict[str, str]) -> list[dict]:
@@ -407,6 +474,7 @@ def main() -> int:
     failures = [r for r in results if r["error"]]
     expected = [r for r in failures if _case_key(r) in EXPECTED_FAILURES]
     unexpected = [r for r in failures if _case_key(r) not in EXPECTED_FAILURES]
+    violations = _content_violations(results)
     slow = sorted([r for r in results if r["ms"] >= a.slow_ms], key=lambda r: -r["ms"])
 
     if a.json:
@@ -414,6 +482,7 @@ def main() -> int:
                           {"results": results, "calls": len(results),
                            "failures": len(failures),
                            "unexpected_failures": len(unexpected),
+                           "content_violations": violations,
                            "expected_failures": [
                                {"tool": r["tool"], "args": r["args"],
                                 "why": EXPECTED_FAILURES[_case_key(r)]}
@@ -431,12 +500,14 @@ def main() -> int:
                   f"     why: {EXPECTED_FAILURES[_case_key(r)]}")
         for r in unexpected:
             print(f"FAIL {r['tool']} {json.dumps(r['args'])[:90]}\n     {r['text'][:220]}")
+        for v in violations:
+            print(f"CONTENT CONTRACT VIOLATION {v}")
         for r in slow:
             print(f"SLOW {r['ms']}ms {r['tool']} {json.dumps(r['args'])[:70]}")
-        if not unexpected:
+        if not unexpected and not violations:
             print("UNEXPECTED FAILURES: 0 — the run is clean"
                   + (f" ({len(expected)} documented expectation(s) above)" if expected else ""))
-    return 1 if unexpected else 0
+    return 1 if unexpected or violations else 0
 
 
 if __name__ == "__main__":

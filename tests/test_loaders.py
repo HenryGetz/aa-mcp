@@ -19,19 +19,16 @@ from typing import ClassVar
 
 import pytest
 
-from aa_mcp import catalog, fetch, flight, loaders, source
+from aa_mcp import catalog, fetch, flight, loaders
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
 @pytest.fixture(autouse=True)
 def _force_rsc_source(monkeypatch: pytest.MonkeyPatch):
-    """These fixtures exercise the RSC path; keep the dual source inert."""
-    monkeypatch.delenv("AA_API_KEY", raising=False)
-    monkeypatch.delenv("AA_SOURCE", raising=False)
+    """These fixtures exercise the RSC path; pin the base URL and offline mode."""
     monkeypatch.delenv("AA_BASE_URL", raising=False)
     monkeypatch.delenv("AA_OFFLINE", raising=False)
-    monkeypatch.setattr(source, "_probe_cache", None)
     # The parsed-payload memos are process-global; the fake fetch hands every
     # payload the same (path, mtime) key, so each test must start from empty.
     loaders._clear_memos()
@@ -430,6 +427,118 @@ def test_unknown_board_raises() -> None:
         loaders.agents("nope")
 
 
+# --------------------------------------------------------------------------- #
+# capability indexes + standalone index pages
+# --------------------------------------------------------------------------- #
+
+
+def test_capability_page_rows() -> None:
+    """The index's own page: score == headlineValue, plus that index's sub-scores."""
+    rows = loaders.parse_capability_index(_text("capability_legal.rsc"))
+    assert len(rows) == 26
+    top = rows[0]
+    assert top["slug"] == "claude-opus-5-5"
+    assert top["score"] == pytest.approx(63.2602763791642)
+    assert top["headline"] == top["score"]
+    assert top["name"] and top["short_name"]
+    # the sub-score key set is the index's own (never a fixed six)
+    assert set(top["sub_scores"]) == {
+        "knowledge", "reasoning", "longContext", "agenticKnowledgeWork",
+        "agenticToolUse", "nonHallucination"}
+    assert top["sub_scores"]["knowledge"] == pytest.approx(64.2)
+    # every row carries a score; the payload's own chart order is preserved
+    assert all(r["score"] is not None and r["slug"] for r in rows)
+    assert {r["slug"] for r in rows} >= {"claude-opus-5-5", "gemini-4-argon"}
+
+
+def test_capability_models_carry_score_and_subscores() -> None:
+    models = loaders.capability_models("capabilities.legal")
+    assert len(models) == 26
+    m = next(x for x in models if x.slug == "claude-opus-5-5")
+    assert m.indices["capabilities.legal"] == pytest.approx(63.2602763791642)
+    # sub-scores are namespaced under the index key so nothing collides
+    assert m.indices["capabilities.legal.knowledge"] == pytest.approx(64.2)
+    assert m.source == "capability"
+    # no other index is invented for the model
+    assert [k for k in m.indices if k.startswith("capabilities.")
+            and not k.startswith("capabilities.legal")] == []
+
+
+def test_capability_models_rejects_a_non_capability_key() -> None:
+    with pytest.raises(ValueError):
+        loaders.capability_models("coding")
+
+
+def test_index_rows_pick_the_full_array_over_the_chart_set() -> None:
+    """The Openness page ships a chart set *and* its full array; take the full one."""
+    rows = loaders.parse_index_rows(_text("eval_index_openness.rsc"), "opennessIndex")
+    assert len(rows) == 4
+    assert next(r["name"] for r in rows) == "MiMo-V2.6-Pro"
+    # the full array carries no slug — the caller joins those by name
+    assert all(r["slug"] == "" for r in rows)
+    assert rows[0]["score"] == pytest.approx(52.77777777777778)
+
+
+def test_decision_index_rows_keep_their_namespaced_slugs() -> None:
+    rows = loaders.parse_index_rows(_text("eval_index_decision.rsc"), "indexScore")
+    assert len(rows) == 4
+    # a contestant slug is AA's own id, not a model slug (hence the name join)
+    assert rows[0]["slug"] == "anthropic_claude-haiku-5-5"
+    assert rows[0]["name"] == "Claude Haiku 5.5 (Max)"
+    assert rows[0]["score"] == pytest.approx(68.36475873224768)
+
+
+def test_index_models_joins_a_capability_page_by_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fetch(monkeypatch, {"capability_legal": "capability_legal.rsc"})
+    models, source, published = loaders.index_models("capabilities.legal")
+    assert source == "/models/capabilities/legal"
+    assert (len(models), published) == (26, 26)
+    assert "claude-opus-5-5" in {m.slug for m in models}
+
+
+def test_index_models_joins_a_nameless_array_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fetch(monkeypatch, {
+        "eval_artificial-analysis-openness-index": "eval_index_openness.rsc",
+        "eval_artificial-analysis-decision-index": "eval_index_decision.rsc",
+    })
+    models, source, published = loaders.index_models("openness")
+    assert source == "/evaluations/artificial-analysis-openness-index"
+    assert (len(models), published) == (4, 4)
+    assert all(m.indices["openness"] is not None for m in models)
+
+    # the decision page's slugs are not model slugs, so the name join carries it
+    models, source, published = loaders.index_models("decisionIndex")
+    assert source == "/evaluations/artificial-analysis-decision-index"
+    assert (len(models), published) == (4, 4)
+    assert all(m.indices["decisionIndex"] is not None for m in models)
+
+
+def test_index_models_is_empty_for_a_key_without_its_own_page() -> None:
+    assert loaders.index_models("coding") == ([], "", 0)
+    assert loaders.index_models("scicode") == ([], "", 0)
+
+
+def test_index_pages_cover_exactly_the_six_capability_indexes() -> None:
+    assert set(loaders.CAPABILITY_INDEXES) == {
+        "capabilities.financeAndAccounting", "capabilities.strategyAndOps",
+        "capabilities.legal", "capabilities.healthcareAndMedical",
+        "capabilities.engineering", "capabilities.economics"}
+    assert loaders.INDEX_PAGES == {
+        "openness": "artificial-analysis-openness-index",
+        "decisionIndex": "artificial-analysis-decision-index"}
+    assert set(loaders.CAPABILITY_INDEXES.values()) == {
+        "finance-and-accounting", "strategy-and-ops", "legal",
+        "healthcare-and-medical", "engineering", "economics"}
+    # every sub-score key AA publishes has a label
+    for key in ("knowledge", "reasoning", "longContext", "agenticKnowledgeWork",
+                "agenticToolUse", "agenticTerminalUse", "nonHallucination"):
+        assert loaders.CAPABILITY_SUBLABELS[key]
+
+
 def test_leaderboard_memo_is_keyed_by_fetch_time(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_fetch(monkeypatch)
     first = loaders.leaderboard()
@@ -594,84 +703,6 @@ def test_provider_endpoints_flat_cost_per_task() -> None:
     assert anthropic.cost_per_task == pytest.approx(5.982012019521066)
     google = next(e for e in endpoints if e.host == "Google")
     assert google.cost_per_task == pytest.approx(11.62770976536921)
-
-
-# --------------------------------------------------------------------------- #
-# API licensing claims + optional RSC enrichment
-# --------------------------------------------------------------------------- #
-
-_CLAUDE_SLUG = "claude-opus-5-5"
-
-
-def _api_envelope(items: list[dict]) -> dict:
-    return {
-        "tier": "free",
-        "intelligence_index_version": 4.1,
-        "pagination": {"page": 1, "page_size": 200, "total_pages": 1, "has_more": False},
-        "data": items,
-    }
-
-
-def _api_item(slug: str) -> dict:
-    item = json.loads(json.dumps(json.loads((FIXTURES / "api_models_free.json").read_text())["data"][0]))
-    item["slug"] = slug
-    item["name"] = "Claude Opus 5.5"
-    item["model_creator"] = {"id": "f0aa413f", "name": "Anthropic"}
-    return item
-
-
-def _faked_fetch(text: str, fetched_at: float = 42.0):
-    def fake_get(url, name, *, refresh=False, rsc=True, ttl=None, min_bytes=0, headers=None):
-        return fetch.Fetched(text=text, path=Path("/fake") / name, fetched_at=fetched_at, cached=True, stale=False)
-    return fake_get
-
-
-def _api_source(monkeypatch: pytest.MonkeyPatch) -> None:
-    from aa_mcp import api
-
-    monkeypatch.setenv("AA_API_KEY", "test")
-    monkeypatch.setattr(source, "_probe_cache", None)
-    envelope = _api_envelope([_api_item(_CLAUDE_SLUG)])
-    monkeypatch.setattr(api, "fetch_models_free", lambda refresh=False: api.parse_models_free(envelope))
-
-
-def test_api_leaderboard_licensing_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
-    _api_source(monkeypatch)
-    models = loaders.leaderboard()
-    assert len(models) == 1
-    assert models[0].is_open_weights is None  # unknown, not a false "proprietary"
-    assert models[0].license is None
-    assert models[0].indices["capabilities.engineering"] == 11.7
-    assert models[0].source == "api"
-
-
-def test_api_leaderboard_with_licensing_enriches_from_rsc(monkeypatch: pytest.MonkeyPatch) -> None:
-    _api_source(monkeypatch)
-    monkeypatch.setattr(loaders, "_LEADERBOARD_MEMO", None)
-    monkeypatch.setattr(loaders.fetch, "get", _faked_fetch(_text("leaderboard.rsc")))
-
-    models = loaders.leaderboard(with_licensing=True)
-    model = models[0]
-    assert model.is_open_weights is False  # claude-opus-5-5 from the RSC fixture
-    assert model.creator_slug == "anthropic"
-    assert model.release_date == "2026-09-22"
-    # API-provided indices survive; RSC's leaderboard indices are not injected.
-    assert model.indices["capabilities.engineering"] == 11.7
-    assert "omniscience" not in model.indices
-    assert model.source == "api"
-
-
-def test_api_leaderboard_with_licensing_survives_rsc_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    _api_source(monkeypatch)
-
-    def boom(url, name, **kwargs):
-        raise fetch.AAFetchError("rsc down")
-
-    monkeypatch.setattr(loaders.fetch, "get", boom)
-    models = loaders.leaderboard(with_licensing=True)
-    assert len(models) == 1
-    assert models[0].is_open_weights is None
-    assert models[0].indices["capabilities.engineering"] == 11.7
 
 
 # --------------------------------------------------------------------------- #

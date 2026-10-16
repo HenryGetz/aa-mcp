@@ -340,19 +340,19 @@ def test_headers_defaults_and_overrides(env, monkeypatch):
 
     def fake_urlopen(req, timeout=None):
         captured["headers"] = {k.lower(): v for k, v in req.header_items()}
-        return _FakeResp(b"api-body")
+        return _FakeResp(b"custom-body")
 
     monkeypatch.setattr(fetch.urllib.request, "urlopen", fake_urlopen)
 
     f = fetch.get(
-        "https://artificialanalysis.ai/api/v2/language/models",
-        "api_models",
+        "https://artificialanalysis.ai/leaderboards/models",
+        "custom_page",
         rsc=False,
-        headers={"x-api-key": "SECRET", "User-Agent": "custom/1.0"},
+        headers={"X-Custom-Token": "SECRET", "User-Agent": "custom/1.0"},
     )
-    assert f.text == "api-body"
+    assert f.text == "custom-body"
     h = captured["headers"]
-    assert h["x-api-key"] == "SECRET"
+    assert h["x-custom-token"] == "SECRET"
     assert h["user-agent"] == "custom/1.0"          # user wins over default UA
     assert "gzip" in h["accept-encoding"]
     assert "rsc" not in h                           # rsc=False -> no RSC header

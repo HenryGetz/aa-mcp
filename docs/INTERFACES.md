@@ -1,22 +1,19 @@
 # aa-mcp interfaces (frozen contract)
 
-## Dual-source architecture (JSON API primary, RSC fallback)
+## Single keyless source (RSC flight payloads)
 
-Two interchangeable data backends; the same canonical `Model` records come out of both.
+One data source: `GET <page>` with the `RSC: 1` header returns the Next.js App
+Router flight payload (JSON-ish text), which the loaders parse into the canonical
+`Model` records. No API key, no backend selection, no quota, no fallback logic.
 
-| | `api` backend | `rsc` backend (default) |
-|---|---|---|
-| transport | `GET https://artificialanalysis.ai/api/v2/language/models/free` (`x-api-key`) | `GET <page>` with `RSC: 1` |
-| selection | `AA_SOURCE=api`, or `AA_SOURCE=auto` (default) **when `AA_API_KEY` is set** | `AA_SOURCE=rsc`, or `auto` with no key, or automatically after the API returns 401/403 |
-| payload | compact snake_case JSON (`tier`/`pagination`/`data`) | 1.19 MB flight text to parse |
-| coverage | indices incl. **6 Capability Indexes + Coding + Agentic** (not in the scrape), cache pricing, medians, cost/task | ~50 metrics incl. 17 per-benchmark fields; no capability/coding/agentic indices |
-| quota | 100 req/24 h free tier -> cache with `AA_API_TTL` (default 6 h) | none |
-| surfaces | language models only (media/agents/providers stay RSC) | every surface |
+Every tool header reports `aa:rsc`: `render.header` renders `aa:{source}` and
+`server._source_key()` is the constant `"rsc"`. Nothing in the server reads
+`AA_API_KEY` / `AA_SOURCE` / `AA_API_TTL`; if those are set in the environment the
+server logs one warning and ignores them.
 
-Contract: `source.active_source()`, `source.source_label()` (`aa:api` / `aa:rsc`) —
-tool headers must show which backend answered. A bad/expired key must never break a
-call: downgrade to RSC for the process and log once to stderr. Implementation lives in
-`src/aa_mcp/api.py` + `src/aa_mcp/source.py`.
+Anything that once needed a key is either available on a public page (the six
+Capability Indexes — see `docs/REFERENCE.md` topic `indexes`) or not published at
+all (the model-level Coding Index and Agentic Index).
 
 ## ADDENDUM (verified 2026-10-14): SDK is `mcp` 2.x — NOT FastMCP
 
@@ -98,10 +95,10 @@ plain HTML works too but is ~2x bigger and needs `self.__next_f.push` joining.
 
 | name | URL (add `RSC: 1`) | decoded | shape |
 |---|---|---|---|
-| leaderboard | `/leaderboards/models` | 1.19 MB | JSON array under `"models":[` (**2nd** occurrence) — 700 model variants x 50 metrics |
+| leaderboard | `/leaderboards/models` | 1.19 MB | JSON array under `"models":[` (**2nd** occurrence) — 703 model variants x 50 metrics |
 | model page | `/models/<slug>` | 0.75-3.2 MB | `"initialModels":[` array (27-32 records x 94 metrics, focused model included, `chartHighlighted:true`) **or**, on legacy/deprecated pages, `"currentModel":{...}` (~80 keys, array may be empty) |
 | model providers | `/models/<slug>/providers` | 380 KB | `"hostModels":[{...}]` — per-endpoint pricing/performance, `intelligenceIndexCostPerTask`, `jsonMode`, `functionCalling`; precision from `slug` suffix |
-| providers board | `/leaderboards/providers` | 2.7 MB | `"rows":[{...}]` 1201 endpoint rows: host + model (incl. `intelligenceIndex` + per-benchmark scores) + pricing (`cacheHitPrice`/`cacheWritePrice`, **no** `cacheHitDiscountPercent`) + performance + `features` (`contextWindowTokens`, `functionCalling`, `jsonMode`, `openaiCompatible`). No precision tag and no `intelligenceIndexCostPerTask` here — those exist only on `hostModels` |
+| providers board | `/leaderboards/providers` | 2.7 MB | `"rows":[{...}]` 1199 endpoint rows: host + model (incl. `intelligenceIndex` + per-benchmark scores) + pricing (`cacheHitPrice`/`cacheWritePrice`, **no** `cacheHitDiscountPercent`) + performance + `features` (`contextWindowTokens`, `functionCalling`, `jsonMode`, `openaiCompatible`). No precision tag and no `intelligenceIndexCostPerTask` here — those exist only on `hostModels` |
 | homepage | `/` | 1.11 MB | `"sttNonStreaming":{"models":[..]}`, `"sttStreaming":{...}`, `"sts":{...}`; plus `{"evalSlug":..,"models":[{score,costPerTask,..}]}` panels (top 20 per eval: cyber-index, cwe-bench-aa, deepsecbench-aa, cybergym-e2e-aa) |
 | media arena | `/image/leaderboard/text-to-image`, `/image/leaderboard/editing`, `/video/leaderboard/text-to-video`, `/video/leaderboard/image-to-video`, `/video/leaderboard/video-editing`, `/text-to-speech/leaderboard/provider-voice`, `/text-to-speech/leaderboard/controlled-voice`, `/music/leaderboard/instrumental`, `/music/leaderboard/vocals` | 1.0-2.0 MB | arrays of `{"formatted":{..},"values":{name,elo,ciLower,ciUpper,appearances,rank,creator:{name},releaseDate,pricePer1kImages|pricePerMinute|pricePer1mCharacters|voiceCount,openWeightsUrl,url}}` — several arrays per page (per-category variants). Selection is **validated** (`loaders._media_arena`): the array must carry the board's expected keys (`name`+`elo`+its price key) and sit in the page's arena slot — the flight main slot (`32:[[null,[…]]]`) or an object-field slot (`"initialData":[`); per-category subsets (`["<label>",[…]]`) never qualify, and the first slot in document order wins. No match ⇒ a clear error instead of a different arena |
 | speech | `/speech-to-speech/arena/overview` | - | fall back to homepage boards |
@@ -109,7 +106,7 @@ plain HTML works too but is ~2x bigger and needs `self.__next_f.push` joining.
 | eval page | `/evaluations/<slug>` | 0.35-0.93 MB | `"initialModels":[` array of chart-selected model records (same 94-key shape as model pages); size varies by eval: gpqa 19, livecodebench 5, aa-briefcase / intelligence-index / terminalbench-4-0 32 — i.e. AA's chart selection, **not** a full leaderboard |
 | eval catalog | `/evaluations` (plain HTML, no RSC header) | 0.38 MB | server-rendered `<a href="/evaluations/<slug>">` cards with `<h2>/<h3>` title, description text, `<span>` tags (33 cards) |
 | sitemap | `/sitemap.xml` | 6 MB | model/eval surface list; use only for diagnostics, not on the hot path |
-| openapi | `/api/v2/openapi` (plain, public) | 206 KB | API field vocabulary (JSON only; no key => cannot be used at runtime) |
+| capability index | `/models/capabilities/<index>` (`index` = `finance-and-accounting`, `strategy-and-ops`, `legal`, `healthcare-and-medical`, `engineering`, `economics`) | 0.39-0.41 MB | `"initialModels":[` array — 26 records (20 for Healthcare & Medical) with `weightedIndex`/`headlineValue` + `subScores`; the full per-model values (`capabilities.<name>`, 221/221/221/82/220/228 of 703) ride the model-page/rich overlay |
 
 Cache path convention: `~/.cache/aa-mcp/<name>.rsc` (env `AA_CACHE_DIR`).
 Default TTL 3600 s (env `AA_CACHE_TTL`).
@@ -117,7 +114,7 @@ Default TTL 3600 s (env `AA_CACHE_TTL`).
 ### Known traps
 
 - The leaderboard payload contains **two** `"models":[` arrays: `#1` is a 3-key nav
-  list (700 items `{name,releaseSlug,slug}`); the metrics array is the one whose
+  list (703 items `{name,releaseSlug,slug}`); the metrics array is the one whose
   items contain `intelligenceIndex`. Select by required keys, never by index.
 - `intelligenceIndexCostPerTask` is a **float** on leaderboard records but a
   **dict** `{"cost": {...}, "evaluations": [...]}` on model-page/chart records.
@@ -195,7 +192,7 @@ def text_strip_tags(text: str) -> str
 parse the whole 3 MB file repeatedly at O(n^2): a single left-to-right scan with
 `json.JSONDecoder.raw_decode` per `[` candidate, short-circuiting on the first
 match, is what ships. Anchors may be `[{` **or** `["` — model pages embed
-`"initialModels":["<flight ref>", …]` and the 700-item pool those refs index
+`"initialModels":["<flight ref>", …]` and the 703-item pool those refs index
 leads with a string, so the probe item is the first *dict* element (probe bounded
 to a 32 KB slice / 32 elements) and the array is decoded in full only once the
 probe carries every required key (audit H4). Measured: full-file scan of the
@@ -233,7 +230,7 @@ def field_names() -> list[str]             # alias list for --fields help
 ```
 
 `BENCHMARKS` coverage summary (verified from live data): 17 per-benchmark fields
-exist in the 700-row leaderboard array (gpqa, hle, scicode, terminalBench21,
+exist in the 703-row leaderboard array (gpqa, hle, scicode, terminalBench21,
 terminalBench40, terminalbenchHard, tau2, tauBanking, lcr, ifbench, critpt,
 mmmuPro, gdpvalNormalized, analystAgent, apexAgents, itbenchSre,
 omniscience*); ~30 more exist only on model pages / eval-page chart records
@@ -320,12 +317,12 @@ def ago(ts: float) -> str                      # "12m ago"
 ```
 
 Header style (keep it ONE short line, no param echo):
-`# 42 of 700 models · Intel/Cost frontier · data 3m ago · aa:rsc`
+`# 42 of 703 models · Intel/Cost frontier · data 3m ago · aa:rsc`
 
 ### loaders.py
 
 ```python
-def leaderboard(refresh=False) -> list[Model]              # 700 variants (from_leaderboard)
+def leaderboard(refresh=False) -> list[Model]              # 703 variants (from_leaderboard)
 def model(slug: str, refresh=False) -> dict[str, Model]     # slug -> Model (chart set incl. target; legacy fallback)
 def provider_endpoints(slug, refresh=False) -> list[Endpoint]
 def provider_board(refresh=False) -> list[Endpoint]
@@ -463,7 +460,7 @@ Boundary rules (server.py: `_tool` wrapper):
 `tests/fixtures/`: `leaderboard.rsc`, `model_page_chart.rsc`,
 `model_page_legacy.rsc`, `providers_model.rsc`, `providers_board.rsc`, `home.rsc`,
 `media_t2i.rsc`, `media_t2v.rsc`, `media_tts.rsc`, `eval_page.rsc`,
-`eval_index.html`, `agents_coding.rsc`, `openapi.yaml`, `eval_catalog.json`.
+`eval_index.html`, `agents_coding.rsc`, `eval_catalog.json`.
 These are real 2026-10-14 captures; treat them as ground truth for parsing tests.
 `/tmp/probe/*.rsc` additionally holds `eval_gpqa_param.rsc`,
 `ev_*.rsc` (intelligence-index, aa-briefcase, terminalbench-4-0, livecodebench

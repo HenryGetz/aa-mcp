@@ -31,13 +31,13 @@ import re
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from . import catalog, fetch, flight, normalize, select, source
+from . import catalog, fetch, flight, normalize, select
 from .fetch import AAFetchError
 from .normalize import Model
 
@@ -46,23 +46,30 @@ log = logging.getLogger("aa_mcp.loaders")
 __all__ = [
     "AGENT_BOARDS",
     "BASE_URL",
+    "CAPABILITY_INDEXES",
+    "CAPABILITY_SUBLABELS",
+    "INDEX_PAGES",
     "MEDIA_BOARDS",
     "SOURCE_URLS",
     "Endpoint",
     "agents",
-    "data_source",
+    "capability_models",
+    "capability_rows",
     "eval_catalog",
     "eval_label",
     "eval_models",
     "home_boards",
+    "index_models",
     "leaderboard",
     "media",
     "model",
     "open_weights_flag",
     "parse_agents",
+    "parse_capability_index",
     "parse_chart",
     "parse_eval_catalog",
     "parse_home_boards",
+    "parse_index_rows",
     "parse_leaderboard",
     "parse_legacy_model",
     "parse_media",
@@ -106,7 +113,38 @@ SOURCE_URLS: dict[str, str] = {
     "home": "/",
     "eval": "/evaluations/{slug}",
     "eval_catalog": "/evaluations",
+    "capability": "/models/capabilities/{slug}",
     "sitemap": "/sitemap.xml",
+}
+
+#: AA capability-index key -> its page slug under ``/models/capabilities/``.
+#: These six pages are the only free source of a capability index's own
+#: ``subScores``; the index score itself also rides in the rich model-page dataset.
+CAPABILITY_INDEXES: dict[str, str] = {
+    "capabilities.financeAndAccounting": "finance-and-accounting",
+    "capabilities.strategyAndOps": "strategy-and-ops",
+    "capabilities.legal": "legal",
+    "capabilities.healthcareAndMedical": "healthcare-and-medical",
+    "capabilities.engineering": "engineering",
+    "capabilities.economics": "economics",
+}
+
+#: AA index key -> eval-page slug for the two indexes whose *own page* carries a
+#: full per-model array (every other index key is a leaderboard/rich column).
+INDEX_PAGES: dict[str, str] = {
+    "openness": "artificial-analysis-openness-index",
+    "decisionIndex": "artificial-analysis-decision-index",
+}
+
+#: sub-score key -> display label (AA's own vocabulary across the six pages).
+CAPABILITY_SUBLABELS: dict[str, str] = {
+    "knowledge": "Knowledge",
+    "reasoning": "Reasoning",
+    "longContext": "Long context",
+    "agenticKnowledgeWork": "Agentic knowledge work",
+    "agenticToolUse": "Agentic tool use",
+    "agenticTerminalUse": "Agentic terminal use",
+    "nonHallucination": "Non-hallucination",
 }
 
 #: media board key -> absolute path on artificialanalysis.ai
@@ -779,11 +817,6 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
     return []
 
 
-def data_source() -> str:
-    """Provenance label (``"aa:api"`` / ``"aa:rsc"``) for tool headers."""
-    return source.source_label()
-
-
 def _leaderboard_rsc(refresh: bool = False) -> list[Model]:
     """The 700-row RSC leaderboard (memoized on the cache file's fetch time)."""
     global _LEADERBOARD_MEMO
@@ -804,99 +837,19 @@ def _leaderboard_rsc(refresh: bool = False) -> list[Model]:
     return models
 
 
-def _enrich_licensing(api_model: Model, rsc_model: Model) -> Model:
-    """Merge RSC identity/licensing/estimated fields onto an API record.
-
-    The RSC contribution is stripped of its dict/cost fields first, so it can
-    only supply identity/licensing/estimated scalars; the API's indices,
-    pricing and speed are preserved (``source`` stays ``"api"``).
-    """
-    patch = replace(
-        rsc_model,
-        slug=api_model.slug,
-        name=api_model.name,
-        short_name=api_model.short_name,
-        source="api",
-        indices={},
-        evals={},
-        pricing={},
-        speed={},
-        cost_per_task=None,
-        cost_breakdown=None,
-        per_eval_cost=None,
-        per_eval=None,
-    )
-    return normalize.merge(api_model, patch)
-
-
-def leaderboard(refresh: bool = False, *, with_licensing: bool = False) -> list[Model]:
-    """All model variants — from the JSON API when keyed, else the RSC scrape.
-
-    On the API source the free shape carries no licensing data, so
-    ``with_licensing=True`` lazily enriches each record from the RSC leaderboard
-    (identity/licensing/estimated only).  If that fetch fails the API records are
-    returned unchanged (``is_open_weights`` stays ``None`` → "unknown").
-    """
-    if source.active_source(refresh=refresh) == "api":
-        from . import api
-
-        models = api.fetch_models_free(refresh=refresh)
-        if not with_licensing:
-            return models
-        try:
-            rsc = _leaderboard_rsc(refresh=refresh)
-        except (AAFetchError, LookupError) as exc:
-            log.warning(
-                "RSC licensing enrichment unavailable (%s); returning API records "
-                "with unknown licensing",
-                exc,
-            )
-            return models
-        by_slug = {model.slug: model for model in rsc}
-        return [
-            _enrich_licensing(model, by_slug[model.slug])
-            if model.slug in by_slug
-            else model
-            for model in models
-        ]
+def leaderboard(refresh: bool = False) -> list[Model]:
+    """All model variants from the RSC scrape (the only source)."""
     return _leaderboard_rsc(refresh=refresh)
 
 
 def model(slug: str, refresh: bool = False) -> dict[str, Model]:
     """Chart set embedded in ``/models/<slug>`` as ``{slug: Model}``.
 
-    On the API source the target record comes from the JSON API and is merged
-    with the RSC chart set (which adds per-eval fields); if that RSC fetch or
-    merge path fails we return the API record alone.  Otherwise the page's
-    ``initialModels`` chart set is used, falling back to the legacy
+    The page's ``initialModels`` chart set is used, falling back to the legacy
     ``currentModel`` object, and the requested slug is always a key.
     """
     path = SOURCE_URLS["model"].format(slug=slug)
     name = f"model_{slug}"
-
-    if source.active_source(refresh=refresh) == "api":
-        from . import api
-
-        api_model: Model | None = None
-        try:
-            api_model = next(
-                (m for m in api.fetch_models_free(refresh=refresh) if m.slug == slug),
-                None,
-            )
-        except AAFetchError:
-            api_model = None
-        if api_model is not None:
-            chart: list[Model] = []
-            try:
-                chart = parse_chart(fetch.get(url(path), name, refresh=refresh).text)
-            except (AAFetchError, LookupError):
-                chart = []
-            out = {record.slug: record for record in chart}
-            if slug in out:
-                out[slug] = normalize.merge(api_model, out[slug])
-            else:
-                out[slug] = api_model
-            return out
 
     got = fetch.get(url(path), name, refresh=refresh)
     key = (str(got.path), got.fetched_at)
@@ -1861,6 +1814,221 @@ def eval_catalog(refresh: bool = False) -> list[dict]:
     rows = union_eval_catalog(cards, paths)
     _EVAL_CATALOG_MEMO.put(key, rows)
     return rows
+
+
+# --------------------------------------------------------------------------- #
+# capability indexes and standalone index pages
+# --------------------------------------------------------------------------- #
+#
+# Every one of AA's six Capability Indexes has its own keyless page,
+# ``/models/capabilities/<slug>``: a curated chart set (26 models, 20 for
+# healthcare) carrying the index score (``weightedIndex``, equal to
+# ``headlineValue``) plus that index's own ``subScores``.  The sub-score key set
+# differs per index and **no other surface publishes it** — the rich ~700-model
+# model-page array carries the six scores but no sub-scores.
+#
+# Two further AA indexes publish a full per-model array on their own eval page and
+# nowhere else: the Openness Index (326 model rows) and the Decision Index (28
+# contestants).  Both shapes are read here so one loader family serves every
+# "AA index page" the ranking tools can reach.
+
+#: first-item keys identifying a capability page's row array
+_CAPABILITY_REQUIRED = ("slug", "weightedIndex")
+#: an index array is either a curated chart set or the page's full model list
+_INDEX_MIN_ROWS = 2
+
+_CAPABILITY_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
+_INDEX_PAGE_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
+
+
+def parse_capability_index(text: str) -> list[dict]:
+    """Rows of one ``/models/capabilities/<slug>`` page.
+
+    Each row is ``{"slug", "name", "short_name", "score", "headline",
+    "sub_scores"}``: ``score`` is AA's ``weightedIndex`` (0-100, identical to
+    ``headlineValue``) and ``sub_scores`` holds exactly the keys that index's page
+    publishes (never a fixed set — the six indexes differ).
+    """
+    arrays = [a for a in flight.find_arrays(text, _CAPABILITY_REQUIRED)
+              if len(a) >= _INDEX_MIN_ROWS]
+    if not arrays:
+        raise LookupError(
+            "no capability rows found (expected an array whose first item carries "
+            "'slug' and 'weightedIndex')"
+        )
+    rows: list[dict] = []
+    for rec in max(arrays, key=len):
+        slug = rec.get("slug")
+        score = _num(rec.get("weightedIndex"))
+        if not slug or score is None:
+            continue
+        subs = rec.get("subScores")
+        rows.append({
+            "slug": str(slug),
+            "name": str(rec.get("name") or slug),
+            "short_name": str(rec.get("shortName") or rec.get("name") or slug),
+            "score": score,
+            "headline": _num(rec.get("headlineValue")),
+            "sub_scores": ({str(k): _num(v) for k, v in subs.items()
+                            if _num(v) is not None}
+                           if isinstance(subs, dict) else {}),
+        })
+    return rows
+
+
+def parse_index_rows(text: str, score_key: str) -> list[dict]:
+    """Rows of a standalone AA index page: ``{"slug", "name", "score"}``.
+
+    Takes the **longest** array carrying ``score_key``, so a page that ships both
+    a curated chart set and its full model list (the Openness Index page carries
+    25 chart rows and 326 model rows) yields the full one.  ``slug`` is empty on
+    the Openness rows; the caller joins those by display name.
+    """
+    arrays = [a for a in flight.find_arrays(text, (score_key,))
+              if len(a) >= _INDEX_MIN_ROWS]
+    if not arrays:
+        raise LookupError(f"no {score_key!r} array found in the payload")
+    rows: list[dict] = []
+    for rec in max(arrays, key=len):
+        score = _num(rec.get(score_key))
+        if score is None:
+            continue
+        name = str(rec.get("name") or "")
+        slug = str(rec.get("slug") or "")
+        if not (slug or name):
+            continue
+        rows.append({"slug": slug, "name": name, "score": score})
+    return rows
+
+
+def capability_rows(slug: str, refresh: bool = False) -> list[dict]:
+    """Parsed rows of one ``/models/capabilities/<slug>`` page (memoised)."""
+    path = SOURCE_URLS["capability"].format(slug=slug)
+    source_url = url(path)
+    got = fetch.get(source_url, f"capability_{slug}", refresh=refresh)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _CAPABILITY_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
+    try:
+        rows = parse_capability_index(got.text)
+    except LookupError as exc:
+        raise _parse_error(exc, got.path, source_url) from exc
+    if not rows:
+        raise ValueError(
+            f"{source_url}: no capability rows carry a score — "
+            f"{_refresh_note(got.path, source_url)}"
+        )
+    _CAPABILITY_MEMO.put(key, rows)
+    return rows
+
+
+def capability_models(key: str, refresh: bool = False) -> list[Model]:
+    """The rows of capability index ``key`` as :class:`Model` objects.
+
+    The index score lands on ``indices[key]`` and the index's own sub-scores on
+    ``indices["<key>.<sub>"]``.  Only the index's own page publishes the
+    sub-scores, so a model outside its chart set has none.
+    """
+    slug = CAPABILITY_INDEXES.get(key)
+    if slug is None:
+        raise ValueError(
+            f"{key!r} is not an AA capability index — known: "
+            f"{', '.join(sorted(CAPABILITY_INDEXES))}"
+        )
+    field = key.split(".", 1)[1]
+    out: list[Model] = []
+    for row in capability_rows(slug, refresh):
+        model = normalize.from_chart({
+            "slug": row["slug"],
+            "name": row["name"],
+            "shortName": row["short_name"],
+            "capabilities": {field: row["score"]},
+        })
+        # the capability page is its own surface; label it as such
+        model.source = "capability"
+        for sub, value in row["sub_scores"].items():
+            model.indices[f"{key}.{sub}"] = value
+        out.append(model)
+    return out
+
+
+def _norm_name(text: str) -> str:
+    """Case/whitespace-insensitive display name, for name-joined index arrays."""
+    return " ".join(str(text).split()).lower()
+
+
+def _tracked_index(refresh: bool = False) -> tuple[dict[str, str], set[str]]:
+    """``(display-name -> slug, all slugs)`` for every tracked model."""
+    by_name: dict[str, str] = {}
+    slugs: set[str] = set()
+    for model in leaderboard(refresh):
+        if not model.slug:
+            continue
+        slugs.add(model.slug)
+        for name in (model.name, model.short_name):
+            key = _norm_name(name) if name else ""
+            if key:
+                by_name.setdefault(key, model.slug)
+    return by_name, slugs
+
+
+def index_models(key: str, refresh: bool = False) -> tuple[list[Model], str, int]:
+    """Models carrying AA index ``key``, read from that index's own page.
+
+    Returns ``(models, source, published)``: ``source`` is the site-relative page
+    the values came from and ``published`` is how many rows that page carries.
+    ``([], "", 0)`` means AA publishes no dedicated page for ``key``.
+
+    Rows are joined to the tracked models by AA slug when the page carries one
+    (the capability pages do) and by display name otherwise — the Openness Index
+    array has no slug, and the Decision Index's slugs are its own namespaced
+    contestant ids (``anthropic_claude-haiku-5-5``), not AA model slugs.  Rows
+    that match no tracked model are dropped, so ``published`` can exceed the
+    number of models returned.
+    """
+    if key in CAPABILITY_INDEXES:
+        slug = CAPABILITY_INDEXES[key]
+        path = SOURCE_URLS["capability"].format(slug=slug)
+        rows = capability_rows(slug, refresh)
+        return capability_models(key, refresh), path, len(rows)
+    slug = INDEX_PAGES.get(key)
+    if slug is None:
+        return [], "", 0
+    path = SOURCE_URLS["eval"].format(slug=slug)
+    source_url = url(path)
+    # same cache entry as loaders.eval_models, so the page is never fetched twice
+    got = fetch.get(source_url, f"eval_{slug}", refresh=refresh)
+    memo_key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _INDEX_PAGE_MEMO.get(memo_key)
+        if memo is not _MISS:
+            return memo
+    score_key = "opennessIndex" if key == "openness" else "indexScore"
+    try:
+        rows = parse_index_rows(got.text, score_key)
+    except LookupError as exc:
+        raise _parse_error(exc, got.path, source_url) from exc
+    by_name, slugs = _tracked_index(refresh)
+    models: list[Model] = []
+    seen: set[str] = set()
+    for row in rows:
+        slug_of = row["slug"] if row["slug"] in slugs else by_name.get(_norm_name(row["name"]), "")
+        if not slug_of or slug_of in seen:
+            continue
+        seen.add(slug_of)
+        record: dict[str, Any] = {"slug": slug_of, "name": row["name"]}
+        if key == "openness":
+            record["openness"] = {"opennessIndex": row["score"]}
+        model = normalize.from_chart(record)
+        model.source = f"{key}_index"
+        if key != "openness":
+            model.indices[key] = row["score"]
+        models.append(model)
+    result = (models, path, len(rows))
+    _INDEX_PAGE_MEMO.put(memo_key, result)
+    return result
 
 
 # --------------------------------------------------------------------------- #

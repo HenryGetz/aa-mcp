@@ -6,17 +6,16 @@ MCP server for [artificialanalysis.ai](https://artificialanalysis.ai) — live A
 benchmarks, pricing, speed, context/parameter specs, provider endpoints and the
 image/video/speech/music arenas — shaped for agents that pay per token.
 
-No API key needed. Two interchangeable data backends, same records out:
+No API key needed. One keyless data source: the site's Next.js RSC flight payloads,
+scraped and cached locally — no quota, no backend selection, no fallback logic.
+Every response header shows `aa:rsc`.
 
-| | `aa:rsc` (default) | `aa:api` (optional) |
-|---|---|---|
-| source | the site's Next.js RSC payloads | `GET /api/v2/language/models/free` |
-| needs | nothing | `AA_API_KEY` (free tier is enough) |
-| adds | ~50 metrics per model incl. 17 cross-model benchmarks, pricing, speed, per-model cost-per-task breakdown, provider endpoints, media boards | six Capability Indexes + Coding/Agentic indexes (not in the scrape) |
-| quota | none | 100 req/24 h → cached 6 h by default |
-
-If a key is present the API is tried first and the server falls back to scraping on
-401/403 rather than failing. Every response header shows which backend answered.
+| | `aa:rsc` |
+|---|---|
+| source | the site's Next.js RSC flight payloads |
+| needs | nothing |
+| carries | ~50 metrics per model incl. 17 cross-model benchmarks, pricing, speed, per-model cost-per-task breakdown, provider endpoints, media boards, the six Capability Indexes |
+| quota | none |
 
 ## Install
 
@@ -125,49 +124,70 @@ board ~160, the `aa_benchmarks` search index ~235, `aa_reference topic=overview`
 Example — `aa_leaderboard {"mode":"value","top":5}` (verbatim):
 
 ```text
-# 5 of 109 scored by value (700 tracked) · value = Intel per $/task, active only · stale: 23m ago · aa:rsc
+# 5 of 113 scored by value (703 tracked) · value = Intel per $/task, active only · 58m ago · aa:rsc
 | Model | Slug | Creator | Intel | $/Task | tok/s | TTFT | Ctx | Intel/$ |
 |---|---|---|---|---|---|---|---|---|
-| GPT-6 Luna (Low) | gpt-6-luna-low | OpenAI | 21.5 | $0.0045 | 121.9 | 2.6s | 1.0M | 4766.0 |
+| GPT-6 Luna (Low) | gpt-6-luna-low | OpenAI | 21.5 | $0.0045 | 120.4 | 2.2s | 1.0M | 4766.0 |
 | GPT-6 Luna (Medium) | gpt-6-luna-medium | OpenAI | 29.9 | $0.02 | - | - | 1.0M | 1712.3 |
 | GPT-6 Luna (Non-reasoning) | gpt-6-luna-non-reasoning | OpenAI | 18.5 | $0.01 | 112.3 | 0.9s | 1.0M | 1627.8 |
-| Granite 4.2 3B | granite-4-2-3b | IBM | 9.1 | $0.0060 | 215.4 | 0.5s | 131k | 1513.0 |
-| Claude Haiku 5.5 (Low) | claude-haiku-5-5-low | Anthropic | 29.5 | $0.02 | 170.0 | 9.2s | 1.0M | 1204.1 |
-— 514 rows skipped: no measured cost per task (AA has cost per task for 186/700 variants)
+| Granite 4.2 3B | granite-4-2-3b | IBM | 9.1 | $0.0060 | 220.3 | 0.5s | 131k | 1512.5 |
+| Claude Haiku 5.5 (Low) | claude-haiku-5-5-low | Anthropic | 29.5 | $0.02 | 182.9 | 6.3s | 1.0M | 1204.1 |
+— 509 rows skipped: no measured cost per task (AA has cost per task for 194/703 variants)
 ```
 
 ## Coverage and limits
 
-Covered: 700 model variants × ~50 leaderboard metrics **merged with** a 700 × 94
+Covered: 703 model variants × ~50 leaderboard metrics **merged with** a 703 × 94
 dataset (capability indexes, AA-Briefcase/GDPval Elo, AIME, LiveCodeBench, GDP.pdf,
 AutomationBench, Harvey LAB, MLCR, cost breakdowns, per-eval costs, licenses, effort
-labels); per-model digests with prompt-type speed breakdowns; 1,201 provider endpoints
+labels); per-model digests with prompt-type speed breakdowns; 1,199 provider endpoints
 across 64 hosts with prices, quantization, latency and feature flags; 9 media arenas
 plus speech-to-text / streaming / realtime voice; AA's coding-agent, chatbot and
-search-API boards; a 95-entry rankable index (67 cross-model benchmarks plus
-indexes, derived cost/speed metrics and arenas) with descriptions, units, live
+search-API boards; a 105-entry rankable index (57 cross-model benchmarks plus
+indexes, derived metrics and arenas) with descriptions, units, live
 coverage and the exact tool call for each.
+
+Counts were measured live on 2026-10-15 and drift as AA adds or retires models.
 
 Deliberately out of scope (and the server says so instead of guessing):
 
 - Benchmarks AA does not track (MathVista, DocVQA, BFCL) — no data exists.
 - Cross-model *signature* leaderboards for benchmarks AA only exposes as a chart
   subset: the tool labels these `not a full leaderboard` and reports real coverage.
-- Coding/Agentic indexes need the JSON API (`AA_API_KEY`).
+- Model-level **Coding Index** and **Agentic Index**: AA publishes these only through
+  its paid data API (no public page, route or payload key exists), so the server does
+  not provide them — use the constituent benchmarks (SciCode, Terminal-Bench 4.0,
+  LiveCodeBench, FrontierCode, τ²-Bench/τ³-Banking, AutomationBench).
 - Performance-over-time history and raw per-provider measurements are Commercial-tier
   API features; not implemented.
 - Image/video/music *model detail* pages (per-family specs beyond arena rows) and
   hardware/inference-stack pages are not exposed.
 
+## Indexes
+
+Free, keyless and scraped like everything else:
+
+| index | what it is | where it comes from |
+|---|---|---|
+| Intelligence Index v4.3.2 | composite of 10 evaluations | leaderboard (703 variants) |
+| AA-Omniscience | factual recall minus hallucination | leaderboard |
+| **six Capability Indexes** — Finance & Accounting, Strategy & Ops, Legal, Healthcare & Medical, Engineering, Economics | weighted composites with published sub-scores (`knowledge`, `reasoning`, `longContext`, `agenticKnowledgeWork`, `agenticToolUse`, `agenticTerminalUse`, `nonHallucination` — the set differs per index) | model pages (`capabilities.<name>`; full coverage 221/221/221/82/220/228 of the 703 variants) plus a curated 26-row (20 for Healthcare & Medical) cross-model page per index |
+| Openness Index | availability, transparency, licensing (0-100) | 326-model array on the openness eval page |
+| Decision Index / Cyber Index | decision quality / safety composite | eval pages, homepage panels |
+| AA Coding Agent Index | coding-agent composite (agent × harness, **not** models) | the coding-agents board, 41 rows |
+
+Not available: the **model-level Coding Index and Agentic Index**. AA publishes them
+only through its paid data API — no public page, route, chunk string or payload key
+exists — so this server does not provide them. The free substitutes are the
+constituent benchmarks (SciCode, Terminal-Bench 4.0, LiveCodeBench, FrontierCode,
+τ²-Bench/τ³-Banking, AutomationBench), which `aa_benchmark_leaderboard` ranks.
+
 ## Environment
 
 | variable | default | meaning |
 |---|---|---|
-| `AA_API_KEY` | unset | AA JSON API key; enables the `aa:api` backend |
-| `AA_SOURCE` | `auto` | `auto` \| `api` \| `rsc` — backend selection |
 | `AA_CACHE_DIR` | `~/.cache/aa-mcp` | payload cache |
 | `AA_CACHE_TTL` | `3600` | scrape cache TTL (seconds) |
-| `AA_API_TTL` | `21600` | API cache TTL (seconds) |
 | `AA_RICH_TTL` | `21600` | rich-dataset (model-page overlay) cache TTL |
 | `AA_MAX_BYTES` | `50331648` | decoded-body cap (gzip-bomb guard) |
 | `AA_HTTP_TIMEOUT` | `30` | per-attempt HTTP timeout (seconds) |
@@ -182,7 +202,7 @@ Deliberately out of scope (and the server says so instead of guessing):
   age and says `stale` when a network failure forced a cached copy. Pass
   `refresh=true` for freshly released models.
 - **Coverage is labelled.** AA scores a benchmark on a subset of models; tables state
-  how many of the 700 tracked variants carry a value, and warn when a filter dropped
+  how many of the 703 tracked variants carry a value, and warn when a filter dropped
   rows that simply have no measurement.
 - **Cost per task is cache-aware** and must not be recomputed from $/1M rates; raw
   rates are separate fields.
