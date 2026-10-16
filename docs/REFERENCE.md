@@ -2,7 +2,7 @@
 
 Canonical text served by the `aa_reference` tool and the `aa://reference/*`
 resources. Source: artificialanalysis.ai (live, scraped) and its published
-methodology. Coverage counts measured 2026-10-15 and drift as AA adds or retires
+methodology. Coverage counts measured 2026-10-16 and drift as AA adds or retires
 models.
 
 ## overview
@@ -29,6 +29,14 @@ Tool routing:
 | the six Capability Indexes (Finance & Accounting, Strategy & Ops, Legal, Healthcare & Medical, Engineering, Economics) — one model's score + sub-scores, or a cross-model ranking | `aa_model` (per model); `aa_benchmarks query=capabilities` prints the exact ranking call |
 | the AA Coding Agent Index (agent x harness rows, not models) | `aa_agents board=coding_agents` |
 | unsure of a model's exact name or slug (incl. media/speech) | `aa_search` (resolves language models and arena entries; when no model matches but the query names a benchmark/metric/board it answers with that thing's hint; always resolve names first) |
+| the Decision-Models suite (When2Call, WildGuardTest, HLE-MultiChoice, AA-Omniscience-Decision — 28 scored models each) | `aa_benchmark_leaderboard benchmark=when2call` / `wildguardtest` / `hleMultichoice` / `omniscienceDecision` |
+| the Multilingual Index and its 16 per-language scores | `aa_leaderboard sort=multilingual` (also `sort=multilingual.<lang>`) |
+| the on-device / mobile benchmark set (7 evals incl. BFCL-500 / BFCL-Small) | `aa_benchmark_leaderboard benchmark=mobile.<eval>` (`aa_leaderboard sort=mobile.<eval>`) |
+| the silent (no-audio) video arenas, or a media board's per-category sub-board | `aa_media board=text_to_video_silent` / `board=image_to_video_silent`; `aa_media board=<board> category=<slug>` |
+| a benchmark's breakdown sub-scores (rankable ones too) | `aa_model sections=benchmarks`; `aa_leaderboard sort=<key>` (e.g. `openness.modelAvailability`, `omniscience.domain.law`) |
+| the full speech boards (speech-to-text 36 rows, streaming 45, speech-to-speech 27) and their per-dataset WER / streaming latency / STS components | `aa_media board=speech_to_text` / `board=speech_to_text_streaming` / `board=speech_to_speech`; rank a column with `aa_leaderboard sort=sttWerIndex` / `sttStreamingTimeToFinal` / `stsBigBenchAudio` |
+| TTS use-case sub-boards | `aa_media board=text_to_speech category=assistants` (also `knowledge-sharing`, `entertainment`, `customer-service`, `en-us`, `en-gb`) |
+| the Search API Index and its BrowseComp / DeepSearchQA / latency / cost metrics | `aa_agents board=search_api`; `aa_leaderboard sort=searchQualityIndex` (also `searchBrowsecompAccuracy`, `searchAvgLatency`, `searchCostPerQuery`) |
 | definitions, field names, provenance | `aa_reference` |
 | raw JSON for anything not covered | `aa_raw` (token-expensive, last resort) |
 
@@ -99,10 +107,19 @@ Trust these, do not re-derive:
   (never zero).
 - **Quantization matters** for open-weights models; the `Precision` column (FP8,
   INT4, BF16, …) comes from the provider endpoint slug.
-- **AA does not track** MathVista, DocVQA or BFCL (Berkeley function calling). For
-  vision use the `mmmuPro` benchmark plus modality flags; for tool use use the
-  `FnCall`/`JSON` endpoint flags. If asked for an untracked benchmark, say AA has no
-  data — do not invent scores.
+- **AA does not track** MathVista or DocVQA. **BFCL** (Berkeley function calling) is
+  published only through the on-device/mobile set (`mobile.bfcl_500`,
+  `mobile.bfcl_small`) — there is no server-grade BFCL leaderboard. For vision use the
+  `mmmuPro` benchmark plus modality flags; for tool use use the `τ²-Bench` /
+  `τ³-Banking` benchmarks and the `FnCall`/`JSON` endpoint flags. If asked for an
+  untracked benchmark, say AA has no data — do not invent scores.
+- **Speech/arena board rows are their own namespace.** A TTS voice or an ASR host is
+  not a language model: those rows publish no Intelligence-Index cost or speed, so
+  `aa_pareto score=<board key>` reports that no frontier can be drawn and names the
+  board's row count. `aa_search` resolves board entries (tagged `aa:arena` with their
+  board) and `aa_compare` compares board rows within one board, accepting both the
+  board's own columns and the board sub-metrics (e.g. `metrics=stsOverallElo`); its
+  footer says the rows are not language models.
 - Freshness: scraped payloads are cached (default 1 h, `AA_CACHE_TTL`); the header
   line shows age and flags `stale`. Pass `refresh=true` for "released today" or
   suspicious data. Cite as "live data from artificialanalysis.ai, <date>".
@@ -119,7 +136,14 @@ Scraped records (the majority of models):
   Accuracy` and `Hallucination Rate` break it out.
 - **Openness Index** — availability, transparency, licensing (0-100); a full
   326-model array on `/evaluations/artificial-analysis-openness-index`.
-- **Decision Index** — AA's decision-quality composite (its own eval page).
+- **Decision Index** — AA's decision-quality composite; its own eval page
+  (`/evaluations/artificial-analysis-decision-index`) carries a 28-row `indexScore`
+  array that also holds the four Decision-Models scores (see topic `benchmarks`).
+- **Multilingual Index** — average over 16 languages (`ar, bn, de, en, es, fr, hi,
+  id, it, ja, ko, pt, sw, yo, zh, my`) for 13 chart-selected models on
+  `/models/multilingual` (`multilingual.average` plus `multilingual.<lang>`); the
+  same page carries the 13-row `globalMmluLite` split. AA's OpenAPI calls it
+  `artificial_analysis_multilingual_index`.
 - **Cyber Index** — safety composite, with refusal-rate and mitigation-status
   companions (eval page / homepage panel).
 - **Capability Indexes** (six, all free) — Finance & Accounting, Strategy & Ops,
@@ -132,8 +156,12 @@ Scraped records (the majority of models):
   `strategy-and-ops`, `legal`, `healthcare-and-medical`, `engineering`, `economics`)
   with `weightedIndex`/`headlineValue` for a curated subset — 26 models each, 20 for
   Healthcare & Medical. Full coverage comes from the rich model-page array:
-  221/221/221/82/220/228 of the 703 variants. A member is null for a model missing
-  any constituent evaluation.
+  ≈222/222/222/82/221/229 of the 703 variants (measured 2026-10-16; AA drifts). A
+  member is null for a model missing any constituent evaluation.
+- **AA Speech-to-Speech Index** (`sts`, 0-100) — a speech index over the STS arena's
+  `overall` slice (19 scored), with components `stsBigBenchAudio`, `stsTauVoice`,
+  `stsArenaScore` and `stsTaskSuccess`; the same arena also ranks `stsOverallElo` /
+  `stsAgenticElo` / `stsNonAgenticElo` and `stsTaskCompletionRate`.
 - **AA Coding Agent Index** (agent-level, not model-level) — 41 agent x harness rows
   on `/agents/coding-agents`, `indexScore` as a 0-1 fraction (x100 for display).
 - **AA-Briefcase Elo** — long-horizon knowledge-work benchmark, reported as Elo
@@ -149,7 +177,7 @@ LiveCodeBench, FrontierCode, tau2-Bench / tau3-Banking and AutomationBench, whic
 ## benchmarks
 
 Per-benchmark scores held by aa-mcp (label · unit · coverage in the 703 tracked
-variants on 2026-10-15 · what it tests):
+variants on 2026-10-16 · what it tests):
 
 Leaderboard-wide (full cross-model ranking available):
 - GPQA Diamond · % · 617 · 198 graduate-level science questions (PhD experts ~65%).
@@ -186,12 +214,86 @@ sort=<key>` joins them by slug and the header/footnote state the real coverage):
 - GDPval-AA raw Elo · Elo · pairwise preference Elo.
 - AA-Briefcase · Elo · see `indexes`.
 - AA-3D · Elo · three-dimensional reasoning/design tasks.
-- Global-MMLU-Lite, MMLU-Pro, Math-500, When2Call, WildGuardTest · % · knowledge,
-  math, tool-calling and safety suites.
+- Global-MMLU-Lite · % · 17 (union of its 5-row eval page and the 13-row
+  `/models/multilingual` page) · multilingual knowledge; also split per language.
+- MMLU-Pro, Math-500 · % · knowledge and math suites (only ~1 active model each —
+  the rest are deprecated).
+
+Decision Models (AA's `/evaluations/{aa-omniscience-decision,hle-multichoice,when2call,wildguardtest}`
+— each a **28-row** array whose four pages share one 28-row score blob with five
+keys, so every model ranks on all four):
+- When2Call · % · 28 · does the model call a tool when it should?
+- WildGuardTest · % · 28 · safety, average F1 over the WildGuardTest suite.
+- HLE-MultiChoice · % · 28 · HLE multiple-choice subset (`hleMultichoice`).
+- AA-Omniscience-Decision · % · 28 · decision-mode factual recall
+  (`omniscienceDecision`); `omniscienceDecisionNonHallucination` is its
+  hallucination counterpart.
+
+Multilingual (AA's OpenAPI `artificial_analysis_multilingual_index`):
+- Artificial Analysis Multilingual Index · % · 13 · average over 16 languages
+  (`multilingual`); per-language keys `multilingual.ar|bn|de|en|es|fr|hi|id|it|ja|ko|pt|sw|yo|zh|my`
+  on `/models/multilingual`.
+
+On-device / mobile set (`/hardware-inference-stack/mobile-phones`, **90 rows x 7
+evals** — the same evaluations run on-device with quantised weights and bounded
+context; this is where AA publishes **BFCL**, so "AA does not track BFCL" is
+wrong):
+- `mobile.gpqa` 57 · `mobile.ifbench` 55 · `mobile.ifstruct` 11 · `mobile.math_500`
+  57 · `mobile.omniscience` 58 · `mobile.bfcl_500` 17 · `mobile.bfcl_small` 57 ·
+  all % of the 90 on-device rows.
 - Security boards (homepage, top 20): AA Cyber Index (`cyberIndex`) with its
   companions Cyber Refusal (`cyberRefusalRate`, lower is better) and Cyber
   Mitigation (`cyberMitigationStatus`, standard/unmitigated), plus CWE-Bench-AA,
   DeepSecBench-AA and CyberGym-E2E-AA (each with its own refusal-rate key).
+
+Speech / voice / search (chart-set; the three speech boards serve the **full**
+published board, not the homepage panel):
+- Speech-to-text (`/speech-to-text/non-streaming`, board `speech_to_text`, 36 rows):
+  `sttWerIndex` 36, `sttWordErrorRate` 11, `sttEarnings22Wer` / `sttVoxpopuliWer` /
+  `sttAgenttalkWer` 36 each (all %, lower is better).
+- Streaming speech-to-text (`/speech-to-text/streaming`, board
+  `speech_to_text_streaming`, 45 rows): `sttStreamingWerIndex`,
+  `sttStreamingEarnings22Wer`, `sttStreamingAgenttalkWer` (45 each, lower is
+  better), `sttStreamingTimeToFirstPartial` / `sttStreamingTimeToFinal` (s, lower is
+  better).
+- Speech-to-speech (`/speech-to-speech/arena`, board `speech_to_speech`, the
+  `overall` slice — 27 rows; the page's 80 rows are overall + agentic + non-agentic):
+  `sts` index 19, `stsOverallElo` 27, `stsAgenticElo` 27, `stsNonAgenticElo` 26,
+  `stsTaskCompletionRate` 27, `stsBigBenchAudio` / `stsTauVoice` / `stsArenaScore` /
+  `stsTaskSuccess` 19 each.
+- TTS (`/text-to-speech/models`, chart-set slug `tts`): `ttsQualityElo` 97,
+  `ttsCharactersPerSecond` 79 (chars/s), `ttsGenerationTime` 79 (s, lower is
+  better), and the pronunciation suite `ttsPronunciationPassRate` /
+  `ttsTermPronunciation` / `ttsTextNormalization` / `ttsSequenceFidelity` /
+  `ttsContextualDisambiguation` (30 each). Use-case sub-boards:
+  `aa_media board=text_to_speech category=<assistants|knowledge-sharing|entertainment|customer-service>`,
+  plus the language boards `en-us` / `en-gb`.
+- Search API (`/agents/search-api`, chart-set slug `search-api`; `aa_agents
+  board=search_api`): `searchQualityIndex`, `searchBrowsecompAccuracy`,
+  `searchDeepsearchqaF1`, `searchOmniscienceAccuracy`, `searchQualityLift` (26 each),
+  `searchCostPerTask` 26, `searchQueriesPerTask` 25 (index),
+  `searchAvgLatency` 26 (s, lower is better), `searchCostPerQuery` 25 (USD/query,
+  lower is better).
+
+Breakdown sub-scores (AA ships these on its chart sets; `aa_model
+sections=benchmarks` renders them, and the multi-model ones are rankable
+sub-metrics via `aa_leaderboard sort=<key>`):
+- AA-Briefcase: `briefcaseRubricPassRate`, `briefcaseAnalyticalQualityElo`,
+  `briefcasePresentationElo`.
+- Harvey LAB: `harveyCriteriaPass`, `harveyGatedAllPass`; GDP.pdf:
+  `gdpPdfMacroPassRate`; AutomationBench: `automationBenchStrictScore`,
+  `automationBenchCompletion`.
+- Turn / efficiency: `gdpvalAvgTurns`, `itbenchAvgTurnsPerTask`,
+  `enterpriseOpsGymAvgTurns`, `aa3dTurnsP50`, `medianCanonicalAnswerOutputSpeed`.
+- Openness components (9): `openness.modelAvailability`, `openness.modelTransparency`,
+  `openness.transparencyPreTrainingData`, `openness.transparencyPostTrainingData`,
+  `openness.transparencyMethodology`, `openness.dataPretrainAccess`,
+  `openness.dataPretrainLicense`, `openness.dataPosttrainAccess`,
+  `openness.dataPosttrainLicense`.
+- Omniscience domains (6): `omniscience.domain.<business|health|humanitiesAndSocialSciences|law|scienceAndEngineering|softwareEngineering>`;
+  SWE languages (14): `omniscience.language.<c|r|go|php|dart|html|java|rust|julia|swift|kotlin|python|javascript|typescript>`.
+- Terminal-Bench-Science domains (5): `terminalBenchScience.domain.<life-sciences|physical-sciences|mathematical-sciences|engineering-sciences|earth-sciences>`.
+- EnterpriseOps-Gym domains (8): `enterpriseOpsGym.domain.<csm|hr|itsm|email|calendar|teams|drive|hybrid>`.
 
 Index membership (v4.3.2) is marked per benchmark in `aa_benchmarks`. The
 `Coverage` column is computed live from the source chain the ranking tools use
@@ -214,7 +316,8 @@ discount` = cache-read discount vs full input price. Blended prices are AA's fix
 input:output:cached ratios (0:3:1, 7:2:1, …).
 
 `cost_per_task` = AA's measured cost to complete one average Intelligence Index task,
-cache-aware (194 of 703 variants have it; unscored/deprecated models do not).
+cache-aware (~195 of 703 variants have it, measured 2026-10-16; unscored/deprecated
+models do not).
 Model pages add a full breakdown (input / cache-read / cache-write / reasoning /
 answer) plus per-evaluation weighted cost and output tokens per task.
 
@@ -248,8 +351,8 @@ slug — shown only when AA's payload discloses it, which is rare), $/1M
 input/output/cache-read, cache discount, cache-hit rate, cost per task,
 tok/s, TTFT, E2E, function-calling and JSON-mode support, and context window (the
 model-level value when the endpoint does not report one).
-The provider board holds 1,199 endpoints across ~453 models and 64 hosts (measured
-2026-10-15) with pricing, performance and feature flags, but without precision tags
+The provider board holds 1,222 endpoints across ~455 models and 64 hosts (measured
+2026-10-16) with pricing, performance and feature flags, but without precision tags
 or per-endpoint cost per task — use the per-model view for those. The table always
 shows the column it is sorted by (`sort=ttft` appends a TTFT column).
 Identity names always resolve in `fields=` (`model`/`name`, `slug`, `host`,
@@ -264,10 +367,23 @@ Human-preference arenas (Elo + appearance counts; the 95% confidence interval is
 available on request with `fields=ci_lower,ci_upper,ci`, not shown by default):
 text-to-image,
 image-editing, text-to-video, image-to-video, video-editing, text-to-speech
-(provider-voice and controlled-voice), music (instrumental, with-vocals). Prices are
-$/1k images, $/min and $/1M characters respectively. Speech boards: speech-to-text
-(word error rate, lower is better), streaming speech-to-text (WER + time to final
-transcript), speech-to-speech realtime voice (STS Index, 0-100, higher is better).
+(provider-voice and controlled-voice), music (instrumental, with-vocals). The two
+video pages ship **two** arenas each — the audio-capable board and a **silent**
+board (`text_to_video_silent` 31 rows, `image_to_video_silent` 82 rows — larger
+than the audio-capable I2V 23), so `aa_media board=text_to_video_silent` /
+`board=image_to_video_silent` rank those. Most boards also ship per-category
+sub-boards: pass `aa_media category=<slug>` to rank one (`text_to_image` 19,
+`image_editing` 17, `text_to_video` 20, `video_editing` 5,
+`text_to_speech_controlled` 11, and the TTS use-case boards `assistants` 90,
+`knowledge-sharing` 97, `entertainment` 90, `customer-service` 92 alongside
+`en-us` 96 / `en-gb` 83 on `text_to_speech`); omit it for the overall board. Prices are
+$/1k images, $/min and $/1M characters respectively. Speech boards serve the **full** published boards (not the homepage panels):
+speech-to-text (`board=speech_to_text`, 36 rows; word error rate, lower is better),
+streaming speech-to-text (`board=speech_to_text_streaming`, 45 rows; WER + time to
+first partial / final transcript), speech-to-speech realtime voice
+(`board=speech_to_speech`, 27 rows — the arena's `overall` slice; STS Index 0-100,
+higher is better); each column is separately rankable (`sttWerIndex`,
+`sttStreamingTimeToFinal`, `stsBigBenchAudio`, …).
 `aa_agents` covers AA's coding-agent, chatbot and search-API boards. Speech board
 keys are `speech_to_text`, `speech_to_text_streaming` and `speech_to_speech`
 (also accepted as `realtime_voice` / "real-time voice").
@@ -287,7 +403,18 @@ context_tokens (ctx), params_b, active_params_b, release_date,
 knowledge_cutoff, license, weights_url, is_open_weights (open), is_reasoning,
 effort, deprecated, size_class, modalities_in, modalities_out, creator, slug, name
 plus every benchmark key listed in `benchmarks` (e.g. gpqa, hle, mmmuPro,
-briefcaseElo, terminalBench40, cyberIndex, cyberRefusalRate, cyberMitigationStatus). Media arenas also accept `ci_lower`, `ci_upper`
+briefcaseElo, terminalBench40, cyberIndex, cyberRefusalRate, cyberMitigationStatus,
+when2call, wildguardtest, hleMultichoice, omniscienceDecision, multilingual,
+mobile.bfcl_500, briefcaseRubricPassRate, openness.modelAvailability, sttWerIndex,
+sttStreamingTimeToFinal, sts, stsBigBenchAudio, ttsQualityElo,
+ttsCharactersPerSecond, searchQualityIndex, searchBrowsecompAccuracy,
+searchCostPerQuery). Chart-set
+sub-keys resolve too: `multilingual.<lang>` (16 languages: ar, bn, de, en, es, fr,
+hi, id, it, ja, ko, pt, sw, yo, zh, my), `mobile.<eval>` (gpqa, ifbench, ifstruct,
+math_500, omniscience, bfcl_500, bfcl_small), `omniscience.domain.<name>`,
+`omniscience.language.<lang>`, `terminalBenchScience.domain.<name>`,
+`enterpriseOpsGym.domain.<name>` and `openness.<component>`. Media arenas also
+accept `ci_lower`, `ci_upper`
 and `ci` (the 95% confidence interval).
 
 Identity names resolve in every `fields=` list whatever the surface calls the
@@ -308,10 +435,19 @@ axes the models carry.
 
 - Site: https://artificialanalysis.ai — `/leaderboards/models` (all variants),
   `/models/<slug>` (rich record + chart set), `/models/<slug>/providers`,
-  `/leaderboards/providers`, `/evaluations/<slug>`, `/evaluations` (catalog),
+  `/leaderboards/providers`, `/evaluations/<slug>` (incl. the Decision-Models pages
+  `aa-omniscience-decision`, `hle-multichoice`, `when2call`, `wildguardtest`),
+  `/evaluations` (catalog),
   `/sitemap.xml` (the eval catalog is the union of the `/evaluations` cards and the
   sitemap `/evaluations/*` paths, so every published eval page is discoverable),
-  media/agent leaderboards, homepage (speech + security panels),
+  media/agent leaderboards (video pages carry both the audio-capable and the silent
+  arena, plus per-category sub-boards), the dedicated speech pages
+  (`/speech-to-text/non-streaming`, `/speech-to-text/streaming`,
+  `/speech-to-speech/arena`) and `/text-to-speech/models` (TTS quality/throughput
+  plus the pronunciation suite), homepage (speech + security panels as fallback),
+  `/models/multilingual` (Multilingual Index + 16 per-language scores),
+  `/hardware-inference-stack/mobile-phones` (the 90-row on-device benchmark set
+  incl. BFCL-500/BFCL-Small),
   `/models/capabilities/<index>` (the six Capability Indexes), `/agents/coding-agents`
   (the AA Coding Agent Index).
 - Surfaces, what each carries and how fresh it is (TTL, then default seconds):
@@ -324,12 +460,23 @@ axes the models carry.
     the header prints: two numbers can disagree on age alone. The header labels
     it separately — `aa:rsc + rich dataset (overlay 12m ago, seed <slug>)`.
   - eval chart sets + homepage panels (`aa_benchmark_leaderboard`, speech and
-    security panels) — the top ~20-30 models per evaluation [1 h].
-  - provider board (`aa_providers` board view) — 1,199 endpoints x 64 hosts [1 h].
+    security panels) — the top ~20-30 models per evaluation [1 h]; the
+    Decision-Models pages (28 rows each), the Multilingual Index
+    (`/models/multilingual`, 13 rows x 16 languages + average), the on-device set
+    (`/hardware-inference-stack/mobile-phones`, 90 rows x 7 evals) and the
+    speech/TTS/search chart sets (`stt` 36, `stt_streaming` 45, `sts` 27,
+    `tts` 97, `search-api` 26) ride this same chart-set path — the speech boards
+    prefer the dedicated page over the homepage panel (`loaders.SPEECH_BOARDS`).
+  - provider board (`aa_providers` board view) — 1,222 endpoints x 64 hosts [1 h].
   - model providers (`aa_providers model=<slug>`) — per-endpoint pricing,
     performance and feature flags [1 h].
-  - media arenas (`aa_media`) — Elo and appearance counts per arena [1 h].
-  - agents boards (`aa_agents`) — coding-agent, chatbot and search-API tables [1 h].
+  - media arenas (`aa_media`) — Elo and appearance counts per arena [1 h]; the
+    video pages' silent boards (`text_to_video_silent`, `image_to_video_silent`)
+    and every board's per-category sub-boards (`category=`) come from the same
+    payload.
+  - agents boards (`aa_agents`) — coding-agent, chatbot and search-API tables [1 h];
+    the Search API's BrowseComp / DeepSearchQA / latency / $-per-query columns are
+    also rankable (`searchQualityIndex`, `searchBrowsecompAccuracy`, …).
   - eval catalog (`aa_benchmarks` index) — `/evaluations` cards + sitemap paths [1 h].
   - capability index pages (`/models/capabilities/<index>`) — the curated
     26-row (20 for Healthcare & Medical) cross-model subset per index; the full

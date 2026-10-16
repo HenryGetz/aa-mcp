@@ -357,3 +357,157 @@ def test_merge_keeps_the_published_time_per_task(chart_records, leaderboard_reco
     for merged in (normalize.merge(leader, chart), normalize.merge(chart, leader)):
         assert merged.speed["time_per_task"] == pytest.approx(789.2354834132094)
         assert merged.speed["time_per_task_derived"] == pytest.approx(689.9289088216383)
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-16: the chart shapes added for the Decision-Models table, the
+# Multilingual Index, the on-device set and AA's per-model breakdown maps
+# --------------------------------------------------------------------------- #
+
+@pytest.fixture(scope="module")
+def decision_row():
+    p = flight.payload(_read("eval_decision_when2call.rsc"))
+    return flight.find_array(p, ["indexScore", "scores", "byDataset"])[0]
+
+
+@pytest.fixture(scope="module")
+def multilingual_row():
+    p = flight.payload(_read("page_multilingual.rsc"))
+    return flight.find_array(p, ["slug"])[0]
+
+
+@pytest.fixture(scope="module")
+def mobile_row():
+    p = flight.payload(_read("page_mobile.rsc"))
+    return flight.find_array(p, ["evalScores"])[0]
+
+
+def test_decision_scores_are_rescaled_to_fractions(decision_row):
+    """The decision table stores 0-100 percentages; Model.evals stays 0-1."""
+    assert decision_row["scores"]["when2callAccuracy"] == pytest.approx(79.3748,
+                                                                       abs=1e-3)
+    model = normalize.from_chart(decision_row)
+    assert model.evals["when2call"] == pytest.approx(0.7937481741162723)
+    assert model.evals["wildguardtest"] == pytest.approx(0.9318750561181345)
+    assert model.evals["hleMultichoice"] == pytest.approx(0.3742690058479532)
+    # decision-cohort omniscience values get their own keys: the same model's
+    # full-benchmark accuracy is a different number (66.2% vs 57.6% here)
+    assert model.evals["omniscienceDecision"] == pytest.approx(0.576)
+    assert model.evals["omniscienceDecisionNonHallucination"] == pytest.approx(
+        0.6933962264150944)
+    assert "omniscienceAccuracy" not in model.evals
+    assert "omniscienceNonHallucination" not in model.evals
+    # the ``scores`` map's own key is not the eval key for a decision page
+    assert "when2callAccuracy" not in model.evals
+
+
+def test_decision_page_index_score_is_not_a_per_eval_value(decision_row):
+    """``indexScore`` is the Decision Index; it must not land on a sub-eval key."""
+    model = normalize.from_chart(decision_row)
+    assert model.evals["when2call"] != pytest.approx(decision_row["indexScore"])
+    assert "decisionIndex" not in model.evals
+
+
+def test_multilingual_flattens_the_index_and_its_languages(multilingual_row):
+    model = normalize.from_chart(multilingual_row)
+    assert model.evals["multilingual"] == pytest.approx(0.9222395833333334)
+    assert model.evals["multilingual.en"] == pytest.approx(0.9366666666666666)
+    assert model.evals["multilingual.my"] == pytest.approx(0.8975)
+    assert len([k for k in model.evals if k.startswith("multilingual.")]) == 16
+    # the same map feeds Global-MMLU-Lite, whose chart set is this page
+    assert model.evals["globalMmluLiteScore"] == pytest.approx(0.9222395833333334)
+
+
+def test_mobile_evals_are_namespaced_and_not_rescaled(mobile_row):
+    model = normalize.from_chart(mobile_row)
+    # already 0-1 on this surface — dividing again would be a 100x error
+    assert model.evals["mobile.gpqa"] == pytest.approx(0.194949494949495)
+    assert model.evals["mobile.bfcl_small"] == pytest.approx(0.3333333333333333)
+    # an on-device run must never overwrite the first-party column
+    assert "gpqa" not in model.evals
+    assert model.context_tokens == 16384
+
+
+def test_breakdowns_are_carried_and_flattened():
+    p = flight.payload(_read("eval_page.rsc"))
+    records = flight.find_array(p, ["chartDefaultSelected", "releaseDate", "suffix"])
+    record = records[0]
+    model = normalize.from_chart(record)
+
+    # the raw maps are kept verbatim, including the nested ones with no rankable
+    for key in ("briefcaseBreakdown", "omniscienceBreakdown",
+                "canonicalEvalTokenCounts", "terminalBenchSciencePassRateByDomain"):
+        assert isinstance(model.breakdowns.get(key), dict), key
+    assert model.breakdowns["omniscienceBreakdown"]["byDomain"]["Law"] == pytest.approx(
+        47.7)
+
+    # ... and the registered scalars are flattened onto canonical eval keys
+    assert model.evals["briefcaseAnalyticalQualityElo"] == pytest.approx(1968.85)
+    assert model.evals["briefcasePresentationElo"] == pytest.approx(1492.06)
+    assert model.evals["briefcaseRubricPassRate"] == pytest.approx(0.6151515151515151)
+    assert model.evals["harveyCriteriaPass"] == pytest.approx(0.924356742116464)
+    assert model.evals["gdpPdfMacroPassRate"] == pytest.approx(0.79743205964747)
+    assert model.evals["automationBenchStrictScore"] == pytest.approx(0.3211567732115677)
+    assert model.evals["gdpvalAvgTurns"] == pytest.approx(60.3926940639269)
+    assert model.evals["itbenchAvgTurnsPerTask"] == pytest.approx(32.112994350282484)
+    assert model.evals["omniscience.domain.law"] == pytest.approx(47.7)
+    assert model.evals["omniscience.language.python"] == pytest.approx(91.0)
+    assert model.evals["terminalBenchScience.domain.life-sciences"] == pytest.approx(
+        0.3157894736842105)
+
+
+def test_openness_components_are_flattened_for_the_models_that_publish_them():
+    """Only the open-weights rows carry ``opennessBreakdown`` (8 of 19 here)."""
+    p = flight.payload(_read("eval_page.rsc"))
+    records = flight.find_array(p, ["chartDefaultSelected", "releaseDate", "suffix"])
+    record = next(r for r in records if isinstance(r.get("opennessBreakdown"), dict))
+    model = normalize.from_chart(record)
+    assert isinstance(model.breakdowns["opennessBreakdown"], dict)
+    components = [k for k in model.evals if k.startswith("openness.")]
+    assert len(components) == 9
+    assert model.evals["openness.modelAvailability"] == pytest.approx(
+        record["opennessBreakdown"]["modelAvailability"])
+    assert model.evals["openness.dataPosttrainLicense"] == pytest.approx(
+        record["opennessBreakdown"]["dataPosttrainLicense"])
+
+
+def test_breakdown_sub_scores_match_their_catalog_keys():
+    """Every flattened key must resolve to a registered metric/benchmark."""
+    from aa_mcp import catalog
+
+    p = flight.payload(_read("eval_page.rsc"))
+    record = flight.find_array(p, ["chartDefaultSelected", "releaseDate", "suffix"])[0]
+    model = normalize.from_chart(record)
+    prefixes = ("openness.", "omniscience.", "briefcase", "harvey", "gdpPdf",
+                "automationBench", "enterpriseOpsGym.domain",
+                "terminalBenchScience.domain", "aa3d", "gdpvalAvgTurns", "itbench")
+    flattened = [k for k in model.evals if k.startswith(prefixes)]
+    assert flattened
+    for key in flattened:
+        assert catalog.metric(key) is not None, key
+        assert catalog.benchmark(key) is not None, key
+
+
+def test_merge_unions_breakdowns_and_sub_scores(chart_records, leaderboard_records):
+    chart = normalize.from_chart(chart_records["claude-opus-5-5"])
+    leader = next(m for m in map(normalize.from_leaderboard, leaderboard_records)
+                  if m.slug == "claude-opus-5-5")
+    assert leader.breakdowns == {}
+    merged = normalize.merge(leader, chart)
+    assert merged.breakdowns
+    assert merged.evals["briefcaseElo"] == chart.evals["briefcaseElo"]
+    # a leaderboard row has no breakdown to contribute; the chart's survives
+    assert normalize.merge(chart, leader).breakdowns
+
+
+def test_decision_contestant_slug_is_restored(decision_row):
+    """``<host>_<model-slug>`` -> the AA model slug every other surface uses."""
+    assert decision_row["slug"] == "anthropic_claude-haiku-5-5"
+    assert normalize.from_chart(decision_row).slug == "claude-haiku-5-5"
+    # a non-contestant record keeps its slug untouched
+    assert normalize.from_chart(
+        {"slug": "claude-opus-5-5", "name": "X"}).slug == "claude-opus-5-5"
+    # a multi-segment remainder is left alone rather than half-stripped
+    assert normalize.from_chart(
+        {"slug": "host_a_b", "hostName": "Host", "scores": {"x": 1.0},
+         "name": "Y"}).slug == "host_a_b"

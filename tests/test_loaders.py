@@ -371,6 +371,9 @@ _CACHE_MAP = {
     "eval_gpqa-diamond": "eval_page.rsc",
     "eval_catalog": "eval_index.html",
     "sitemap": None,
+    "speech_stt": "speech_stt.rsc",
+    "speech_stt_streaming": "speech_stt_streaming.rsc",
+    "speech_sts": "speech_sts.rsc",
 }
 
 
@@ -411,7 +414,8 @@ def test_loader_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
     assert len(loaders.provider_board()) == 1201
 
     boards = loaders.home_boards()
-    assert (len(boards["stt"]), len(boards["stt_streaming"]), len(boards["sts"])) == (15, 28, 15)
+    # the full boards replace the homepage's top-N panels when the page is readable
+    assert (len(boards["stt"]), len(boards["stt_streaming"]), len(boards["sts"])) == (8, 8, 3)
 
     assert len(loaders.media("text_to_image")) == 102
     assert len(loaders.agents("coding_agents")) == 39
@@ -451,7 +455,12 @@ def test_capability_page_rows() -> None:
     assert {r["slug"] for r in rows} >= {"claude-opus-5-5", "gemini-4-argon"}
 
 
-def test_capability_models_carry_score_and_subscores() -> None:
+def test_capability_models_carry_score_and_subscores(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # pinned to the capture: the live page gains models over time, so an
+    # unpinned exact count is live-cache drift rather than a code signal
+    _patch_fetch(monkeypatch, {"capability_legal": "capability_legal.rsc"})
     models = loaders.capability_models("capabilities.legal")
     assert len(models) == 26
     m = next(x for x in models if x.slug == "claude-opus-5-5")
@@ -1304,3 +1313,288 @@ def test_rich_ttl_env_override_expires_a_young_cache(monkeypatch, tmp_path) -> N
 
     loaders.rich_dataset()
     assert calls
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-16: the Decision-Models table, the Multilingual Index, the on-device
+# benchmark set, the silent video boards and the media category sub-boards
+# --------------------------------------------------------------------------- #
+
+def test_decision_eval_page_parses_its_shared_table() -> None:
+    """The four decision eval pages ship one 28-row table, not ``initialModels``."""
+    models = loaders.parse_chart(_text("eval_decision_when2call.rsc"))
+    assert len(models) == 28
+    by_slug = {m.slug: m for m in models}
+    # AA's contestant id is ``<host>_<model-slug>``; the model slug is restored so
+    # a decision row joins the leaderboard row for the same model
+    assert "anthropic_claude-haiku-5-5" not in by_slug
+    row = by_slug["claude-haiku-5-5"]
+    assert row.name == "Claude Haiku 5.5 (Max)"
+    # the ``scores`` map holds 0-100 percentages; Model.evals stores 0-1 fractions
+    assert row.evals["when2call"] == pytest.approx(0.7937481741162723)
+    assert row.evals["wildguardtest"] == pytest.approx(0.9318750561181345)
+    assert row.evals["hleMultichoice"] == pytest.approx(0.3742690058479532)
+    assert row.evals["omniscienceDecision"] == pytest.approx(0.576)
+    assert row.evals["omniscienceDecisionNonHallucination"] == pytest.approx(
+        0.6933962264150944)
+    # the page's own ``indexScore`` is the Decision Index, not one of the four
+    assert "decisionIndex" not in row.evals
+
+
+def test_multilingual_page_carries_the_index_and_its_languages() -> None:
+    models = loaders.parse_chart(_text("page_multilingual.rsc"))
+    assert len(models) == 13
+    row = next(m for m in models if m.slug == "gemini-3-pro")
+    assert row.evals["multilingual"] == pytest.approx(0.9222395833333334)
+    assert row.evals["multilingual.zh"] == pytest.approx(0.935)
+    assert row.evals["multilingual.yo"] == pytest.approx(0.8624999999999999)
+    # the same page is the wider Global-MMLU-Lite chart set
+    assert row.evals["globalMmluLiteScore"] == pytest.approx(0.9222395833333334)
+
+
+def test_mobile_page_parses_the_on_device_benchmark_set() -> None:
+    models = loaders.parse_chart(_text("page_mobile.rsc"))
+    assert len(models) == 90
+    row = next(m for m in models if m.slug == "gemma-3-270m-q4km")
+    assert row.context_tokens == 16384
+    # every on-device eval is namespaced so it never mixes into the leaderboard
+    assert row.evals["mobile.gpqa"] == pytest.approx(0.194949494949495)
+    assert row.evals["mobile.ifbench"] == pytest.approx(0.0938775510204082)
+    assert row.evals["mobile.math_500"] == pytest.approx(0.0672)
+    assert row.evals["mobile.bfcl_small"] == pytest.approx(0.3333333333333333)
+    assert "gpqa" not in row.evals
+
+
+def test_eval_models_unions_the_global_mmlu_lite_pages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two Global-MMLU-Lite pages overlap, so the union is 17 (not 18)."""
+    _patch_fetch(monkeypatch, {
+        "eval_global-mmlu-lite": "eval_global_mmlu_lite.rsc",
+        "eval_global-mmlu-lite_1": "page_multilingual.rsc",
+    })
+    first = loaders.parse_chart(_text("eval_global_mmlu_lite.rsc"))
+    second = loaders.parse_chart(_text("page_multilingual.rsc"))
+    shared = {m.slug for m in first} & {m.slug for m in second}
+    assert shared == {"gemini-3-pro"}            # the overlap, not a disjoint pair
+    models = loaders.eval_models("global-mmlu-lite")
+    slugs = [m.slug for m in models]
+    assert len(first) == 5 and len(second) == 13
+    assert len(slugs) == 17                      # 5 + 13 - 1 shared
+    assert len(set(slugs)) == 17
+    assert "gemini-3-pro" in slugs
+
+
+def test_silent_video_boards_are_their_own_board() -> None:
+    """Both video pages ship a with-audio and a without-audio arena."""
+    text = _text("media_t2v.rsc")
+    audio = loaders.parse_media(text, "text_to_video")
+    silent = loaders.parse_media(text, "text_to_video_silent")
+    assert len(audio) == 29 and len(silent) == 32
+    assert audio[0]["name"] == "Wan 3.0"
+    assert audio[0]["elo"] != silent[0]["elo"]
+    # the silent board is selected by the page's own withoutAudioData reference,
+    # not by document order
+    assert {r["name"] for r in silent} != {r["name"] for r in audio}
+
+
+def test_media_category_sub_boards() -> None:
+    text = _text("media_t2i.rsc")
+    overall = loaders.parse_media(text, "text_to_image")
+    category = loaders.parse_media(text, "text_to_image",
+                                   category="marketing-and-advertising")
+    assert 0 < len(category) < len(overall)
+    elos = [r["elo"] for r in category]
+    assert elos == sorted(elos, reverse=True)
+    with pytest.raises(ValueError) as ei:
+        loaders.parse_media(text, "text_to_image", category="not-a-category")
+    assert "unknown category" in str(ei.value)
+
+
+def test_capability_parser_tolerates_flight_reference_strings() -> None:
+    """A string back-reference in the longest array must degrade, not crash."""
+    text = (
+        'd:["$","$L1",null,{"initialModels":["$e:props:models:0",'
+        '{"slug":"alpha","name":"Alpha","weightedIndex":50.0,'
+        '"headlineValue":50.0,"subScores":{"knowledge":60.0}},"$e:props:models:1"]}]'
+    )
+    rows = loaders.parse_capability_index(text)
+    assert rows == [{
+        "slug": "alpha", "name": "Alpha", "short_name": "Alpha",
+        "score": 50.0, "headline": 50.0, "sub_scores": {"knowledge": 60.0},
+    }]
+
+
+def test_index_rows_parser_tolerates_flight_reference_strings() -> None:
+    text = (
+        'd:["$","$L1",null,{"contestants":["$e:props:models:0",'
+        '{"slug":"beta","name":"Beta","indexScore":42.5},"$e:props:models:1"]}]'
+    )
+    assert loaders.parse_index_rows(text, "indexScore") == [
+        {"slug": "beta", "name": "Beta", "score": 42.5}
+    ]
+
+
+def test_decision_page_binds_its_declared_primary_metric(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The page's own ``metric`` binds to the benchmark that owns its slug.
+
+    Today's four pages share one 5-key ``scores`` blob, so the table-driven mapping
+    happens to cover them; this pins the *declared* binding, which is what keeps a
+    future page whose blob carries an unseen key on the right benchmark — and it is
+    authoritative when the two disagree, because the page states what it ranks by.
+    """
+
+    def page(metric: str, scores: str) -> str:
+        head = f'"metric":"{metric}",' if metric else ""
+        return ('d:["$","$L6",null,{"locale":"en","children":[["$","$L1",null,{'
+                + head + '"slug":"when2call","contestants":[{"slug":"host_model-a",'
+                '"kind":"llm","name":"Model A","hostName":"Host","indexScore":50.0,'
+                '"scores":' + scores + ',"byDataset":{}}]}]]}]')
+
+    def serve(text: str):
+        def fake_get(url: str, name: str, **kwargs):
+            return fetch.Fetched(text=text, path=Path("/fake-cache") / name,
+                                 fetched_at=1_700_000_000.0, cached=True, stale=False)
+        return fake_get
+
+    # an unseen key maps nowhere on its own; the page's declaration carries it
+    loaders._clear_memos()
+    monkeypatch.setattr(loaders.fetch, "get", serve(page("unseenMetric", '{"unseenMetric":55.0}')))
+    models = loaders.eval_models("when2call")
+    assert [m.slug for m in models] == ["model-a"]
+    assert models[0].evals["when2call"] == pytest.approx(0.55)
+
+    # with no declaration the same blob yields nothing for that benchmark
+    loaders._clear_memos()
+    monkeypatch.setattr(loaders.fetch, "get", serve(page("", '{"unseenMetric":55.0}')))
+    assert "when2call" not in loaders.eval_models("when2call")[0].evals
+
+    # the declared metric is authoritative when it disagrees with the table
+    loaders._clear_memos()
+    monkeypatch.setattr(loaders.fetch, "get", serve(
+        page("unseenMetric", '{"unseenMetric":55.0,"when2callAccuracy":80.0}')))
+    row = loaders.eval_models("when2call")[0]
+    assert row.evals["when2call"] == pytest.approx(0.55)
+    # a table key this blob does not carry is simply absent
+    assert "wildguardtest" not in row.evals
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-16: the full speech boards, the ref-declared media categories, and the
+# speech / TTS / search boards as chart sets
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("board, fixture, count", [
+    ("stt", "speech_stt.rsc", 8),
+    ("stt_streaming", "speech_stt_streaming.rsc", 8),
+    ("sts", "speech_sts.rsc", 3),
+])
+def test_speech_boards_are_the_full_board(board, fixture, count):
+    """The dedicated page carries the whole board, not the homepage's top-N panel."""
+    rows = loaders.parse_speech_board(_text(fixture), board)
+    assert len(rows) == count
+    assert all(r["name"] for r in rows)
+    if board == "sts":
+        # the overall slice is the board; the other slices would duplicate rows
+        assert {r["sliceKey"] for r in rows} == {"overall"}
+        values = [r["stsIndex"] for r in rows if r["stsIndex"] is not None]
+        assert values == sorted(values, reverse=True)
+    else:
+        values = [r["werIndex"] for r in rows if r["werIndex"] is not None]
+        assert values == sorted(values)          # lower is better, best first
+
+
+def test_speech_rows_keep_the_panel_key_space():
+    """``aa_media`` and the arena index read ``werIndex``/``stsIndex``/``hostName``."""
+    stt = loaders.parse_speech_board(_text("speech_stt.rsc"), "stt")
+    assert set(stt[0]) >= {"name", "creatorName", "hostName", "werIndex", "price",
+                           "price_unit", "open_weights", "release_date", "extra"}
+    # best first, so the top row is the lowest word-error rate on the page
+    assert stt[0]["werIndex"] == min(r["werIndex"] for r in stt)
+    grok = next(r for r in stt if r["name"].startswith("Grok Voice Transcribe 2.0"))
+    assert grok["werIndex"] == pytest.approx(0.0229)
+    assert grok["extra"]["aaSttDatasetWer"] == pytest.approx(0.023354)
+    sts = loaders.parse_speech_board(_text("speech_sts.rsc"), "sts")
+    assert sts[0]["stsIndex"] is not None
+    assert sts[0]["extra"]                      # the STS components ride along
+
+
+def test_home_boards_prefer_the_full_speech_board(monkeypatch):
+    _patch_fetch(monkeypatch)
+    boards = loaders.home_boards()
+    assert len(boards["stt"]) == 8               # the page, not the 15-row panel
+    assert boards["stt"][0]["name"].startswith("StepAudio 3 ASR")  # best WER first
+
+
+def test_home_boards_fall_back_to_the_panel(monkeypatch):
+    """A speech page that cannot be read leaves the homepage panel in place."""
+    mapping = dict(_CACHE_MAP)
+    mapping.pop("speech_stt")
+
+    def fake_get(url: str, name: str, **kwargs):
+        if name not in mapping:
+            raise fetch.AAFetchError("no such page", url=url)
+        return fetch.Fetched(text=_text(mapping[name]), path=Path("/fake") / name,
+                             fetched_at=1_700_000_000.0, cached=True, stale=False)
+
+    monkeypatch.setattr(loaders.fetch, "get", fake_get)
+    boards = loaders.home_boards()
+    assert len(boards["stt"]) == 15              # the homepage panel survives
+    assert len(boards["sts"]) == 3               # the other pages still loaded
+
+
+def test_media_category_declared_by_reference():
+    """TTS use-case boards are ``["<slug>","$Q…"]`` pairs, not inline arrays."""
+    text = _text("media_tts_voice.rsc")
+    overall = loaders.parse_media(text, "text_to_speech")
+    assert len(overall) == 4
+    for slug in ("assistants", "knowledge-sharing"):   # declared by reference
+        rows = loaders.parse_media(text, "text_to_speech", category=slug)
+        assert len(rows) == 4
+    for slug in ("en-us", "en-gb"):                    # declared inline
+        assert len(loaders.parse_media(text, "text_to_speech", category=slug)) == 4
+    with pytest.raises(ValueError) as ei:
+        loaders.parse_media(text, "text_to_speech", category="nope")
+    assert "unknown category" in str(ei.value)
+
+
+@pytest.mark.parametrize("slug, fixture, count, key", [
+    ("stt", "speech_stt.rsc", 8, "sttWerIndex"),
+    ("stt_streaming", "speech_stt_streaming.rsc", 8, "sttStreamingWerIndex"),
+    ("sts", "speech_sts.rsc", 3, "sts"),
+    ("tts", "tts_models.rsc", 5, "ttsPronunciationPassRate"),
+    ("search-api", "agents_search_api.rsc", 6, "searchBrowsecompAccuracy"),
+])
+def test_speech_and_search_boards_are_chart_sets(slug, fixture, count, key):
+    """Each board's per-model columns reach the standard ranking paths."""
+    models = loaders.parse_chart(_text(fixture), slug=slug)
+    assert len(models) == count
+    assert all(m.slug for m in models)
+    assert any(m.evals.get(key) is not None for m in models), key
+
+
+def test_tts_chart_set_joins_the_pronunciation_results():
+    """The pronunciation array is keyed by ``ttsModelId`` = the row's ``model.id``."""
+    models = loaders.parse_chart(_text("tts_models.rsc"), slug="tts")
+    scored = [m for m in models if m.evals.get("ttsPronunciationPassRate") is not None]
+    assert scored
+    row = scored[0]
+    assert 0 < row.evals["ttsPronunciationPassRate"] < 1
+    for key in ("ttsTermPronunciation", "ttsTextNormalization", "ttsSequenceFidelity",
+                "ttsContextualDisambiguation"):
+        assert 0 < row.evals[key] < 1, key
+    assert row.evals["ttsCharactersPerSecond"] > 0
+
+
+def test_sts_chart_set_merges_the_slices():
+    """One record per model, carrying the overall index plus each slice's Elo."""
+    models = loaders.parse_chart(_text("speech_sts.rsc"), slug="sts")
+    assert len(models) == 3                      # 3 models x 3 slices -> 3 records
+    slugs = [m.slug for m in models]
+    assert len(set(slugs)) == 3
+    row = next(m for m in models if m.evals.get("sts") is not None)
+    assert row.evals["stsBigBenchAudio"] is not None
+    assert row.evals["stsAgenticElo"] is not None
+    assert row.evals["stsNonAgenticElo"] is not None

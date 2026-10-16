@@ -4,9 +4,13 @@ Three source shapes are supported:
 
 * ``from_leaderboard`` — the 50-key rows in the ``/leaderboards/models`` array.
   Here ``intelligenceIndexCostPerTask`` is a **plain float**.
-* ``from_chart`` — the 92-key model-page / eval-page chart records. Here
-  ``intelligenceIndexCostPerTask`` is a **dict** ``{"cost": {...},
-  "evaluations": [...]}`` and extra capability / briefcase fields exist.
+* ``from_chart`` — the 92-key model-page / eval-page chart records, plus the three
+  other per-model array shapes AA ships on a chart-set page: the Decision-Models
+  table (28 rows, ``indexScore`` + a ``scores`` map), the Multilingual Index page
+  (``multilingual`` + ``globalMmluLite`` language maps) and the on-device
+  benchmark set (``evalScores``). Here ``intelligenceIndexCostPerTask`` is a
+  **dict** ``{"cost": {...}, "evaluations": [...]}`` and extra capability /
+  briefcase fields exist.
 * ``from_legacy`` — the ``currentModel`` object on legacy/deprecated model pages.
 
 Eval values in :attr:`Model.evals` are stored **raw**: percentages stay as
@@ -32,7 +36,9 @@ per-evaluation rows carry a ``timePerTask``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
+
+from aa_mcp import catalog
 
 __all__ = ["Model", "from_chart", "from_leaderboard", "from_legacy", "merge"]
 
@@ -72,6 +78,11 @@ class Model:
     source: str
     value: float | None = None
     per_eval: list[dict] | None = None
+    #: AA's raw per-model breakdown maps (payload key -> map), kept verbatim so a
+    #: renderer can show the nested structure that the flattened sub-scores in
+    #: :attr:`evals` summarise (``briefcaseBreakdown``, ``opennessBreakdown``,
+    #: ``omniscienceBreakdown``, ``canonicalEvalTokenCounts``, …).
+    breakdowns: dict[str, dict] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -181,6 +192,80 @@ _CHART_EVAL_KEYS = (
     "cweBench", "cybergymE2e", "deepsecBench", "cyberIndex",
     "cweBenchRefusalRate", "cybergymE2eRefusalRate", "deepsecBenchRefusalRate",
     "globalMmluLiteScore", "mmluPro", "math500", "aa3dElo",
+    # 2026-10-16: flat scalars on the eval-page chart record (no map to walk).
+    "itbenchAvgTurnsPerTask", "enterpriseOpsGymAvgConversationTurns",
+    "medianCanonicalAnswerOutputSpeed",
+    # 2026-10-16: the speech / TTS / search boards' per-model metric columns
+    # (adapted into chart-shaped records by ``loaders._CHART_ADAPTERS``).
+    "sttWerIndex", "sttWordErrorRate", "sttEarnings22Wer", "sttVoxpopuliWer",
+    "sttAgenttalkWer",
+    "sttStreamingWerIndex", "sttStreamingEarnings22Wer", "sttStreamingAgenttalkWer",
+    "sttStreamingTimeToFinal", "sttStreamingTimeToFirstPartial",
+    "sts", "stsOverallElo", "stsAgenticElo", "stsNonAgenticElo",
+    "stsTaskCompletionRate",
+    "stsBigBenchAudio", "stsTauVoice", "stsArenaScore", "stsTaskSuccess",
+    "ttsQualityElo", "ttsPronunciationPassRate", "ttsTermPronunciation",
+    "ttsTextNormalization", "ttsSequenceFidelity", "ttsContextualDisambiguation",
+    "ttsCharactersPerSecond", "ttsGenerationTime",
+    "searchQualityIndex", "searchBrowsecompAccuracy", "searchDeepsearchqaF1",
+    "searchOmniscienceAccuracy", "searchAvgLatency", "searchCostPerQuery",
+    "searchCostPerTask", "searchQueriesPerTask", "searchQualityLift",
+)
+
+#: Decision-Models ``scores`` key -> canonical eval keys.  The four decision eval
+#: pages ship **one shared 28-row table whose ``scores`` blob is byte-identical**
+#: (5 keys); what differs per page is the primary ``metric`` its own config
+#: declares.  Every score is a 0-100 percentage, so it is rescaled to the 0-1
+#: fraction every other surface stores.  These are *decision-cohort* measurements:
+#: the same model's full-benchmark ``omniscienceAccuracy`` differs, so they get
+#: their own keys rather than overwriting the leaderboard columns.
+_DECISION_SCORES: dict[str, tuple[str, ...]] = {
+    "when2callAccuracy": ("when2call",),
+    "wildguardtestAverageF1": ("wildguardtest",),
+    "hleTextMcqAccuracy": ("hleMultichoice",),
+    "omniscienceAccuracy": ("omniscienceDecision",),
+    "omniscienceNonHallucinationRate": ("omniscienceDecisionNonHallucination",),
+}
+
+#: Breakdown payload key -> its scalar sub-scores:
+#: (path into the map, canonical eval key, scale).  ``scale`` is ``"pct"`` when the
+#: payload stores the value as 0-100 and ``"raw"`` when it is already canonical.
+_BREAKDOWN_SCALARS: dict[str, tuple[tuple[tuple[str, ...], str, str], ...]] = {
+    "briefcaseBreakdown": (
+        (("analyticalQuality", "elo"), "briefcaseAnalyticalQualityElo", "raw"),
+        (("presentation", "elo"), "briefcasePresentationElo", "raw"),
+        (("rubricPassRate",), "briefcaseRubricPassRate", "raw"),
+    ),
+    "aa3dBreakdown": ((("turns", "p50"), "aa3dTurnsP50", "raw"),),
+    "gdpvalBreakdown": ((("avgTurns",), "gdpvalAvgTurns", "raw"),),
+    "harveyLabBreakdown": (
+        (("criteriaPass",), "harveyCriteriaPass", "raw"),
+        (("gatedAllPass",), "harveyGatedAllPass", "raw"),
+    ),
+    "gdpPdfBreakdown": ((("macroCriterionPassRate",), "gdpPdfMacroPassRate", "raw"),),
+    "automationBenchBreakdown": (
+        (("strictScore",), "automationBenchStrictScore", "raw"),
+        (("completion",), "automationBenchCompletion", "raw"),
+    ),
+}
+
+#: Breakdown payload key -> its *map-valued* sub-scores: (path into the map or
+#: ``()`` for the map itself, canonical eval-key prefix).
+_BREAKDOWN_MAPS: dict[str, tuple[tuple[tuple[str, ...], str], ...]] = {
+    "opennessBreakdown": (((), "openness"),),
+    "omniscienceBreakdown": ((("byDomain",), "omniscience.domain"),
+                             (("bySweLanguage",), "omniscience.language")),
+    "terminalBenchSciencePassRateByDomain": (((), "terminalBenchScience.domain"),),
+    "enterpriseOpsGymSuccessRateByDomain": (((), "enterpriseOpsGym.domain"),),
+}
+
+#: Breakdown maps kept verbatim on :attr:`Model.breakdowns` (everything AA ships,
+#: including the nested ones whose leaves are not registered as rankables).
+_BREAKDOWN_KEYS = (
+    "briefcaseBreakdown", "aa3dBreakdown", "gdpvalBreakdown", "harveyLabBreakdown",
+    "gdpPdfBreakdown", "automationBenchBreakdown", "opennessBreakdown",
+    "omniscienceBreakdown", "terminalBenchSciencePassRateByDomain",
+    "enterpriseOpsGymSuccessRateByDomain", "canonicalEvalTokenCounts",
 )
 
 # Payload key spellings that differ from the canonical catalog key.
@@ -365,11 +450,164 @@ def _speed_chart(rec, per_eval: list[dict] | None = None) -> dict[str, float | N
     }
 
 
-def from_chart(rec: dict) -> Model:
-    """Build a :class:`Model` from a model-page / eval-page chart record."""
+def _pct(value) -> float | None:
+    """A 0-100 percentage as the 0-1 fraction every other surface stores."""
+    v = _num(value)
+    return v / 100.0 if v is not None else None
+
+
+def _dig(rec, path: tuple[str, ...]):
+    """Walk ``path`` into nested maps; ``None`` when any step is missing."""
+    cur = rec
+    for step in path:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(step)
+    return cur
+
+
+def _decision_scores(rec, primary_metric: str = "", primary_key: str = "") -> dict[str, float]:
+    """The Decision-Models ``scores`` map in canonical eval keys (see the table).
+
+    ``primary_metric``/``primary_key`` bind the evaluation the page *declares* as
+    its own (``{"metric":"when2callAccuracy"}``) to the benchmark that owns the
+    page's slug.  The table above covers the five keys today's shared blob carries;
+    the declared binding is what keeps a future page — whose blob may hold a key
+    this build has never seen — landing on the right benchmark.
+    """
+    scores = rec.get("scores")
+    if not isinstance(scores, dict):
+        return {}
+    out: dict[str, float] = {}
+    for src, keys in _DECISION_SCORES.items():
+        value = _pct(scores.get(src))
+        if value is None:
+            continue
+        for key in keys:
+            out[key] = value
+    if primary_key and primary_metric:
+        # the page's own declaration is authoritative for its own benchmark (for
+        # today's four pages it agrees with the table; a page whose blob names the
+        # evaluation differently would otherwise be ranked by the wrong column)
+        value = _pct(scores.get(primary_metric))
+        if value is not None:
+            out[primary_key] = value
+    return out
+
+
+def _mobile_scores(rec) -> dict[str, float]:
+    """The on-device ``evalScores`` map, namespaced ``mobile.<eval>``.
+
+    Unlike the Decision-Models table, this surface already stores its scores as
+    0-1 fractions, so no rescaling is applied.
+    """
+    scores = rec.get("evalScores")
+    if not isinstance(scores, dict):
+        return {}
+    out: dict[str, float] = {}
+    for name in catalog.MOBILE_EVALS:
+        entry = scores.get(name)
+        value = _num(entry.get("score")) if isinstance(entry, dict) else None
+        if value is not None:
+            out[f"mobile.{name}"] = value
+    return out
+
+
+def _multilingual_scores(rec) -> dict[str, float]:
+    """The Multilingual Index and its per-language split (0-1 fractions)."""
+    out: dict[str, float] = {}
+    block = rec.get("multilingual")
+    if isinstance(block, dict):
+        avg = _num(block.get("average"))
+        if avg is not None:
+            out["multilingual"] = avg
+        for code in catalog.MULTILINGUAL_LANGS:
+            value = _num(block.get(code))
+            if value is not None:
+                out[f"multilingual.{code}"] = value
+    lite = rec.get("globalMmluLite")
+    if isinstance(lite, dict):
+        avg = _num(lite.get("average"))
+        if avg is not None:
+            out.setdefault("globalMmluLiteScore", avg)
+    return out
+
+
+def _map_suffix(prefix: str, raw: str) -> str:
+    """The eval-key suffix for one key of a breakdown map (matches catalog)."""
+    if prefix == "omniscience.domain":
+        entry = catalog.OMNISCIENCE_DOMAINS.get(raw)
+        return entry[0] if entry else ""
+    if prefix == "omniscience.language":
+        return raw.lower()
+    return raw
+
+
+def _breakdown_fields(rec) -> tuple[dict[str, dict], dict[str, float]]:
+    """``(raw maps, flattened sub-scores)`` for AA's per-model breakdown keys.
+
+    Every map AA ships is kept verbatim on :attr:`Model.breakdowns`; the scalars
+    that are registered as rankables are additionally flattened into
+    :attr:`Model.evals` under the canonical keys :mod:`aa_mcp.catalog` defines, so
+    one eval-page fetch makes the whole breakdown rankable, not just readable.
+    """
+    raw: dict[str, dict] = {}
+    flat: dict[str, float] = {}
+    for key in _BREAKDOWN_KEYS:
+        block = rec.get(key)
+        if isinstance(block, dict) and block:
+            raw[key] = block
+    for key, specs in _BREAKDOWN_SCALARS.items():
+        block = rec.get(key)
+        if not isinstance(block, dict):
+            continue
+        for path, out_key, scale in specs:
+            value = _dig(block, path)
+            value = _pct(value) if scale == "pct" else _num(value)
+            if value is not None:
+                flat[out_key] = value
+    for key, specs in _BREAKDOWN_MAPS.items():
+        block = rec.get(key)
+        if not isinstance(block, dict):
+            continue
+        for path, prefix in specs:
+            mapping = _dig(block, path)
+            if not isinstance(mapping, dict):
+                continue
+            for raw_key, value in mapping.items():
+                suffix = _map_suffix(prefix, str(raw_key))
+                number = _num(value)
+                if suffix and number is not None:
+                    flat[f"{prefix}.{suffix}"] = number
+    return raw, flat
+
+
+def _contestant_slug(rec, slug: str) -> str:
+    """AA's Decision-Models contestant id is ``<host>_<model-slug>``.
+
+    The model slug is what every other surface uses, so it is restored here: that
+    is what lets a decision row join the leaderboard row for the same model (the
+    join :func:`loaders.index_models` performs by display name for the Decision
+    Index itself).  Only records that carry the decision table's ``scores`` map and
+    a ``hostName`` are rewritten, and only when the remainder is a single-segment
+    slug, so a genuine model slug is never mangled.
+    """
+    if not isinstance(rec.get("scores"), dict) or not rec.get("hostName"):
+        return slug
+    _host, sep, rest = slug.partition("_")
+    return rest if sep and rest and "_" not in rest else slug
+
+
+def from_chart(rec: dict, *, primary_metric: str = "",
+               primary_key: str = "") -> Model:
+    """Build a :class:`Model` from a model-page / eval-page chart record.
+
+    ``primary_metric``/``primary_key`` are supplied by the loader for a page that
+    declares its own primary evaluation (see :func:`_decision_scores`).
+    """
     if not isinstance(rec, dict):
         raise TypeError(f"from_chart expects a mapping, got {type(rec).__name__}")
-    slug = rec.get("slug") or ""
+    slug = _contestant_slug(rec, rec.get("slug") or "")
     name = rec.get("name") or slug
     creator, creator_slug = _creator(rec)
     _, deprecated_to = _release(rec)
@@ -377,6 +615,13 @@ def from_chart(rec: dict) -> Model:
     effort_label = effort.get("label") if isinstance(effort, dict) else None
 
     evals = _evals(rec, _CHART_EVAL_KEYS, _CHART_KEY_ALIASES)
+    for extra in (_decision_scores(rec, primary_metric, primary_key),
+                  _mobile_scores(rec), _multilingual_scores(rec)):
+        for key, value in extra.items():
+            evals.setdefault(key, value)
+    breakdowns, flat = _breakdown_fields(rec)
+    for key, value in flat.items():
+        evals.setdefault(key, value)
     briefcase_elo = _briefcase_elo(rec)
     if briefcase_elo is not None:
         evals["briefcaseElo"] = briefcase_elo
@@ -403,7 +648,9 @@ def from_chart(rec: dict) -> Model:
         effort=effort_label,
         params_b=_num(rec.get("parameters")),
         active_params_b=_num(rec.get("inferenceParametersActiveBillions")),
-        context_tokens=_int(rec.get("contextWindowTokens")),
+        # the on-device benchmark set reports the context it actually served
+        # (``servedContextTokens``) rather than the model's nominal window
+        context_tokens=_int(_get(rec, "contextWindowTokens", "servedContextTokens")),
         license=rec.get("licenseName"),
         license_url=rec.get("licenseUrl"),
         weights_url=rec.get("modelWeightsSourceUrl"),
@@ -422,6 +669,7 @@ def from_chart(rec: dict) -> Model:
         per_eval_cost=per_eval_cost,
         per_eval=per_eval,
         source="chart",
+        breakdowns=breakdowns,
     )
 
 
@@ -484,7 +732,7 @@ def from_legacy(rec: dict) -> Model:
 # merge
 # --------------------------------------------------------------------------- #
 
-_DICT_FIELDS = {"indices", "evals", "pricing", "speed"}
+_DICT_FIELDS = {"indices", "evals", "pricing", "speed", "breakdowns"}
 
 
 def merge(*models: Model) -> Model:

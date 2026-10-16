@@ -52,6 +52,8 @@ def cases() -> list[tuple[str, dict]]:
         ("aa_benchmark_leaderboard", {"benchmark": "capabilities.legal", "top": 2}),
         ("aa_leaderboard", {"sort": "openness", "top": 2}),
         ("aa_leaderboard", {"sort": "decisionIndex", "top": 2}),
+        # decision-family rankable carried by the rich dataset / chart set
+        ("aa_leaderboard", {"sort": "when2call", "top": 2}),
     ]
     # paid-data-API-only composites: every call must explain the gap and point at
     # the free constituents (see EXPECTED_FAILURES + CONTENT_CHECKS)
@@ -80,6 +82,8 @@ def cases() -> list[tuple[str, dict]]:
     out += [
         ("aa_leaderboard", {"top": 2, "creator": "anthropic"}),
         ("aa_leaderboard", {"top": 2, "name": "opus max"}),
+        # a name with no alphanumeric token matches nothing, never "everything"
+        ("aa_leaderboard", {"top": 2, "name": "-_-"}),
         ("aa_leaderboard", {"top": 2, "open_weights": True}),
         ("aa_leaderboard", {"top": 2, "reasoning": False}),
         ("aa_leaderboard", {"top": 2, "min_intelligence": 40, "max_cost_per_task": 1.0}),
@@ -195,6 +199,24 @@ def cases() -> list[tuple[str, dict]]:
         ("aa_pareto", {"x": "cost_per_task", "min_intelligence": 40,
                        "min_context": 200000, "top": 2}),
         ("aa_pareto", {"x": "Cost to Run the Intelligence Index", "top": 2}),
+        # a filter narrows the frontier pool; the footnote labels that as matches
+        ("aa_pareto", {"score": "capabilities.legal", "creator": "OpenAI", "top": 3}),
+        # a board-only column has rows but no Intelligence-Index cost: explained,
+        # never a made-up cost
+        ("aa_pareto", {"score": "ttsQualityElo", "top": 2}),
+    ]
+
+    # --- boards as their own namespace: TTS voices, STT hosts, search APIs -----
+    out += [
+        ("aa_compare", {"queries": ["Eleven v4 Turbo", "Sonic 3.6"],
+                        "metrics": "ttsPronunciationPassRate,ttsQualityElo"}),
+        ("aa_compare", {"queries": ["Scribe v2", "MAI-Transcribe-2"],
+                        "metrics": "sttEarnings22Wer"}),
+        ("aa_compare", {"queries": ["Perplexity Search", "Octen Search"],
+                        "metrics": "searchQualityIndex,searchCostPerQuery"}),
+        ("aa_search", {"query": "Eleven v4 Turbo"}),
+        # a language model and a board row are refused with an explanation
+        ("aa_compare", {"queries": ["claude-opus-5-5", "Eleven v4 Turbo"]}),
     ]
 
     # --- benchmarks: the rankable search index ------------------------------
@@ -237,6 +259,8 @@ def cases() -> list[tuple[str, dict]]:
     # Wave E: the hint audit — the call each ``how`` hint now points at succeeds
     out += [
         ("aa_benchmark_leaderboard", {"benchmark": "cyberIndex", "top": 2}),
+        # the estimate marker belongs to the displayed metric: Openness is real
+        ("aa_benchmark_leaderboard", {"benchmark": "openness", "top": 2}),
         ("aa_pareto", {"x": "tps", "top": 2}),
         # container benchmarks return an honest one-liner, never a TypeError (E2)
         ("aa_benchmark_leaderboard", {"benchmark": "aa3dBreakdown"}),
@@ -275,6 +299,14 @@ def cases() -> list[tuple[str, dict]]:
     # Wave G: a media field the board does not have is ignored, not fatal
     out.append(("aa_media", {"board": "text_to_image", "top": 2,
                              "fields": "elo,nonsense"}))
+    # per-category sub-boards: an image category and a TTS language, plus the two
+    # argument errors (unknown slug, and a speech panel that has no split)
+    out.append(("aa_media", {"board": "text_to_image", "category": "marketing-and-advertising",
+                             "top": 2}))
+    out.append(("aa_media", {"board": "text_to_speech_controlled", "category": "ja",
+                             "top": 2}))
+    out.append(("aa_media", {"board": "text_to_image", "category": "nope", "top": 2}))
+    out.append(("aa_media", {"board": "speech_to_text", "category": "ja", "top": 2}))
 
     # --- agents: every board ------------------------------------------------
     for board in sorted(loaders.AGENT_BOARDS):
@@ -340,7 +372,7 @@ EXPECTED_FAILURES: dict[tuple[str, str], str] = {
         "only) — the error names the free constituents to rank instead "
         "(terminalBench40, tau2, tauBanking, automationBenchPartialScore)",
     ("aa_benchmark_leaderboard", '{"benchmark": "hleDiamond", "top": 2}'):
-        "HLE Diamond has no values in the 700-row leaderboard, the eval chart "
+        "HLE Diamond has no values in the leaderboard, the eval chart "
         "set or the homepage panels — '+' reported as 'no data for benchmark'",
     ("aa_leaderboard", '{"sort": "mmluPro", "top": 2}'):
         "MMLU-Pro's only current values are on deprecated models; the default "
@@ -372,13 +404,22 @@ EXPECTED_FAILURES: dict[tuple[str, str], str] = {
     ("aa_compare", '{"queries": ["Grok Voice 3.0", "claude-opus-5-5"]}'):
         "mixing a language model and an arena-board entry is refused with an "
         "explanation instead of a broken table (E3)",
+    ("aa_compare", '{"queries": ["claude-opus-5-5", "Eleven v4 Turbo"]}'):
+        "mixing a language model and a board row (a TTS voice) is refused with the "
+        "same explanation, naming the board it belongs to (round-2 follow-up)",
+    ("aa_media", '{"board": "text_to_image", "category": "nope", "top": 2}'):
+        "an unknown category lists the board's published slugs instead of silently "
+        "ranking the overall board (round-2 follow-up)",
+    ("aa_media", '{"board": "speech_to_text", "category": "ja", "top": 2}'):
+        "the homepage speech panels publish no category split — category= is refused "
+        "with the reason, never ignored",
     ("aa_benchmark_leaderboard", '{"benchmark": "aa3dBreakdown"}'):
         "AA-3D Breakdown is a container benchmark: AA publishes per-model sub-score "
-        "maps, not a ranking column — an honest error naming the scalar sibling "
-        "aa3dElo, never a TypeError (E2)",
+        "maps, not a ranking column — an honest error naming a rankable sub-score "
+        "(aa3dTurnsP50) and the model-page breakdown path, never a TypeError (E2)",
     ("aa_benchmark_leaderboard", '{"benchmark": "harveyLabBreakdown"}'):
         "Harvey Breakdown is a container benchmark: same honest error naming "
-        "harveyLab (E2)",
+        "harveyCriteriaPass (E2)",
 }
 
 
@@ -397,6 +438,36 @@ _CONTENT_CHECKS: dict[tuple[str, str], tuple[tuple[str, ...], tuple[str, ...]]] 
         ("aa_benchmark_leaderboard", '{"benchmark": "agentic"}'),
     )
 }
+_CONTENT_CHECKS.update({
+    # a name with no alphanumeric token matches nothing, never the whole dataset
+    ("aa_leaderboard", '{"name": "-_-", "top": 2}'):
+        (("no models match",), ("| model |",)),
+    # a filtered frontier labels its denominator as the filtered pool
+    ("aa_pareto", '{"creator": "OpenAI", "score": "capabilities.legal", "top": 3}'):
+        (("matching your filters",), ()),
+    # the `*` estimate marker belongs to the Intelligence Index, not to Openness
+    ("aa_benchmark_leaderboard", '{"benchmark": "openness", "top": 2}'):
+        (("openness",), ("aa-estimated",)),
+    # fields=all asks for everything renderable — not an all-"-" column
+    ("aa_leaderboard", '{"fields": "all", "top": 2}'):
+        (("intel",), ("precision",)),
+    # a category call surfaces the slug it ranked
+    ("aa_media", '{"board": "text_to_image", "category": "marketing-and-advertising", "top": 2}'):
+        (("category=marketing-and-advertising",), ()),
+    # the container-benchmark error names a call that ranks something
+    ("aa_benchmark_leaderboard", '{"benchmark": "aa3dBreakdown"}'):
+        (("container benchmark", "aa3dturnsp50"), ("typeerror",)),
+    # the chatbot board's Feature Score is an absolute score out of 6, not a percentage
+    ("aa_agents", '{"board": "chatbots", "top": 2}'):
+        (("feature score", "out of 6"), ("%",)),
+    # board rows resolve by name and compare on the board's own columns
+    ("aa_compare", '{"metrics": "ttsPronunciationPassRate,ttsQualityElo", "queries": ["Eleven v4 Turbo", "Sonic 3.6"]}'):
+        (("board rows are their own namespace", "tts quality elo"), ()),
+    ("aa_compare", '{"metrics": "sttEarnings22Wer", "queries": ["Scribe v2", "MAI-Transcribe-2"]}'):
+        (("board rows are their own namespace", "earnings22"), ()),
+    ("aa_search", '{"query": "Eleven v4 Turbo"}'):
+        (("tts",), ()),
+})
 
 
 def _case_key(r: dict) -> tuple[str, str]:

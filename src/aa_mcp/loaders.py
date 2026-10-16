@@ -48,6 +48,7 @@ __all__ = [
     "BASE_URL",
     "CAPABILITY_INDEXES",
     "CAPABILITY_SUBLABELS",
+    "EXTRA_EVAL_PAGES",
     "INDEX_PAGES",
     "MEDIA_BOARDS",
     "SOURCE_URLS",
@@ -117,6 +118,30 @@ SOURCE_URLS: dict[str, str] = {
     "sitemap": "/sitemap.xml",
 }
 
+#: Chart-set slugs whose pages are **not** ``/evaluations/<slug>``.  All these
+#: surfaces ship the same kind of per-model model array as an eval page, so one
+#: chart-set code path serves them: ``/models/multilingual`` carries the
+#: Multilingual Index (``multilingual`` + ``globalMmluLite``) and the on-device
+#: benchmark set lives on ``/hardware-inference-stack/mobile-phones``.
+#:
+#: A slug may name **several** pages; ``eval_models`` unions them by model slug.
+#: Global-MMLU-Lite is charted on two pages whose selections *overlap*
+#: (``gemini-3-pro`` is on both): 5 rows on its eval page, 13 on the multilingual
+#: page, **17** distinct models in the union.
+EXTRA_EVAL_PAGES: dict[str, tuple[str, ...]] = {
+    "multilingual": ("/models/multilingual",),
+    "mobile": ("/hardware-inference-stack/mobile-phones",),
+    "global-mmlu-lite": ("/evaluations/global-mmlu-lite", "/models/multilingual"),
+    # the speech/search boards publish per-model metric columns rather than an
+    # ``initialModels`` chart set; ``parse_chart`` adapts their rows (see
+    # ``_CHART_ADAPTERS``) so the same ranking paths reach their metrics.
+    "stt": ("/speech-to-text/non-streaming",),
+    "stt_streaming": ("/speech-to-text/streaming",),
+    "sts": ("/speech-to-speech/arena",),
+    "tts": ("/text-to-speech/models",),
+    "search-api": ("/agents/search-api",),
+}
+
 #: AA capability-index key -> its page slug under ``/models/capabilities/``.
 #: These six pages are the only free source of a capability index's own
 #: ``subScores``; the index score itself also rides in the rich model-page dataset.
@@ -152,7 +177,9 @@ MEDIA_BOARDS: dict[str, str] = {
     "text_to_image": "/image/leaderboard/text-to-image",
     "image_editing": "/image/leaderboard/editing",
     "text_to_video": "/video/leaderboard/text-to-video",
+    "text_to_video_silent": "/video/leaderboard/text-to-video",
     "image_to_video": "/video/leaderboard/image-to-video",
+    "image_to_video_silent": "/video/leaderboard/image-to-video",
     "video_editing": "/video/leaderboard/video-editing",
     "text_to_speech": "/text-to-speech/leaderboard/provider-voice",
     "text_to_speech_controlled": "/text-to-speech/leaderboard/controlled-voice",
@@ -160,11 +187,33 @@ MEDIA_BOARDS: dict[str, str] = {
     "music_with_vocals": "/music/leaderboard/vocals",
 }
 
+#: Which of a video page's two arenas a board wants.  Both video leaderboards ship
+#: ``withAudioData`` **and** ``withoutAudioData``; they are distinct boards with
+#: distinct models (AA-Video-T2V v2.1 vs AA-Video-T2V-Silent v2.1, AA-Video-I2V
+#: v1.1 vs AA-Video-I2V-Silent v1.0), so the arena is picked by that reference
+#: rather than by document order.
+_ARENA_AUDIO_REF: dict[str, str] = {
+    "text_to_video": "withAudioData",
+    "text_to_video_silent": "withoutAudioData",
+    "image_to_video": "withAudioData",
+    "image_to_video_silent": "withoutAudioData",
+}
+
 #: agents board key -> absolute path on artificialanalysis.ai
 AGENT_BOARDS: dict[str, str] = {
     "coding_agents": "/agents/coding-agents",
     "chatbots": "/agents/chatbots",
     "search_api": "/agents/search-api",
+}
+
+#: speech board key (the key ``home_boards`` exposes) -> the page carrying the
+#: **full** board.  The homepage ships only a top-N panel for each of these; the
+#: dedicated page publishes the whole board, so ``home_boards`` prefers it and
+#: falls back to the panel when the page cannot be read.
+SPEECH_BOARDS: dict[str, str] = {
+    "stt": "/speech-to-text/non-streaming",
+    "stt_streaming": "/speech-to-text/streaming",
+    "sts": "/speech-to-speech/arena",
 }
 
 _PRECISIONS = ("fp4", "fp8", "fp16", "bf16", "int4", "int8", "awq", "gptq")
@@ -437,6 +486,7 @@ _MEDIA_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
 _MODEL_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
 _PROVIDER_ENDPOINTS_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
 _AGENTS_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
+_SPEECH_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
 _EVAL_MODELS_MEMO = _PayloadMemo(_MEMO_MAXSIZE)
 _PROVIDER_BOARD_MEMO = _PayloadMemo(1)
 _HOME_MEMO = _PayloadMemo(1)
@@ -450,6 +500,7 @@ def _clear_memos() -> None:
         _MODEL_MEMO,
         _PROVIDER_ENDPOINTS_MEMO,
         _AGENTS_MEMO,
+        _SPEECH_MEMO,
         _EVAL_MODELS_MEMO,
         _PROVIDER_BOARD_MEMO,
         _HOME_MEMO,
@@ -464,6 +515,23 @@ def _clear_memos() -> None:
 
 _LEADERBOARD_REQUIRED = ("slug", "intelligenceIndex")
 _CHART_REQUIRED = ("chartDefaultSelected", "releaseDate", "suffix")
+#: Other per-model array shapes a chart-set page may ship instead of
+#: ``initialModels``, tried in order: the Decision-Models table on
+#: ``/evaluations/{when2call,wildguardtest,hle-multichoice,aa-omniscience-decision}``
+#: (28 rows carrying ``indexScore`` + a ``scores`` map), the on-device benchmark
+#: set on ``/hardware-inference-stack/mobile-phones`` (90 rows carrying
+#: ``evalScores``), and the four speech/search boards that publish per-model metric
+#: columns rather than an eval chart set.  Each is probed on the first *dict* item,
+#: like ``_CHART_REQUIRED``.
+_CHART_FALLBACK_SHAPES: tuple[tuple[str, ...], ...] = (
+    ("indexScore", "scores", "byDataset"),
+    ("evalScores",),
+    ("aaWerIndex",),
+    ("aaWerStreamingIndex",),
+    ("sliceKey", "stsQualityIndexV2Score"),
+    ("pricePer1mCharacters", "isRepresentative"),
+    ("providerKey", "aaSearchQualityIndex"),
+)
 
 # cache key -> (fetch time, parsed list); guarded only by atomic rebinding
 _LEADERBOARD_MEMO: tuple[tuple[str, float], list[Model]] | None = None
@@ -577,24 +645,272 @@ def _resolve_refs(items: list, payload: str, pool: list | None) -> list[dict]:
     return out
 
 
-def parse_chart(text: str) -> list[Model]:
-    """Parse the ``initialModels`` chart set from a model or evaluation page.
+#: A chart-set page declares its primary evaluation in its own config
+#: (``{"metric":"when2callAccuracy","title":"When2Call: Accuracy"}``); the
+#: ``{name}: {metric}`` i18n templates are not declarations and are skipped.
+_PAGE_METRIC_RE = re.compile(r'"metric"\s*:\s*"([A-Za-z][A-Za-z0-9_]*)"')
 
-    On "rich" pages the array holds flight-reference strings into the sibling
-    ~700-entry dataset; those are resolved.  Non-dict entries are always skipped,
-    so a single odd entry can never crash a tool.
+
+def _model_obj(rec: dict) -> dict:
+    """The nested ``model`` object of a speech/TTS board row (``{}`` when absent)."""
+    model = rec.get("model")
+    return model if isinstance(model, dict) else {}
+
+
+def _endpoint_slug(rec: dict, model: dict, seen: set[str]) -> str:
+    """A stable per-endpoint slug: AA's ``hostApiId``, host-qualified on a clash.
+
+    ``hostsUrl`` names the *family* page (``/speech-to-text/models/azure`` covers
+    two different Microsoft models), so it cannot identify a row; ``hostApiId`` is
+    AA's own id for that host-model endpoint and is unique in practice.
+    """
+    host = rec.get("host") if isinstance(rec.get("host"), dict) else {}
+    base = (_clean(rec.get("hostApiId")) or _clean(model.get("slug"))
+            or _clean(rec.get("id")) or "")
+    slug = base
+    if slug and slug in seen:
+        host_slug = _clean(host.get("slug")) or ""
+        slug = f"{host_slug}/{base}" if host_slug else f"{base}-2"
+    seen.add(slug)
+    return slug
+
+
+def _adapt_stt(records: list[dict], payload: str) -> list[dict]:
+    """``/speech-to-text/non-streaming`` rows -> chart-shaped records."""
+    out = []
+    seen: set[str] = set()
+    for rec in records:
+        model = _model_obj(rec)
+        out.append({
+            "slug": _endpoint_slug(rec, model, seen),
+            "name": rec.get("name") or model.get("name"),
+            "shortName": rec.get("displayName"),
+            "creator": model.get("creator"),
+            "releaseDate": model.get("releaseDate"),
+            "isOpenWeights": model.get("openWeights"),
+            "sttWerIndex": rec.get("aaWerIndex"),
+            "sttWordErrorRate": rec.get("wordErrorRate"),
+            "sttEarnings22Wer": rec.get("earnings22CleanedWer"),
+            "sttVoxpopuliWer": rec.get("voxpopuliCleanedWer"),
+            "sttAgenttalkWer": rec.get("aaSttDatasetWer"),
+        })
+    return out
+
+
+def _adapt_stt_streaming(records: list[dict], payload: str) -> list[dict]:
+    """``/speech-to-text/streaming`` rows -> chart-shaped records."""
+    out = []
+    seen: set[str] = set()
+    for rec in records:
+        model = _model_obj(rec)
+        out.append({
+            "slug": _endpoint_slug(rec, model, seen),
+            "name": rec.get("name") or model.get("name"),
+            "shortName": rec.get("displayName") or rec.get("displayLabel"),
+            "creator": model.get("creator"),
+            "releaseDate": model.get("releaseDate"),
+            "isOpenWeights": model.get("openWeights"),
+            "sttStreamingWerIndex": rec.get("aaWerStreamingIndex"),
+            "sttStreamingEarnings22Wer": rec.get("earnings22StreamingWer"),
+            "sttStreamingAgenttalkWer": rec.get("aaAgenttalkStreamingWer"),
+            "sttStreamingTimeToFinal": rec.get("timeToFinalTranscriptSeconds"),
+            "sttStreamingTimeToFirstPartial": rec.get(
+                "timeToFirstPartialTranscriptSeconds"),
+        })
+    return out
+
+
+#: the four STS quality components the page publishes per model
+_STS_COMPONENTS = {
+    "bigBenchAudio": "stsBigBenchAudio",
+    "tau3Voice": "stsTauVoice",
+    "arenaScore": "stsArenaScore",
+    "taskSuccessRate": "stsTaskSuccess",
+}
+
+
+def _adapt_sts(records: list[dict], payload: str) -> list[dict]:
+    """``/speech-to-speech/arena`` rows -> one chart-shaped record per model.
+
+    The page ships three slices (``overall``, ``agentic``, ``non_agentic``) of the
+    same models.  Only ``overall`` carries the STS index and its components, so the
+    index and components come from that row while each slice's Elo is kept under
+    its own key — one record per model, never three rows for one model.
+    """
+    by_slug: dict[str, dict] = {}
+    for rec in records:
+        slug = _clean(rec.get("modelKey"))
+        if not slug:
+            continue
+        slice_key = str(rec.get("sliceKey") or "overall")
+        row = by_slug.setdefault(slug, {
+            "slug": slug,
+            "name": rec.get("name"),
+            "creator": {"name": rec.get("creatorName")},
+        })
+        if slice_key == "overall":
+            row["sts"] = rec.get("stsQualityIndexV2Score")
+            row["stsTaskCompletionRate"] = rec.get("taskCompletionRate")
+            row["stsOverallElo"] = rec.get("elo")
+            components = rec.get("stsQualityIndexV2Components")
+            if isinstance(components, dict):
+                for raw, key in _STS_COMPONENTS.items():
+                    entry = components.get(raw)
+                    if isinstance(entry, dict):
+                        row[key] = entry.get("score")
+        elif slice_key == "agentic":
+            row["stsAgenticElo"] = rec.get("elo")
+        elif slice_key == "non_agentic":
+            row["stsNonAgenticElo"] = rec.get("elo")
+    return list(by_slug.values())
+
+
+def _adapt_tts(records: list[dict], payload: str) -> list[dict]:
+    """``/text-to-speech/models`` rows -> chart-shaped records.
+
+    The page's pronunciation results are a separate 30-row array keyed by
+    ``ttsModelId`` (which matches each row's ``model.id``), so they are joined here.
+    """
+    pronunciation: dict[str, dict] = {}
+    try:
+        for rec in _first_dict_array(payload, ("ttsModelId",), min_len=1):
+            model_id = _clean(rec.get("ttsModelId"))
+            if model_id:
+                pronunciation[model_id] = rec
+    except ValueError:
+        pronunciation = {}
+    # AA marks one endpoint per model as representative; the dedupe that follows
+    # keeps the first record per slug, so put those first.
+    records = sorted(records, key=lambda r: not r.get("isRepresentative"))
+    out = []
+    for rec in records:
+        model = _model_obj(rec)
+        perf = rec.get("performance") if isinstance(rec.get("performance"), dict) else {}
+        row = {
+            # one row per TTS model: AA marks the endpoint it treats as the model's
+            # representative, and the quality/pronunciation metrics are model-level
+            "slug": _clean(model.get("slug")) or _clean(rec.get("slug")),
+            "name": rec.get("name") or model.get("name"),
+            "shortName": rec.get("shortName") or model.get("shortName"),
+            "creator": model.get("creator"),
+            "releaseDate": model.get("releaseDate"),
+            "isOpenWeights": model.get("isOpenWeights"),
+            "ttsQualityElo": model.get("qualityElo"),
+            "ttsCharactersPerSecond": perf.get("medianCharactersPerSecond"),
+            "ttsGenerationTime": perf.get("medianGenerationTimeSeconds"),
+        }
+        pron = pronunciation.get(_clean(model.get("id")) or "")
+        if pron is not None:
+            overall = pron.get("overall") if isinstance(pron.get("overall"), dict) else {}
+            row["ttsPronunciationPassRate"] = overall.get("passRate")
+            categories = pron.get("categories")
+            if isinstance(categories, dict):
+                for raw, key in (
+                    ("term_pronunciation", "ttsTermPronunciation"),
+                    ("text_normalization", "ttsTextNormalization"),
+                    ("sequence_fidelity", "ttsSequenceFidelity"),
+                    ("contextual_disambiguation", "ttsContextualDisambiguation"),
+                ):
+                    entry = categories.get(raw)
+                    if isinstance(entry, dict):
+                        row[key] = entry.get("passRate")
+        out.append(row)
+    return out
+
+
+def _adapt_search_api(records: list[dict], payload: str) -> list[dict]:
+    """``/agents/search-api`` rows -> chart-shaped records (one per provider)."""
+    out = []
+    for rec in records:
+        out.append({
+            "slug": _clean(rec.get("providerKey")),
+            "name": rec.get("providerName"),
+            "shortName": rec.get("providerVariant"),
+            "creator": {"name": rec.get("providerFamily")},
+            "searchQualityIndex": rec.get("aaSearchQualityIndex"),
+            "searchBrowsecompAccuracy": rec.get("browsecompAccuracy"),
+            "searchDeepsearchqaF1": rec.get("deepsearchqaAvgF1"),
+            "searchOmniscienceAccuracy": rec.get("omniscienceAccuracy"),
+            "searchAvgLatency": rec.get("avgLatencyS"),
+            "searchCostPerQuery": rec.get("costPerSearchQueryUsd"),
+            "searchCostPerTask": rec.get("searchApiCostPerTaskUsd"),
+            "searchQueriesPerTask": rec.get("searchQueriesPerTask"),
+            "searchQualityLift": rec.get("qualityIndexLiftVsModelOnly"),
+        })
+    return out
+
+
+#: fallback shape -> the adapter that turns its rows into chart-shaped records
+_CHART_ADAPTERS: dict[tuple[str, ...], object] = {
+    ("aaWerIndex",): _adapt_stt,
+    ("aaWerStreamingIndex",): _adapt_stt_streaming,
+    ("sliceKey", "stsQualityIndexV2Score"): _adapt_sts,
+    ("pricePer1mCharacters", "isRepresentative"): _adapt_tts,
+    ("providerKey", "aaSearchQualityIndex"): _adapt_search_api,
+}
+
+
+def _page_metric(payload: str) -> str:
+    """The evaluation a page's own config names as its primary metric (``""`` if none)."""
+    for match in _PAGE_METRIC_RE.finditer(payload):
+        return match.group(1)
+    return ""
+
+
+def _benchmark_key_for_slug(slug: str) -> str:
+    """The benchmark key that owns chart-set ``slug`` (``""`` when none does)."""
+    if not slug:
+        return ""
+    for bench in catalog.BENCHMARKS.values():
+        if bench.slug == slug:
+            return bench.key
+    return ""
+
+
+def parse_chart(text: str, *, slug: str = "") -> list[Model]:
+    """Parse the model array a chart-set page ships.
+
+    Preferred shape is ``initialModels`` (model pages, eval pages, capability-like
+    charts). On "rich" pages that array holds flight-reference strings into the
+    sibling ~700-entry dataset; those are resolved.  Pages without ``initialModels``
+    are read through :data:`_CHART_FALLBACK_SHAPES` — the Decision-Models table and
+    the on-device benchmark set both publish their per-model rows that way.  Non-dict
+    entries are always skipped, so a single odd entry can never crash a tool.
+
+    ``slug`` is the chart-set slug the page was fetched for (``eval_models`` knows
+    it).  It lets the Decision-Models page's **own declared metric** bind to the
+    benchmark that owns that slug, so a future page whose ``scores`` blob carries a
+    key this build has never seen still lands on the right benchmark.
     """
     payload = flight.payload(text)
     items = _initial_models_items(payload)
+    shape: tuple[str, ...] | None = None
     if items is None:
-        try:
-            found = flight.find_array(payload, _CHART_REQUIRED)
-        except LookupError:
-            found = []
+        found: list = []
+        for candidate in (_CHART_REQUIRED, *_CHART_FALLBACK_SHAPES):
+            try:
+                found = flight.find_array(payload, candidate)
+            except LookupError:
+                continue
+            if found:
+                shape = candidate
+                break
         records = [rec for rec in found if isinstance(rec, dict)]
+        adapter = _CHART_ADAPTERS.get(shape or ())
+        if adapter is not None and records:
+            records = adapter(records, payload)  # type: ignore[operator]
     else:
         pool = _rich_records(payload) if any(isinstance(i, str) for i in items) else None
         records = _resolve_refs(items, payload, pool)
+    # The Decision-Models table is the one shape that declares a page-level
+    # primary metric; bind it to the benchmark that owns this slug.
+    if records and isinstance(records[0].get("scores"), dict):
+        primary_key = _benchmark_key_for_slug(slug)
+        metric = _page_metric(payload) if primary_key else ""
+        if primary_key and metric:
+            return [normalize.from_chart(rec, primary_metric=metric,
+                                         primary_key=primary_key)
+                    for rec in records]
     return [normalize.from_chart(rec) for rec in records]
 
 
@@ -1110,8 +1426,177 @@ def parse_home_boards(text: str) -> dict[str, list[dict]]:
     return out
 
 
+def _first_dict_array(payload: str, required: tuple[str, ...],
+                      min_len: int = 2) -> list[dict]:
+    """The longest array of dicts whose first item carries ``required``.
+
+    Every surface here ships its rows inline; only the first *dict* element is
+    probed, so a leading flight-reference string is tolerated.
+    """
+    arrays = [a for _index, a in flight.find_arrays_at(payload, required, min_len=min_len)
+              if a and isinstance(a[0], dict)]
+    if not arrays:
+        raise ValueError(
+            f"no row array carrying {sorted(required)} was found in the payload"
+        )
+    return max(arrays, key=len)
+
+
+def _speech_slug(rec: dict, model: dict) -> str:
+    """The AA slug of a speech row (``hostsUrl`` last segment, else ``hostApiId``)."""
+    url_path = _clean(rec.get("hostsUrl"))
+    if url_path:
+        tail = str(url_path).rstrip("/").rsplit("/", 1)[-1]
+        if tail:
+            return tail
+    return _clean(rec.get("hostApiId")) or ""
+
+
+def _stt_speech_row(rec: dict, streaming: bool) -> dict:
+    """One ``/speech-to-text/*`` row, in the key space the speech boards use."""
+    model = rec.get("model") if isinstance(rec.get("model"), dict) else {}
+    host = rec.get("host") if isinstance(rec.get("host"), dict) else {}
+    creator = model.get("creator") if isinstance(model.get("creator"), dict) else {}
+    perf = rec.get("performance") if isinstance(rec.get("performance"), dict) else {}
+    index_key = "aaWerStreamingIndex" if streaming else "aaWerIndex"
+    row = {
+        "name": _clean(rec.get("name")) or _clean(model.get("name")),
+        "slug": _speech_slug(rec, model),
+        "creatorName": _clean(creator.get("name")) or _clean(host.get("name")),
+        "hostName": _clean(host.get("name")),
+        "werIndex": _num(rec.get(index_key)),
+        "release_date": _clean(model.get("releaseDate")),
+        "price": _num(rec.get("pricePer1kMinutes")),
+        "price_unit": "/1k min",
+        "open_weights": _flag(model.get("openWeights")),
+        "url": _clean(rec.get("hostsUrl")),
+        "extra": {},
+    }
+    if streaming:
+        row["timeToFinalTranscriptSeconds"] = _num(rec.get("timeToFinalTranscriptSeconds"))
+        row["timeToFirstPartialTranscriptSeconds"] = _num(
+            rec.get("timeToFirstPartialTranscriptSeconds"))
+    row["extra"] = {
+        key: rec[key] for key in (
+            "aaSttDatasetWer", "earnings22CleanedWer", "voxpopuliCleanedWer",
+            "wordErrorRate", "aaAgenttalkStreamingWer", "earnings22StreamingWer",
+            "aaWerStreamingFirstPartialAfterSpeechEnd",
+            "aaAgenttalkTimeToFinalTranscriptSeconds",
+            "aaAgenttalkTimeToFirstPartialTranscriptSeconds",
+            "medianSpeedFactor",
+        )
+        if _num(rec.get(key)) is not None
+    }
+    if _num(perf.get("medianSpeedFactor")) is not None:
+        row["extra"].setdefault("medianSpeedFactor", _num(perf.get("medianSpeedFactor")))
+    return row
+
+
+def _sts_speech_row(rec: dict, slice_key: str) -> dict:
+    """One ``/speech-to-speech/arena`` row, in the key space the STS panel uses."""
+    components = rec.get("stsQualityIndexV2Components")
+    components = components if isinstance(components, dict) else {}
+    return {
+        "name": _clean(rec.get("name")),
+        "slug": _clean(rec.get("modelKey")),
+        "hostName": _clean(rec.get("creatorName")),
+        "creatorName": _clean(rec.get("creatorName")),
+        "stsIndex": _num(rec.get("stsQualityIndexV2Score")),
+        "elo": _num(rec.get("elo")),
+        "sliceKey": slice_key,
+        "appearances": _int(rec.get("appearances")),
+        "rank": _int(rec.get("rank")),
+        "taskCompletionRate": _num(rec.get("taskCompletionRate")),
+        "release_date": None,
+        "price": None,
+        "price_unit": None,
+        "open_weights": None,
+        "url": None,
+        "extra": {
+            key: _num(entry.get("score"))
+            for key, entry in components.items()
+            if isinstance(entry, dict) and _num(entry.get("score")) is not None
+        },
+    }
+
+
+def parse_speech_board(text: str, board: str) -> list[dict]:
+    """The **full** rows of one :data:`SPEECH_BOARDS` page, best first.
+
+    * ``stt`` / ``stt_streaming`` — every row of the page's host-model table
+      (``aaWerIndex`` / ``aaWerStreamingIndex``), ranked by word-error rate
+      (lower is better).
+    * ``sts`` — the page's ``overall`` slice, one row per model (the ``agentic``
+      and ``non_agentic`` slices are the same models ranked in another context and
+      would otherwise duplicate every row); ranked by the STS index, best first.
+    """
+    payload = flight.payload(text)
+    if board == "sts":
+        records = [r for r in _first_dict_array(payload, ("sliceKey",), min_len=2)
+                   if isinstance(r, dict)]
+        rows = [_sts_speech_row(r, str(r.get("sliceKey") or "overall"))
+                for r in records if (r.get("sliceKey") or "overall") == "overall"]
+        rows.sort(key=lambda r: (r["stsIndex"] is None, -(r["stsIndex"] or 0.0)))
+        return rows
+    streaming = board == "stt_streaming"
+    records = _first_dict_array(
+        payload, ("aaWerStreamingIndex",) if streaming else ("aaWerIndex",), min_len=2)
+    rows = [_stt_speech_row(r, streaming) for r in records if isinstance(r, dict)]
+    rows.sort(key=lambda r: (r["werIndex"] is None, r["werIndex"] or 0.0))
+    return rows
+
+
+def speech_board(board: str, refresh: bool = False) -> list[dict]:
+    """Full rows for one of :data:`SPEECH_BOARDS` (memoised)."""
+    try:
+        path = SPEECH_BOARDS[board]
+    except KeyError:
+        raise ValueError(
+            f"unknown speech board {board!r}; expected one of "
+            f"{', '.join(sorted(SPEECH_BOARDS))}"
+        ) from None
+    source_url = url(path)
+    got = fetch.get(source_url, f"speech_{board}", refresh=refresh)
+    key = (str(got.path), got.fetched_at)
+    if not refresh:
+        memo = _SPEECH_MEMO.get(key)
+        if memo is not _MISS:
+            return memo
+    try:
+        rows = parse_speech_board(got.text, board)
+    except ValueError as exc:
+        raise _parse_error(exc, got.path, source_url) from exc
+    _SPEECH_MEMO.put(key, rows)
+    return rows
+
+
+def _full_speech_boards(boards: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    """Replace the homepage speech panels with the full boards where readable.
+
+    AA renders only a top-N panel for each speech board on the homepage; the
+    dedicated page carries the whole board.  A page that cannot be read (offline,
+    or a payload that changed shape) leaves the panel in place, so the tool keeps
+    working on the narrower data rather than failing.
+    """
+    for board in SPEECH_BOARDS:
+        try:
+            rows = speech_board(board)
+        except (AAFetchError, ValueError) as exc:
+            log.debug("full speech board %s unavailable (%s); using the panel", board, exc)
+            continue
+        if rows:
+            boards[board] = rows
+    return boards
+
+
 def home_boards(refresh: bool = False) -> dict[str, list[dict]]:
-    """Homepage speech boards and per-eval top panels."""
+    """Homepage speech boards and per-eval top panels.
+
+    The three speech keys (``stt``, ``stt_streaming``, ``sts``) carry the **full**
+    board from the dedicated page when it can be read, and the homepage's top-N
+    panel otherwise — the panel is the same metric on a shorter list, never a
+    different board.  The ``eval:<slug>`` keys are the homepage's own panels.
+    """
     source_url = url(SOURCE_URLS["home"])
     got = fetch.get(source_url, "home", refresh=refresh, min_bytes=100_000)
     key = (str(got.path), got.fetched_at)
@@ -1119,7 +1604,7 @@ def home_boards(refresh: bool = False) -> dict[str, list[dict]]:
         memo = _HOME_MEMO.get(key)
         if memo is not _MISS:
             return memo
-    boards = parse_home_boards(got.text)
+    boards = _full_speech_boards(parse_home_boards(got.text))
     if not any(boards.values()):
         raise ValueError(
             f"{source_url}: no speech board or eval panel found in the payload — "
@@ -1146,6 +1631,9 @@ _MEDIA_BOARD_KEYS: dict[str, tuple[str, ...]] = {
     "text_to_speech_controlled": ("name", "elo", "pricePer1mCharacters"),
     "music_instrumental": ("name", "elo"),
     "music_with_vocals": ("name", "elo"),
+    # the silent video boards carry the rows of their audio siblings
+    "text_to_video_silent": ("name", "elo", "pricePerMinute"),
+    "image_to_video_silent": ("name", "elo", "pricePerMinute"),
 }
 _DEFAULT_MEDIA_KEYS = ("name", "elo")
 
@@ -1249,21 +1737,87 @@ def _arena_slot(payload: str, index: int) -> bool:
     (``32:[[null,[<rows>]]]``) or the value of an object field
     (``"initialData":[<rows>]`` — how the music pages ship it).  The
     per-category subsets are *elements* of a surrounding array
-    (``["<category>",[<rows>]]``) and never match.
+    (``["<category>",[<rows>]]``) and never match.  Only the few characters
+    before ``index`` are inspected, so this stays O(1) on a multi-megabyte
+    payload (slicing ``payload[:index]`` would copy it).
     """
-    prefix = payload[:index].rstrip()
-    return prefix.endswith(("[null,", '":'))
+    i = index - 1
+    while i >= 0 and payload[i] in " \t\r\n":
+        i -= 1
+    return payload[max(0, i - 5):i + 1].endswith(("[null,", '":'))
+
+
+#: how far back from an array's ``[`` the ``["<category-slug>",`` wrapper can start
+_ARENA_CATEGORY_WINDOW = 96
+_ARENA_CATEGORY_RE = re.compile(r'\["([a-z0-9][a-z0-9._-]*)"\s*,\s*$')
+#: a category declared as a *reference* to another flight line:
+#: ``["assistants","$Q47d"]`` (how the TTS provider-voice use-case boards ship)
+_ARENA_CATEGORY_REF_RE = re.compile(r'\["([a-z0-9][a-z0-9._-]*)","(\$[^"]+)"\]')
+#: the board-config keys that name an arena, precompiled (see ``_ARENA_AUDIO_REF``)
+_ARENA_REF_RES: dict[str, re.Pattern[str]] = {
+    _key: re.compile(r'"' + re.escape(_key) + r'"\s*:\s*"(\$[^"]*)"')
+    for _key in set(_ARENA_AUDIO_REF.values())
+}
+
+
+def _arena_ref(payload: str, key: str) -> str | None:
+    """The flight reference a page's board config stores under ``key``.
+
+    Both video leaderboards name their two arenas this way
+    (``"withAudioData":"$Q3a","withoutAudioData":"$Q281"``); the value is a
+    reference to the flight line that holds that arena.
+    """
+    pattern = _ARENA_REF_RES.get(key)
+    if pattern is None:
+        return None
+    match = pattern.search(payload)
+    return match.group(1) if match else None
+
+
+def _flight_ref_line(payload: str, ref: str) -> tuple[int, int] | None:
+    """``(start, end)`` payload span of the flight line a reference names.
+
+    ``$Q3a`` names the record on the ``3a:`` line (the ``$Q`` prefix is Next.js's
+    "quoted reference" marker; a bare ``$`` is also accepted).  The line's value is
+    ``[[null,[<rows>]]]``, so callers match the *inner* array by span rather than by
+    the line's first ``[``.
+    """
+    token = str(ref).lstrip("$")
+    if token.startswith("Q"):
+        token = token[1:]
+    if not re.fullmatch(r"[0-9a-fA-F]+", token):
+        return None
+    prefix = token + ":"
+    at = payload.find("\n" + prefix)
+    start = at + 1 if at >= 0 else (0 if payload.startswith(prefix) else -1)
+    if start < 0:
+        return None
+    end = payload.find("\n", start + len(prefix))
+    return start, (len(payload) if end < 0 else end)
+
+
+def _arena_category(payload: str, index: int) -> str | None:
+    """The category slug of the sub-board array at ``index``, if it is one.
+
+    AA ships each category as an element of the board array,
+    ``["<category-slug>",[<rows>]]``, so the slug is the string literal directly
+    before the ``[``.  Only the tail of the payload is inspected, so this stays
+    O(1) per array.
+    """
+    match = _ARENA_CATEGORY_RE.search(payload[max(0, index - _ARENA_CATEGORY_WINDOW):index])
+    return match.group(1) if match else None
 
 
 def _media_arena(payload: str, board: str) -> list[dict]:
     """The arena array that belongs to ``board``.
 
     Selection is validated in two steps — the rows must carry the board's
-    expected keys *and* the array must sit in an arena slot — and then takes the
-    first slot in document order, which is the page's own board. Later slots hold
-    *other* boards' arenas (the TTS capture carries five, the video capture two:
-    ``AA-Video-T2V v2.1`` and ``AA-Video-T2V-Silent v2.1``), and a payload whose
-    own arena is missing is a clear error rather than a smaller board (A34).
+    expected keys *and* the array must sit in an arena slot — and then picks the
+    slot the page's config names for this board.  The video pages ship **two**
+    arenas (``withAudioData`` and ``withoutAudioData``), so the board's own
+    reference decides; every other board falls back to the first slot in document
+    order, which is the page's own board.  A payload whose own arena is missing is
+    a clear error rather than a smaller board (A34).
     """
     label = board or "media page"
     candidates = flight.find_arrays_at(payload, ("values", "formatted"))
@@ -1288,21 +1842,89 @@ def _media_arena(payload: str, board: str) -> list[dict]:
             f"{len(matching)} remaining array(s) with keys {sorted(required)} are "
             "per-category subsets — refusing to serve one of them as the board"
         )
+    ref_key = _ARENA_AUDIO_REF.get(board)
+    if ref_key:
+        ref = _arena_ref(payload, ref_key)
+        span = _flight_ref_line(payload, ref) if ref else None
+        if span is not None:
+            lo, hi = span
+            for index, rows in slots:
+                if lo <= index < hi:
+                    return rows
+            raise ValueError(
+                f"{label}: the payload's {ref_key} arena ({ref}) is not a row array "
+                "carrying the expected keys — refusing to serve the other variant"
+            )
     _index, rows = slots[0]
     return rows
 
 
-def parse_media(text: str, board: str = "") -> list[dict]:
-    """Parse one media arena page into flat rows sorted by Elo (best first)."""
+def _ref_rows(payload: str, ref: str) -> list[dict] | None:
+    """The ``values``/``formatted`` row array on the flight line a reference names."""
+    span = _flight_ref_line(payload, ref)
+    if span is None:
+        return None
+    lo, hi = span
+    for index, rows in flight.find_arrays_at(payload, ("values", "formatted")):
+        if lo <= index < hi and rows and isinstance(rows[0], dict):
+            return rows
+    return None
+
+
+def _media_categories(payload: str) -> dict[str, list[dict]]:
+    """Every category sub-board of a media page, keyed by its slug.
+
+    AA ships a sub-board either inline as a ``["<slug>",[<rows>]]`` element of the
+    board array, or — on the TTS provider-voice page — as a ``["<slug>","$Q…"]``
+    pair pointing at the flight line that holds its rows.  Both forms are read.
+    """
+    out: dict[str, list[dict]] = {}
+    for index, rows in flight.find_arrays_at(payload, ("values", "formatted")):
+        if _arena_slot(payload, index):
+            continue  # the board itself, not a category
+        slug = _arena_category(payload, index)
+        if slug and rows and isinstance(rows[0], dict):
+            out.setdefault(slug, rows)
+    for match in _ARENA_CATEGORY_REF_RE.finditer(payload):
+        slug, ref = match.group(1), match.group(2)
+        if slug in out:
+            continue
+        rows = _ref_rows(payload, ref)
+        if rows:
+            out[slug] = rows
+    return out
+
+
+def parse_media(text: str, board: str = "", category: str = "") -> list[dict]:
+    """Parse one media arena page into flat rows sorted by Elo (best first).
+
+    ``category`` selects one of the page's per-category sub-boards by its slug
+    (e.g. ``marketing-and-advertising``, ``en-us``); an unknown slug raises rather
+    than silently returning the overall board.
+    """
     payload = flight.payload(text)
-    arena = _media_arena(payload, board)
+    if category:
+        arena = _media_categories(payload).get(category)
+        if arena is None:
+            known = ", ".join(sorted(_media_categories(payload))) or "none"
+            raise ValueError(
+                f"unknown category {category!r} for board {board or 'media page'!r} "
+                f"— published categories: {known}"
+            )
+    else:
+        arena = _media_arena(payload, board)
     rows = [_media_row(item) for item in arena if isinstance(item, dict)]
     rows.sort(key=lambda r: (r["elo"] is None, -(r["elo"] or 0.0)))
     return rows
 
 
-def media(board: str, refresh: bool = False) -> list[dict]:
-    """Leaderboard rows for one of :data:`MEDIA_BOARDS`."""
+def media(board: str, refresh: bool = False, category: str = "") -> list[dict]:
+    """Leaderboard rows for one of :data:`MEDIA_BOARDS`.
+
+    ``category`` selects one of the board's per-category sub-boards (AA publishes
+    those as ``["<slug>",[<rows>]]`` elements of the board array); the cache key
+    includes it so the overall board and a category never collide.
+    """
     try:
         path = MEDIA_BOARDS[board]
     except KeyError:
@@ -1312,13 +1934,13 @@ def media(board: str, refresh: bool = False) -> list[dict]:
         ) from None
     source_url = url(path)
     got = fetch.get(source_url, f"media_{board}", refresh=refresh)
-    key = (str(got.path), got.fetched_at)
+    key = (str(got.path), got.fetched_at, category)
     if not refresh:
         memo = _MEDIA_MEMO.get(key)
         if memo is not _MISS:
             return memo
     try:
-        rows = parse_media(got.text, board)
+        rows = parse_media(got.text, board, category)
     except ValueError as exc:
         raise ValueError(f"{exc} — {_refresh_note(got.path, source_url)}") from exc
     _MEDIA_MEMO.put(key, rows)
@@ -1629,29 +2251,46 @@ def agents(board: str, refresh: bool = False) -> list[dict]:
 
 
 def eval_models(slug: str, refresh: bool = False) -> list[Model]:
-    """Top-N chart set for one ``/evaluations/<slug>`` page, best first.
+    """Chart set for one chart-set slug, best first.
 
+    ``slug`` is normally an ``/evaluations/<slug>`` page; :data:`EXTRA_EVAL_PAGES`
+    names the slugs whose chart set lives elsewhere (``multilingual``, ``mobile``)
+    or on more than one page (``global-mmlu-lite``, whose two overlapping
+    selections union to 17 models).  Multi-page slugs are unioned by model slug,
+    first page wins.
     "Best" follows :attr:`catalog.Metric.better`: lower-is-better evaluations
     (hallucination/refusal rates) are ranked lowest-first (audit H2).
     """
-    path = SOURCE_URLS["eval"].format(slug=slug)
-    source_url = url(path)
-    got = fetch.get(source_url, f"eval_{slug}", refresh=refresh)
-    key = (str(got.path), got.fetched_at)
+    paths = EXTRA_EVAL_PAGES.get(slug) or (SOURCE_URLS["eval"].format(slug=slug),)
+    fetched = []
+    for index, path in enumerate(paths):
+        # the first page keeps the historical cache name, so nothing re-downloads
+        name = f"eval_{slug}" if index == 0 else f"eval_{slug}_{index}"
+        fetched.append((path, fetch.get(url(path), name, refresh=refresh)))
+    key = tuple((str(got.path), got.fetched_at) for _path, got in fetched)
     if not refresh:
         memo = _EVAL_MODELS_MEMO.get(key)
         if memo is not _MISS:
             return memo
-    try:
-        models = parse_chart(got.text)
-    except LookupError as exc:
-        raise _parse_error(exc, got.path, source_url) from exc
-    if not models:
-        raise ValueError(
-            f"{source_url}: no 'initialModels' chart set found in the payload — "
-            f"{_refresh_note(got.path, source_url)}"
-        )
-    _validate(models, path=got.path, url=source_url)
+    models: list[Model] = []
+    seen: set[str] = set()
+    for path, got in fetched:
+        source_url = url(path)
+        try:
+            parsed = parse_chart(got.text, slug=slug)
+        except LookupError as exc:
+            raise _parse_error(exc, got.path, source_url) from exc
+        if not parsed:
+            raise ValueError(
+                f"{source_url}: no per-model array found in the payload — "
+                f"{_refresh_note(got.path, source_url)}"
+            )
+        for model in parsed:
+            if model.slug and model.slug not in seen:
+                seen.add(model.slug)
+                models.append(model)
+    first_path, first_got = fetched[0]
+    _validate(models, path=first_got.path, url=url(first_path))
     bench = catalog.benchmark(slug)
     if bench is not None:
         bench_key = bench.key
@@ -1858,6 +2497,10 @@ def parse_capability_index(text: str) -> list[dict]:
         )
     rows: list[dict] = []
     for rec in max(arrays, key=len):
+        # arrays may lead with flight-reference strings (the scan probes the first
+        # *dict* element), so only dict records can be read.
+        if not isinstance(rec, dict):
+            continue
         slug = rec.get("slug")
         score = _num(rec.get("weightedIndex"))
         if not slug or score is None:
@@ -1890,6 +2533,10 @@ def parse_index_rows(text: str, score_key: str) -> list[dict]:
         raise LookupError(f"no {score_key!r} array found in the payload")
     rows: list[dict] = []
     for rec in max(arrays, key=len):
+        # arrays may lead with flight-reference strings (the scan probes the first
+        # *dict* element), so only dict records can be read.
+        if not isinstance(rec, dict):
+            continue
         score = _num(rec.get(score_key))
         if score is None:
             continue

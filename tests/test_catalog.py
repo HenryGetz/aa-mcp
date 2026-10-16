@@ -44,7 +44,7 @@ def test_all_33_eval_slugs_are_covered():
 def test_benchmarks_have_unit_and_desc():
     for b in catalog.BENCHMARKS.values():
         assert b.unit in ("%", "Elo", "index", "mixed", "s", "tok/s", "USD/task",
-                          "text")
+                          "chars/s", "USD/query", "text")
         assert b.desc and b.key
 
 
@@ -238,12 +238,27 @@ def test_source_hint_values_are_known_and_counted():
 
 
 def test_untracked_benchmarks_notes_are_factual():
-    for key in ("mathvista", "docvqa", "bfcl", "berkeley function calling",
-                "human eval", "humaneval", "mbpp", "chatbot arena",
-                "lmsys arena", "mt-bench", "alpaca eval"):
+    for key in ("mathvista", "docvqa", "human eval", "humaneval", "mbpp",
+                "chatbot arena", "lmsys arena", "mt-bench", "alpaca eval"):
         note = catalog.UNTRACKED_BENCHMARKS[key]
         assert note.startswith("AA does not track")
         assert len(note) > 40
+
+
+def test_partially_tracked_benchmark_notes_name_the_real_surface():
+    """BFCL/IFStruct are *not* untracked: AA publishes them on the on-device set.
+
+    The note must say so (and point at the surface) rather than claiming AA has
+    nothing — that claim was wrong until 2026-10-16.
+    """
+    for key in ("bfcl", "berkeley function calling"):
+        note = catalog.UNTRACKED_BENCHMARKS[key]
+        assert "AA tracks BFCL only on its on-device benchmark set" in note
+        assert "/hardware-inference-stack/mobile-phones" in note
+        assert "bfcl_500" in note and "bfcl_small" in note
+    ifstruct = catalog.UNTRACKED_BENCHMARKS["ifstruct"]
+    assert ifstruct.startswith("AA tracks IFStruct only")
+    assert "/hardware-inference-stack/mobile-phones" in ifstruct
 
 
 # --------------------------------------------------------------------------- #
@@ -260,6 +275,12 @@ def test_lower_is_better_marks_match_descriptions():
         "cyberRefusalRate",
         "cybergymE2eRefusalRate",
         "deepsecBenchRefusalRate",
+        # 2026-10-16: the speech/search boards' WER, latency and cost columns
+        "sttWerIndex", "sttWordErrorRate", "sttEarnings22Wer", "sttVoxpopuliWer",
+        "sttAgenttalkWer", "sttStreamingWerIndex", "sttStreamingEarnings22Wer",
+        "sttStreamingAgenttalkWer", "sttStreamingTimeToFinal",
+        "sttStreamingTimeToFirstPartial", "ttsGenerationTime", "searchAvgLatency",
+        "searchCostPerQuery", "searchCostPerTask",
     }
     for key in lowered:
         assert catalog.metric(key).better == "low", key
@@ -388,7 +409,7 @@ def test_rankables_cover_required_derived_and_arena():
 
 def test_rankable_entries_have_valid_shape():
     units = {"%", "Elo", "index", "USD/task", "USD", "USD/1M", "s", "tok/s",
-             "tokens", "params", "date", "text"}
+             "tokens", "params", "date", "text", "chars/s", "USD/query"}
     for key, r in catalog.RANKABLES.items():
         assert r.key == key
         assert r.kind in ("benchmark", "index", "derived", "arena", "view"), key
@@ -486,12 +507,15 @@ def test_rankable_how_hints_are_actionable():
     assert catalog.rankable("cyberRefusalRate").how == \
         "aa_leaderboard sort=cyberRefusalRate"
     assert catalog.rankable("cweBench").how == "aa_leaderboard sort=cweBench"
-    # a chart key with no eval-page slug has no cross-model column to sort
-    assert catalog.rankable("when2call").how == \
-        "aa_benchmark_leaderboard benchmark=when2call"
-    # a container/breakdown kind keeps the honest explanatory error path
+    # the Decision-Models evals now have a real chart set on their own pages
+    assert catalog.rankable("when2call").how == "aa_leaderboard sort=when2call"
+    assert catalog.rankable("wildguardtest").how == "aa_leaderboard sort=wildguardtest"
+    # a container/breakdown kind names a *rankable* sub-score, never itself (a
+    # hint must not point at an empty output)
     assert catalog.rankable("aa3dBreakdown").how == \
-        "aa_benchmark_leaderboard benchmark=aa3dBreakdown"
+        "aa_benchmark_leaderboard benchmark=aa3dTurnsP50"
+    assert catalog.rankable("briefcaseBreakdown").how == \
+        "aa_benchmark_leaderboard benchmark=briefcaseRubricPassRate"
     assert catalog.rankable("tps").how == "aa_leaderboard sort=tps"
     assert catalog.rankable("cost_per_task").how == "aa_pareto x=cost_per_task"
     assert catalog.rankable("text_to_speech").how == "aa_media board=text_to_speech"
@@ -694,3 +718,157 @@ def test_task_domain_matches_a_free_text_query():
 def test_task_domain_is_exported():
     assert "TASK_DOMAINS" in catalog.__all__
     assert "task_domain" in catalog.__all__
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-16: the surfaces added after the coverage audit
+# --------------------------------------------------------------------------- #
+
+#: (key, aliases that must resolve to it)
+_NEW_RANKABLES = [
+    ("multilingual", ("multilingual", "Multilingual Index",
+                      "Artificial Analysis Multilingual Index",
+                      "artificial_analysis_multilingual_index", "languages")),
+    ("multilingual.ar", ("multilingual.ar",)),
+    ("hleMultichoice", ("hleMultichoice", "hle-multichoice", "HLE-MultiChoice")),
+    ("omniscienceDecision", ("omniscienceDecision", "aa-omniscience-decision",
+                             "AA-Omniscience-Decision")),
+    ("omniscienceDecisionNonHallucination",
+     ("omniscienceDecisionNonHallucination",
+      "Omniscience-Decision Non-Hallucination")),
+    ("when2call", ("when2call", "When2Call")),
+    ("wildguardtest", ("wildguardtest", "WildGuardTest")),
+    ("mobile.gpqa", ("mobile.gpqa", "On-device GPQA")),
+    ("mobile.bfcl_500", ("mobile.bfcl_500", "BFCL-500", "BFCL")),
+    ("mobile.ifstruct", ("mobile.ifstruct", "IFStruct")),
+    ("openness.modelAvailability", ("openness.modelAvailability",)),
+    ("omniscience.domain.law", ("omniscience.domain.law",)),
+    ("omniscience.language.python", ("omniscience.language.python",)),
+    ("terminalBenchScience.domain.life-sciences",
+     ("terminalBenchScience.domain.life-sciences",)),
+    ("enterpriseOpsGym.domain.hybrid", ("enterpriseOpsGym.domain.hybrid",)),
+    ("briefcaseAnalyticalQualityElo", ("briefcaseAnalyticalQualityElo",)),
+    ("harveyCriteriaPass", ("harveyCriteriaPass",)),
+    ("gdpPdfMacroPassRate", ("gdpPdfMacroPassRate",)),
+    ("automationBenchStrictScore", ("automationBenchStrictScore",)),
+    ("itbenchAvgTurnsPerTask", ("itbenchAvgTurnsPerTask",)),
+    ("medianCanonicalAnswerOutputSpeed", ("medianCanonicalAnswerOutputSpeed",)),
+    # the speech / TTS / search board columns
+    ("sttWerIndex", ("sttWerIndex", "AA-WER", "STT WER", "Word Error Rate")),
+    ("sttEarnings22Wer", ("sttEarnings22Wer", "Earnings22")),
+    ("sttVoxpopuliWer", ("sttVoxpopuliWer", "VoxPopuli")),
+    ("sttAgenttalkWer", ("sttAgenttalkWer", "AgentTalk")),
+    ("sttStreamingTimeToFinal", ("sttStreamingTimeToFinal",)),
+    ("sts", ("sts", "STS Index", "Realtime Voice Index")),
+    ("stsBigBenchAudio", ("stsBigBenchAudio", "Big Bench Audio", "BBA")),
+    ("stsTauVoice", ("stsTauVoice", "tau3-Voice")),
+    ("stsAgenticElo", ("stsAgenticElo",)),
+    ("ttsPronunciationPassRate", ("ttsPronunciationPassRate",
+                                  "Pronunciation Robustness")),
+    ("ttsCharactersPerSecond", ("ttsCharactersPerSecond",
+                                "Characters Per Second", "TTS Throughput")),
+    ("searchBrowsecompAccuracy", ("searchBrowsecompAccuracy", "BrowseComp")),
+    ("searchCostPerQuery", ("searchCostPerQuery", "Cost per Search Query")),
+    ("searchQualityIndex", ("searchQualityIndex", "AA Search Index")),
+]
+
+
+@pytest.mark.parametrize("key,aliases", _NEW_RANKABLES)
+def test_new_rankables_exist_and_resolve(key, aliases):
+    rank = catalog.rankable(key)
+    assert rank is not None, key
+    assert rank.key == key
+    for alias in aliases:
+        got = catalog.rankable(alias)
+        assert got is not None and got.key == key, (alias, got)
+
+
+def test_new_chart_benchmarks_declare_a_chart_slug():
+    """A chart-set key with no slug can never be reached by the join."""
+    for key in ("multilingual", "hleMultichoice", "omniscienceDecision",
+                "when2call", "wildguardtest", "mobile.gpqa", "mobile.bfcl_small",
+                "openness.modelAvailability", "omniscience.domain.law",
+                "terminalBenchScience.domain.life-sciences",
+                "briefcaseRubricPassRate", "medianCanonicalAnswerOutputSpeed"):
+        bench = catalog.BENCHMARKS[key]
+        assert bench.source_hint == "chart", key
+        assert bench.slug, key
+
+
+def test_mobile_evals_are_namespaced_in_the_catalog():
+    keys = [b.key for b in catalog.BENCHMARKS.values() if b.slug == "mobile"]
+    assert keys == [f"mobile.{name}" for name in catalog.MOBILE_EVALS]
+
+
+def test_every_breakdown_container_hint_names_a_rankable_sub_score():
+    """A hint must never point at the container itself (that output is empty)."""
+    for key, bench in catalog.BENCHMARKS.items():
+        if bench.unit != "mixed":
+            continue
+        rank = catalog.rankable(key)
+        assert rank is not None
+        tool, _sep, arg = rank.how.partition(" ")
+        if tool == "aa_benchmark_leaderboard":
+            assert arg.startswith("benchmark=")
+            target = arg.split("=", 1)[1]
+            assert target != key, f"{key} points at itself"
+            assert catalog.rankable(target) is not None, (key, target)
+            assert catalog.BENCHMARKS[target].unit != "mixed", (key, target)
+
+
+def test_domains_expand_to_the_new_surfaces():
+    multi = {r.key for r in catalog.rankables(domain="multilingual")}
+    assert {"multilingual", "multilingual.ar"} <= multi
+    on_device = {r.key for r in catalog.rankables(domain="mobile")}
+    assert "mobile.bfcl_500" in on_device
+    langs = {r.key for r in catalog.rankables(query="multilingual")}
+    assert "multilingual" in langs
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-16: Elo display rounding and the 12-character column headers
+# --------------------------------------------------------------------------- #
+
+def test_elo_cells_round_half_away_from_zero():
+    """AA's own table rounds ``.5`` up; Python's ``:.0f`` rounds half-to-even.
+
+    The site ships its rendered string in the payload's ``formatted.elo``, so the
+    convention is observable rather than assumed: raw 1146.5 -> "1147",
+    1092.5 -> "1093", 1138.5 -> "1139".  Display only — the stored value stays the
+    exact float.
+    """
+    assert catalog.format_value("briefcaseElo", 1146.5) == "1147"
+    assert catalog.format_value("briefcaseElo", 1092.5) == "1093"
+    assert catalog.format_value("briefcaseElo", 1138.5) == "1139"
+    assert catalog.format_value("briefcaseElo", 1173.94) == "1174"
+    assert catalog.format_value("briefcaseElo", 1174.5) == "1175"
+    assert catalog.format_value("briefcaseElo", -0.5) == "-1"
+    assert catalog.format_value("briefcaseElo", 1200.0) == "1200"
+
+
+def test_metric_labels_fit_the_column_and_stay_distinguishable():
+    """A header cell is 12 characters; two benchmarks must not share one label."""
+    seen: dict[str, str] = {}
+    for key in catalog.BENCHMARKS:
+        metric = catalog.METRICS.get(key)
+        if metric is None:
+            continue
+        assert len(metric.label) <= 12, (key, metric.label)
+        assert metric.label not in seen, (metric.label, seen.get(metric.label), key)
+        seen[metric.label] = key
+
+
+def test_new_long_labels_get_a_short_display_label():
+    """The long labels the audit added must not collapse into one header."""
+    assert catalog.metric("mobile.bfcl_500").label == "Dev BFCL-500"
+    assert catalog.metric("mobile.bfcl_small").label == "Dev BFCL-Sm"
+    assert catalog.metric("mobile.gpqa").label == "Dev GPQA"
+    assert catalog.metric("hleMultichoice").label == "HLE-MCQ"
+    assert catalog.metric("globalMmluLiteScore").label == "Global-MMLU"
+    assert catalog.metric("multilingual").label == "Multilingual"
+    assert catalog.metric("multilingual.ja").label == "Japanese"
+    assert catalog.metric("openness.modelTransparency").label == "Open Model"
+    assert catalog.metric("openness.transparencyMethodology").label == "Open Method"
+    # the canonical keys are unchanged
+    assert catalog.metric("mobile.bfcl_500").key == "mobile.bfcl_500"
+    assert catalog.benchmark("mobile.bfcl_500").label == "On-device BFCL-500"

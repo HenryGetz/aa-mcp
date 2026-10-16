@@ -55,7 +55,7 @@ public signature here without telling the orchestrator.**
 
 ## Hard rules
 
-- Dependency budget: **`mcp` only** (official SDK, ships FastMCP). No pandas, no
+- Dependency budget: **`mcp` only** (official SDK, ships `MCPServer`). No pandas, no
   requests, no bs4, no lxml, no yaml at runtime. `tests/` may use pytest.
 - Python >= 3.10 (dev machine has 3.14; target 3.10+ syntax).
 - No network at import time. Network only inside loaders.
@@ -80,7 +80,7 @@ src/aa_mcp/
   select.py               # filter / sort / fuzzy resolve / pareto / value
   render.py               # markdown table + header rendering
   loaders.py              # per-source page loaders (the only network users)
-  server.py               # FastMCP app: tools, resources, prompts, main()
+  server.py               # MCPServer app: tools, resources, prompts, main()
 tests/
   fixtures/               # real captured payloads (offline tests)
   test_*.py
@@ -98,15 +98,20 @@ plain HTML works too but is ~2x bigger and needs `self.__next_f.push` joining.
 | leaderboard | `/leaderboards/models` | 1.19 MB | JSON array under `"models":[` (**2nd** occurrence) — 703 model variants x 50 metrics |
 | model page | `/models/<slug>` | 0.75-3.2 MB | `"initialModels":[` array (27-32 records x 94 metrics, focused model included, `chartHighlighted:true`) **or**, on legacy/deprecated pages, `"currentModel":{...}` (~80 keys, array may be empty) |
 | model providers | `/models/<slug>/providers` | 380 KB | `"hostModels":[{...}]` — per-endpoint pricing/performance, `intelligenceIndexCostPerTask`, `jsonMode`, `functionCalling`; precision from `slug` suffix |
-| providers board | `/leaderboards/providers` | 2.7 MB | `"rows":[{...}]` 1199 endpoint rows: host + model (incl. `intelligenceIndex` + per-benchmark scores) + pricing (`cacheHitPrice`/`cacheWritePrice`, **no** `cacheHitDiscountPercent`) + performance + `features` (`contextWindowTokens`, `functionCalling`, `jsonMode`, `openaiCompatible`). No precision tag and no `intelligenceIndexCostPerTask` here — those exist only on `hostModels` |
+| providers board | `/leaderboards/providers` | 2.7 MB | `"rows":[{...}]` 1222 endpoint rows: host + model (incl. `intelligenceIndex` + per-benchmark scores) + pricing (`cacheHitPrice`/`cacheWritePrice`, **no** `cacheHitDiscountPercent`) + performance + `features` (`contextWindowTokens`, `functionCalling`, `jsonMode`, `openaiCompatible`). No precision tag and no `intelligenceIndexCostPerTask` here — those exist only on `hostModels` |
 | homepage | `/` | 1.11 MB | `"sttNonStreaming":{"models":[..]}`, `"sttStreaming":{...}`, `"sts":{...}`; plus `{"evalSlug":..,"models":[{score,costPerTask,..}]}` panels (top 20 per eval: cyber-index, cwe-bench-aa, deepsecbench-aa, cybergym-e2e-aa) |
-| media arena | `/image/leaderboard/text-to-image`, `/image/leaderboard/editing`, `/video/leaderboard/text-to-video`, `/video/leaderboard/image-to-video`, `/video/leaderboard/video-editing`, `/text-to-speech/leaderboard/provider-voice`, `/text-to-speech/leaderboard/controlled-voice`, `/music/leaderboard/instrumental`, `/music/leaderboard/vocals` | 1.0-2.0 MB | arrays of `{"formatted":{..},"values":{name,elo,ciLower,ciUpper,appearances,rank,creator:{name},releaseDate,pricePer1kImages|pricePerMinute|pricePer1mCharacters|voiceCount,openWeightsUrl,url}}` — several arrays per page (per-category variants). Selection is **validated** (`loaders._media_arena`): the array must carry the board's expected keys (`name`+`elo`+its price key) and sit in the page's arena slot — the flight main slot (`32:[[null,[…]]]`) or an object-field slot (`"initialData":[`); per-category subsets (`["<label>",[…]]`) never qualify, and the first slot in document order wins. No match ⇒ a clear error instead of a different arena |
-| speech | `/speech-to-speech/arena/overview` | - | fall back to homepage boards |
+| media arena | `/image/leaderboard/text-to-image`, `/image/leaderboard/editing`, `/video/leaderboard/text-to-video`, `/video/leaderboard/image-to-video`, `/video/leaderboard/video-editing`, `/text-to-speech/leaderboard/provider-voice`, `/text-to-speech/leaderboard/controlled-voice`, `/music/leaderboard/instrumental`, `/music/leaderboard/vocals` | 1.0-2.0 MB | arrays of `{"formatted":{..},"values":{name,elo,ciLower,ciUpper,appearances,rank,creator:{name},releaseDate,pricePer1kImages|pricePerMinute|pricePer1mCharacters|voiceCount,openWeightsUrl,url}}` — several arrays per page (per-category variants). Selection is **validated** (`loaders._media_arena`): the array must carry the board's expected keys (`name`+`elo`+its price key) and sit in the page's arena slot — the flight main slot (`32:[[null,[…]]]`) or an object-field slot (`"initialData":[`); per-category subsets (`["<label>",[…]]`) never qualify. The two video pages ship **two** arenas each (`withAudioData`/`withoutAudioData`); `loaders._ARENA_AUDIO_REF` picks the board's one, so `text_to_video_silent` (31 rows) / `image_to_video_silent` (82) are distinct boards from `text_to_video` (28) / `image_to_video` (23). Per-category sub-boards are selected by slug via the `category=` argument. No match ⇒ a clear error instead of a different arena |
+| speech boards | `/speech-to-text/non-streaming`, `/speech-to-text/streaming`, `/speech-to-speech/arena` | 0.3-0.9 MB | `loaders.SPEECH_BOARDS` maps the `home_boards` keys to the dedicated full-board pages (the homepage top-N panel is only the fallback). STT rows are `aaWerIndex`-shaped (`aaWerIndex`, `wordErrorRate`, `earnings22CleanedWer`, `voxpopuliCleanedWer`, `aaSttDatasetWer`); streaming adds `aaWerStreamingIndex` / `timeToFinalTranscriptSeconds` / `timeToFirstPartialTranscriptSeconds`; the STS page ships an 80-row `stsQualityIndexV2Score` array whose `sliceKey` splits `overall` (27) / `agentic` (27) / `non_agentic` (26) — the board serves `overall` and each slice's Elo is its own rankable |
+| TTS models | `/text-to-speech/models` | ~1 MB | `ttsModelId`-keyed rows joined with the page's `latencyPerformance` / `performance` arrays; quality Elo (97), the pronunciation suite (`overall.passRate` plus the 5 sub-suites, 30 each), chars/s and generation time (79 each) |
+| search API | `/agents/search-api` | 0.6 MB | a 26-row `aaSearchQualityIndex` array plus `browsecompAccuracy`, `deepsearchqaAvgF1`, `omniscienceAccuracy`, `avgLatencyS`, `costPerSearchQueryUsd`, `queriesPerTask`, `qualityLift` |
 | agents | `/agents/coding-agents`, `/agents/chatbots`, `/agents/search-api` | 0.6 MB | inspect with `flight.find_arrays` (see "unresolved" below) |
 | eval page | `/evaluations/<slug>` | 0.35-0.93 MB | `"initialModels":[` array of chart-selected model records (same 94-key shape as model pages); size varies by eval: gpqa 19, livecodebench 5, aa-briefcase / intelligence-index / terminalbench-4-0 32 — i.e. AA's chart selection, **not** a full leaderboard |
+| decision eval page | `/evaluations/{aa-omniscience-decision,hle-multichoice,when2call,wildguardtest}` | ~0.5 MB | a **28-row** `contestants` array (each row `indexScore` + `byDataset`, plus a `scores` blob of `{omniscienceAccuracy, omniscienceNonHallucinationRate, hleTextMcqAccuracy, when2callAccuracy, wildguardtestAverageF1}`). The four pages ship **byte-identical** `scores` — only the page's primary metric differs — and rows include `kind=decisionModel` entries absent from the 703-row leaderboard |
+| multilingual | `/models/multilingual` (chart-set slug `multilingual`) | ~0.5 MB | `"initialModels":[` — 13 records, each `multilingual` (== `globalMmluLite`) = `average` + 16 language keys (`ar,bn,de,en,es,fr,hi,id,it,ja,ko,pt,sw,yo,zh,my`). The 13-row `globalMmluLite` overlaps the 5-row `/evaluations/global-mmlu-lite` page (union **17**, not disjoint) |
+| mobile set | `/hardware-inference-stack/mobile-phones` (chart-set slug `mobile`) | ~0.5 MB | a **90-row** `models` array, each with `quant`, `servedContextTokens`, `indexOutputTokens`, `contextCapRate` and `evalScores` over 7 evals (`gpqa`, `ifbench`, `ifstruct`, `math_500`, `omniscience`, `bfcl_500`, `bfcl_small`); this is where AA publishes BFCL |
 | eval catalog | `/evaluations` (plain HTML, no RSC header) | 0.38 MB | server-rendered `<a href="/evaluations/<slug>">` cards with `<h2>/<h3>` title, description text, `<span>` tags (33 cards) |
 | sitemap | `/sitemap.xml` | 6 MB | model/eval surface list; use only for diagnostics, not on the hot path |
-| capability index | `/models/capabilities/<index>` (`index` = `finance-and-accounting`, `strategy-and-ops`, `legal`, `healthcare-and-medical`, `engineering`, `economics`) | 0.39-0.41 MB | `"initialModels":[` array — 26 records (20 for Healthcare & Medical) with `weightedIndex`/`headlineValue` + `subScores`; the full per-model values (`capabilities.<name>`, 221/221/221/82/220/228 of 703) ride the model-page/rich overlay |
+| capability index | `/models/capabilities/<index>` (`index` = `finance-and-accounting`, `strategy-and-ops`, `legal`, `healthcare-and-medical`, `engineering`, `economics`) | 0.39-0.41 MB | `"initialModels":[` array — 26 records (20 for Healthcare & Medical) with `weightedIndex`/`headlineValue` + `subScores`; the full per-model values (`capabilities.<name>`, ≈222/222/222/82/221/229 of 703, measured 2026-10-16) ride the model-page/rich overlay |
 
 Cache path convention: `~/.cache/aa-mcp/<name>.rsc` (env `AA_CACHE_DIR`).
 Default TTL 3600 s (env `AA_CACHE_TTL`).
@@ -233,14 +238,33 @@ def field_names() -> list[str]             # alias list for --fields help
 exist in the 703-row leaderboard array (gpqa, hle, scicode, terminalBench21,
 terminalBench40, terminalbenchHard, tau2, tauBanking, lcr, ifbench, critpt,
 mmmuPro, gdpvalNormalized, analystAgent, apexAgents, itbenchSre,
-omniscience*); ~30 more exist only on model pages / eval-page chart records
+omniscience*); ~90 more exist only on model pages / eval-page chart records
 (aime25, livecodebench, hleDiamond, terminalBenchScience, frontierCode,
 cweBench, cybergymE2e, deepsecBench, cyberIndex, aa3dElo, briefcaseElo,
 automationBenchPartialScore, enterpriseOpsGym, gdpPdfAllPass, mlcrOverall,
 harveyLab, globalMmluLiteScore, mmluPro, math500, when2call, wildguardtest,
+hleMultichoice, omniscienceDecision (+ `omniscienceDecisionNonHallucination`),
+`multilingual` (+ `.ar…my`), `mobile.{gpqa,ifbench,ifstruct,math_500,omniscience,bfcl_500,bfcl_small}`,
 aa3dBreakdown, automationBenchBreakdown, gdpvalBreakdown, harveyLabBreakdown,
 gdpPdfBreakdown, briefcaseBreakdown, enterpriseOpsGymSuccessRateByDomain,
-omniscienceAccuracy, omniscienceHallucinationRate, capabilities.* — plus the
+omniscienceAccuracy, omniscienceHallucinationRate, and the breakdown
+sub-metrics briefcaseRubricPassRate / briefcaseAnalyticalQualityElo /
+briefcasePresentationElo, harveyCriteriaPass / harveyGatedAllPass,
+gdpPdfMacroPassRate, automationBenchStrictScore / automationBenchCompletion,
+gdpvalAvgTurns, itbenchAvgTurnsPerTask, enterpriseOpsGymAvgTurns, aa3dTurnsP50,
+medianCanonicalAnswerOutputSpeed, `openness.<component>`,
+`omniscience.domain.*`, `omniscience.language.*`,
+`terminalBenchScience.domain.*`, `enterpriseOpsGym.domain.*`, the speech/TTS/search
+families (`sttWerIndex`, `sttWordErrorRate`, `sttEarnings22Wer`, `sttVoxpopuliWer`,
+`sttAgenttalkWer`, `sttStreamingWerIndex`/`…Earnings22Wer`/`…AgenttalkWer`/
+`…TimeToFinal`/`…TimeToFirstPartial`, `sts` + `stsOverallElo`/`stsAgenticElo`/
+`stsNonAgenticElo`/`stsTaskCompletionRate`/`stsBigBenchAudio`/`stsTauVoice`/
+`stsArenaScore`/`stsTaskSuccess`, `ttsQualityElo`/`ttsPronunciationPassRate`/
+`ttsTermPronunciation`/`ttsTextNormalization`/`ttsSequenceFidelity`/
+`ttsContextualDisambiguation`/`ttsCharactersPerSecond`/`ttsGenerationTime`,
+`searchQualityIndex`/`searchBrowsecompAccuracy`/`searchDeepsearchqaF1`/
+`searchOmniscienceAccuracy`/`searchAvgLatency`/`searchCostPerQuery`/
+`searchCostPerTask`/`searchQueriesPerTask`/`searchQualityLift`), capabilities.* — plus the
 Intelligence Index v4.3.2 member list: AA-Briefcase v1.1, GDPval-AA v2.1,
 AutomationBench-AA, Terminal-Bench 4.0, SciCode, AA-LCR v1.1, AA-Omniscience,
 HLE, GDP.pdf, CritPt).
@@ -326,14 +350,22 @@ def leaderboard(refresh=False) -> list[Model]              # 703 variants (from_
 def model(slug: str, refresh=False) -> dict[str, Model]     # slug -> Model (chart set incl. target; legacy fallback)
 def provider_endpoints(slug, refresh=False) -> list[Endpoint]
 def provider_board(refresh=False) -> list[Endpoint]
-def home_boards(refresh=False) -> dict[str, list[dict]]     # "stt","stt_streaming","sts","eval:<slug>"
+def home_boards(refresh=False) -> dict[str, list[dict]]     # "stt","stt_streaming","sts","eval:<slug>"; prefers SPEECH_BOARDS' full board over the homepage panel
 def media(board: str, refresh=False) -> list[dict]          # board in MEDIA_BOARDS
 def agents(board: str, refresh=False) -> list[dict]
 def open_weights_flag(row: dict) -> bool | None             # public normalizer for speech/agent/media rows
-def eval_models(slug: str, refresh=False) -> list[Model]    # top-N chart set for one eval page
+def eval_models(slug: str, refresh=False) -> list[Model]    # chart set for one slug; EXTRA_EVAL_PAGES redirects `multilingual`/`mobile` and unions `global-mmlu-lite`
 def eval_catalog(refresh=False) -> list[dict]               # {slug,title,description,tags}
 def sitemap_paths(refresh=False) -> list[str]
 ```
+
+`SPEECH_BOARDS: dict[str, str]` maps a `home_boards` speech key to the page carrying
+the whole board (`stt` → `/speech-to-text/non-streaming`, `stt_streaming` →
+`/speech-to-text/streaming`, `sts` → `/speech-to-speech/arena`); `home_boards` prefers
+it and keeps the homepage's top-N panel as the fallback. `EXTRA_EVAL_PAGES` +
+`_CHART_ADAPTERS` give the board pages a chart-set shape, so `eval_models("stt")` /
+`("sts")` / `("tts")` / `("search-api")` serve the same ranking paths as the
+Decision-Models and on-device sets.
 
 `open_weights_flag(row)` is the single reader for the several open-weights
 spellings AA ships (`openWeights`, `isOpenWeights`, `openWeightsUrl`,
@@ -353,7 +385,8 @@ class Endpoint:
 ```
 
 `MEDIA_BOARDS` keys: `text_to_image`, `image_editing`, `text_to_video`,
-`image_to_video`, `video_editing`, `text_to_speech`, `text_to_speech_controlled`,
+`text_to_video_silent`, `image_to_video`, `image_to_video_silent`,
+`video_editing`, `text_to_speech`, `text_to_speech_controlled`,
 `music_instrumental`, `music_with_vocals`. `agents()` boards:
 `coding_agents`, `chatbots`, `search_api` (resolve payload shape during
 implementation; if a board has no usable structured data, raise a clear
@@ -413,10 +446,14 @@ fetch live coverage: `aa_benchmark_leaderboard`, `aa_leaderboard`, `aa_pareto`).
 7. `aa_providers` — `model` (endpoint detail) OR board filters
    (`host`, `model`, `open_weights`, `min_context`, `sort`, `top=15`),
    `fields`, `refresh=False`.
-8. `aa_media` — `board`, `top=15`, `open_weights=None`, `fields`, `refresh=False`.
-   Speech boards are `speech_to_text`, `speech_to_text_streaming`,
-   `speech_to_speech` (aliases: `realtime_voice`, `realtime-voice`, `realtime voice`);
-   their `open_weights` filter is refused when the panel carries no such flag.
+8. `aa_media` — `board`, `top=15`, `open_weights=None`, `fields`, `category=""`,
+   `refresh=False`. Speech boards are `speech_to_text` (full 36-row board),
+   `speech_to_text_streaming` (45) and `speech_to_speech` (27 — the STS arena's
+   `overall` slice) — aliases `realtime_voice`, `realtime-voice`, `realtime voice`;
+   their `open_weights` filter is refused when the board carries no such flag.
+   `category=` ranks one of a board's per-category sub-boards (image/video/TTS,
+   incl. the TTS use-case boards `assistants` / `knowledge-sharing` /
+   `entertainment` / `customer-service` and the language boards `en-us` / `en-gb`).
 9. `aa_agents` — `board`, `top=15`, `refresh=False`.
 10. `aa_search` — `query`, `creator=None`, `open_weights=None`, `top=15`,
     `refresh=False` → name/creator/slug/intel/cost.
@@ -438,7 +475,7 @@ Prompts (2): `best_model_for_task` (routes value/trade-off questions to
 `aa_pareto`), `compare_models` (mentions `metrics=all`, `view=diff` and the
 `spec=` round-trip).
 
-Every tool must raise `ToolError`-equivalent (FastMCP: raise `ValueError`/
+Every tool must raise `ToolError`-equivalent (MCPServer: raise `ValueError`/
 `RuntimeError` with actionable text) on bad input, never return a bare empty table
 without explanation.
 

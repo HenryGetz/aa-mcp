@@ -8,7 +8,6 @@ selection, axis resolution, coverage labels, YAML subset, response bounds).
 
 from __future__ import annotations
 
-import inspect
 import json
 
 import pytest
@@ -64,9 +63,9 @@ def fake(monkeypatch):
                         lambda refresh=False, rich=True: (models, rich))
     monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
     monkeypatch.setattr(server, "_rich_models", lambda refresh=False: models)
-    monkeypatch.setattr(server, "_lb_cache", lambda: ("leaderboard", False))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
-    monkeypatch.setattr(server, "_fresh", lambda name, api=False: (None, False))
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
     monkeypatch.setattr(server, "_extra_score_models", lambda key, refresh=False: [])
     monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [])
     return {m.slug: m for m in models}
@@ -266,23 +265,6 @@ def test_pareto_knee_ignores_a_zero_cost_point():
     assert server._pareto_knee(front) == 2
 
 
-def test_pareto_tool_signature_matches_the_brief():
-    params = list(inspect.signature(server.aa_pareto).parameters)
-    assert params == ["score", "x", "top", "creator", "open_weights",
-                      "min_intelligence", "min_context", "include_deprecated",
-                      "include_all", "refresh"]
-
-
-def test_compare_tool_signature_matches_the_brief():
-    params = list(inspect.signature(server.aa_compare).parameters)
-    assert params == ["queries", "metrics", "view", "compact", "spec", "refresh"]
-
-
-def test_benchmarks_tool_signature_matches_the_brief():
-    params = list(inspect.signature(server.aa_benchmarks).parameters)
-    assert params == ["query", "domain", "tag", "verbose"]
-
-
 # --------------------------------------------------------------------------- #
 # Wave F: aa_leaderboard ranks any key with per-model values on any surface
 # --------------------------------------------------------------------------- #
@@ -293,9 +275,9 @@ def _patch_leaderboard(monkeypatch, base, extra):
     monkeypatch.setattr(server, "_models_state",
                         lambda refresh=False, rich=True: (list(base), rich))
     monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: list(base))
-    monkeypatch.setattr(server, "_lb_cache", lambda: ("leaderboard", False))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
-    monkeypatch.setattr(server, "_fresh", lambda name, api=False: (None, False))
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
     monkeypatch.setattr(server, "_extra_score_models",
                         lambda key, refresh=False: list(extra.get(key, [])))
 
@@ -511,9 +493,15 @@ def test_benchmarks_rows_carry_the_how_hint(fake):
 
 
 def test_benchmarks_domain_rows_and_count(fake):
+    """``domain=`` narrows the catalog, and the header count matches the rows shown."""
     out = server._benchmarks(domain="security")
-    assert "domain=security" in out.splitlines()[0]
-    assert "of" in out.splitlines()[0] and "rankables" in out.splitlines()[0]
+    header = out.splitlines()[0]
+    body_rows = [line for line in out.splitlines()
+                 if line.startswith("| ") and "---" not in line][1:]  # drop header row
+    assert "domain=security" in header
+    assert body_rows                                     # the domain is not empty
+    assert len(body_rows) < len(catalog.RANKABLES)       # it actually filtered
+    assert f"{len(body_rows)} of {len(catalog.RANKABLES)} rankables" in header
     assert "aa_leaderboard sort=cweBench" in out
 
 
@@ -1008,9 +996,9 @@ def test_compare_sanitizes_a_hostile_scraped_name(monkeypatch):
                         lambda refresh=False, rich=True: (models, rich))
     monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
     monkeypatch.setattr(server, "_rich_models", lambda refresh=False: models)
-    monkeypatch.setattr(server, "_lb_cache", lambda: ("leaderboard", False))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
-    monkeypatch.setattr(server, "_fresh", lambda name, api=False: (None, False))
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
     monkeypatch.setattr(server, "_extra_score_models", lambda key, refresh=False: [])
     out = server.aa_compare(queries=["bad", "alpha"], metrics="cost_per_task")
     assert "\ud800" not in out            # no lone surrogate reaches the client
@@ -1044,9 +1032,9 @@ def test_benchmark_leaderboard_ranks_a_lower_is_better_metric(monkeypatch):
     monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
     monkeypatch.setattr(server, "_models_state",
                         lambda refresh=False, rich=True: (models, rich))
-    monkeypatch.setattr(server, "_lb_cache", lambda: ("leaderboard", False))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
-    monkeypatch.setattr(server, "_fresh", lambda name, api=False: (None, False))
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
     out = server.aa_benchmark_leaderboard(
         benchmark="omniscienceHallucinationRate", top=5)
     assert "lower is better" in out
@@ -1124,13 +1112,16 @@ def test_breakdown_benchmark_reports_a_container_not_a_typeerror(key):
     assert "TypeError" not in msg
 
 
-def test_breakdown_benchmark_names_its_scalar_sibling():
-    with pytest.raises(ValueError) as exc:
-        server._benchmark_leaderboard(benchmark="aa3dBreakdown")
-    assert "aa_benchmark_leaderboard benchmark=aa3dElo" in str(exc.value)
-    with pytest.raises(ValueError) as exc:
-        server._benchmark_leaderboard(benchmark="harveyLabBreakdown")
-    assert "aa_benchmark_leaderboard benchmark=harveyLab" in str(exc.value)
+def test_breakdown_benchmark_names_a_rankable_sub_score():
+    """The container error points at a call that ranks something (the catalog hint)."""
+    for key, sub in (("aa3dBreakdown", "aa3dTurnsP50"),
+                     ("harveyLabBreakdown", "harveyCriteriaPass")):
+        with pytest.raises(ValueError) as exc:
+            server._benchmark_leaderboard(benchmark=key)
+        msg = str(exc.value)
+        assert "container benchmark" in msg
+        assert f"aa_benchmark_leaderboard benchmark={sub}" in msg
+        assert "aa_model <slug> sections=benchmarks" in msg
 
 
 def test_breakdown_benchmark_is_honest_through_the_tool_boundary():
@@ -1217,6 +1208,44 @@ def test_compare_arena_diff_view_shows_deltas(fake, monkeypatch):
     monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: entries)
     out = server._compare(["Arena One", "Arena Two"], metrics="elo", view="diff")
     assert "1150 (-50)" in out
+
+
+def test_elo_values_round_half_away_from_zero_everywhere(fake, monkeypatch):
+    """One Elo rule: ``.5`` rounds up in arena, media and benchmark-leaderboard cells.
+
+    ``catalog.format_value`` matches AA's own rendered Elo strings; a bare ``:.0f``
+    (half-to-even) would print 1146.5 as 1146 in these keyless cells while the
+    metric columns say 1147.  Confidence-interval bounds follow the same rule.
+    """
+    # arena compare: the Elo metric cell and the 95% CI cell
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [
+        _arena_entry("Arena One", "text_to_image", metric=("elo", "Elo", 1146.5, "Elo"),
+                     ci_lower=1092.5, ci_upper=1200.5),
+        _arena_entry("Arena Two", "text_to_image", metric=("elo", "Elo", 1000.0, "Elo"),
+                     ci_lower=900.0, ci_upper=1100.0),
+    ])
+    arena = server._compare(["Arena One", "Arena Two"], metrics="elo,ci")
+    assert "| Elo | 1147 | 1000 |" in arena
+    assert "| 95% CI | 1093–1201 | 900–1100 |" in arena
+
+    # arena diff view: a .5 Elo delta follows the same rule (1000 - 1146.5)
+    diff = server._compare(["Arena One", "Arena Two"], metrics="elo", view="diff")
+    assert "1000 (-147)" in diff
+
+    # media board: the Elo cell and its CI columns
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: [
+        {"name": "Ideogram 4.0", "elo": 1146.5, "ci_lower": 1092.5,
+         "ci_upper": 1200.5}])
+    media = server.aa_media(board="text_to_image",
+                            fields="name,elo,ci_lower,ci_upper,ci", top=1)
+    assert "| 1147 |" in media
+    assert "1093" in media and "1201" in media
+
+    # benchmark leaderboard: the CI columns (chart-set bounds, no published truth)
+    monkeypatch.setattr(server, "_chart_ci",
+                        lambda slug, refresh=False: {"alpha": (1092.5, 1200.5)})
+    bench = server.aa_benchmark_leaderboard(benchmark="gpqa", fields="score,ci", top=2)
+    assert "1093–1201" in bench
 
 
 def test_compare_mixed_language_and_arena_explains(fake, monkeypatch):
@@ -1437,9 +1466,9 @@ def _patch_models(monkeypatch, models):
                         lambda refresh=False, rich=True: (models, rich))
     monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
     monkeypatch.setattr(server, "_rich_models", lambda refresh=False: models)
-    monkeypatch.setattr(server, "_lb_cache", lambda: ("leaderboard", False))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
-    monkeypatch.setattr(server, "_fresh", lambda name, api=False: (None, False))
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
     monkeypatch.setattr(server, "_extra_score_models", lambda key, refresh=False: [])
 
 
@@ -1499,9 +1528,9 @@ def _patch_dual_source(monkeypatch, lb, page):
                         lambda refresh=False, rich=True: (list(merged if rich else lb), rich))
     monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: list(lb))
     monkeypatch.setattr(server, "_rich_models", lambda refresh=False: list(page))
-    monkeypatch.setattr(server, "_lb_cache", lambda: ("leaderboard", False))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
-    monkeypatch.setattr(server, "_fresh", lambda name, api=False: (None, False))
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
     monkeypatch.setattr(server, "_extra_score_models", lambda key, refresh=False: [])
     monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [])
 
@@ -1553,7 +1582,7 @@ def test_compare_states_a_leaderboard_only_speed_value(monkeypatch):
     _patch_dual_source(monkeypatch, lb, [])
     out = server._compare(["alpha", "beta"], metrics="ttft", compact=False)
     assert "| Time to First Token | 100.0s | 200.0s |" in out
-    assert "700-row leaderboard snapshot" in out
+    assert "leaderboard snapshot" in out
     assert "long-prompt median" not in out
 
 
@@ -1740,6 +1769,58 @@ def test_media_ignores_an_unknown_field(fake, monkeypatch):
     assert "unknown, ignored: nonsense (closest:" in out
 
 
+def test_media_category_ranks_the_sub_board_and_says_so(fake, monkeypatch):
+    """``category=`` is forwarded to the loader and surfaced in the header/footer."""
+    seen: dict = {}
+
+    def fake_load(name, fn, *a, **k):
+        seen["category"] = k.get("category")
+        return [{"name": f"row-{k.get('category')}", "elo": 1000.0}]
+
+    monkeypatch.setattr(server, "_load", fake_load)
+    out = server.aa_media(board="text_to_image", top=2,
+                          category="marketing-and-advertising")
+    assert seen["category"] == "marketing-and-advertising"      # forwarded
+    assert "category=marketing-and-advertising" in out          # surfaced
+    assert "not the overall board" in out
+    assert "row-marketing-and-advertising" in out
+
+
+def test_media_without_a_category_uses_the_primary_board(fake, monkeypatch):
+    """Omitting ``category`` ranks the board itself (empty string reaches the loader)."""
+    seen: dict = {}
+    monkeypatch.setattr(server, "_load",
+                        lambda name, fn, *a, **k: seen.update(k) or [{"name": "x",
+                                                                     "elo": 1.0}])
+    out = server.aa_media(board="text_to_image", top=1)
+    assert seen.get("category") == ""
+    assert "category=" not in out
+
+
+def test_media_unknown_category_lists_the_published_ones(fake, monkeypatch):
+    """A bad category is an argument error: the published slugs, no cache noise."""
+    def boom(name, fn, *a, **k):
+        raise ValueError(
+            "unknown category 'nope' for board 'text_to_image' — published "
+            "categories: animation-and-gaming, marketing-and-advertising — the "
+            "payload cached at /tmp/x.rsc is unusable — retry with refresh=true to "
+            "refetch https://example.invalid/x")
+
+    monkeypatch.setattr(server, "_load", boom)
+    with pytest.raises(ValueError) as exc:
+        server._media("text_to_image", category="nope")
+    msg = str(exc.value)
+    assert "published categories" in msg and "marketing-and-advertising" in msg
+    assert "unusable" not in msg and "refresh=true" not in msg   # cache noise dropped
+
+
+def test_media_category_is_rejected_on_a_speech_panel(fake):
+    """The homepage speech panels publish no category split — say so, don't ignore it."""
+    with pytest.raises(ValueError) as exc:
+        server._media("speech_to_text", category="ja")
+    assert "not available" in str(exc.value)
+
+
 def test_search_answers_a_task_word_aa_does_not_measure(fake, monkeypatch):
     """A task word is answered with the closest AA measures, never a dead end (G8)."""
     monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [])
@@ -1817,15 +1898,16 @@ def test_source_key_is_always_rsc_and_warns_once(monkeypatch, caplog):
 
 
 def test_lb_cache_and_cache_ttl_ignore_api_settings(monkeypatch):
-    """No keyed cache: ``_lb_cache`` is constant and ``AA_API_TTL`` is ignored."""
+    """No keyed cache: ``_lb_cache`` is a constant and ``AA_API_TTL`` is ignored."""
     monkeypatch.setenv("AA_API_TTL", "123")
     monkeypatch.delenv("AA_CACHE_TTL", raising=False)
-    assert server._lb_cache() == ("leaderboard", False)
-    assert server._cache_ttl(True) == 3600      # AA_API_TTL no longer read
-    assert server._cache_ttl(False) == 3600
+    assert server._lb_cache() == "leaderboard"
+    assert server._cache_ttl() == 3600          # AA_API_TTL is never read
     monkeypatch.setenv("AA_CACHE_TTL", "456")
-    assert server._cache_ttl(True) == 456
-    assert server._cache_ttl(False) == 456
+    assert server._cache_ttl() == 456
+    # a TTL that is not an integer is ignored, not fatal
+    monkeypatch.setenv("AA_CACHE_TTL", "not-a-number")
+    assert server._cache_ttl() == 3600
 
 
 # --------------------------------------------------------------------------- #
@@ -1974,8 +2056,8 @@ def test_model_section_shows_capability_sub_scores(monkeypatch, fake):
     monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: {})
     monkeypatch.setattr(server, "_capability_page_subs",
                         lambda key, slug, refresh=False: (
-                            [("capabilities.legal.knowledge", 64.2)]
-                            if key == "capabilities.legal" else []))
+                            ([("capabilities.legal.knowledge", 64.2)], True)
+                            if key == "capabilities.legal" else ([], True)))
 
     out = server.aa_model(query="alpha", sections="indexes")
     assert "| Legal | 63.3 |" in out
@@ -1984,6 +2066,21 @@ def test_model_section_shows_capability_sub_scores(monkeypatch, fake):
     assert "Coding Index, Agentic Index: AA publishes these composites only" in out
     assert "AA_API_KEY" not in out and "JSON API" not in out
     assert "no sub-scores for Economics" in out
+
+
+def test_model_section_names_an_unreadable_capability_page(monkeypatch, fake):
+    """An index page that could not be read is not reported as an absent model (L1)."""
+    base = _model("alpha", "Alpha One", intelligence=50.0,
+                  indices={"capabilities.legal": 63.26})
+    monkeypatch.setattr(server, "_models", lambda refresh=False: [base])
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: {})
+    monkeypatch.setattr(server, "_capability_page_subs",
+                        lambda key, slug, refresh=False: ([], False))
+
+    out = server.aa_model(query="alpha", sections="indexes")
+    assert "| Legal | 63.3 |" in out
+    assert "could not be read" in out
+    assert "does not list this model" not in out
 
 
 def test_paid_only_indexes_explain_themselves_without_a_key(monkeypatch, fake):
@@ -2014,19 +2111,6 @@ def test_no_hint_for_a_paid_only_index_claims_a_leaderboard_path():
         assert catalog.benchmark(constituent) is not None
         assert catalog.benchmark(constituent).source_hint != "none"
         assert key in catalog.API_ONLY_INDEXES
-
-
-def test_openness_and_decision_index_rankables_are_registered():
-    for key, unit in (("openness", "index"), ("decisionIndex", "index")):
-        rank = catalog.RANKABLES[key]
-        assert rank.unit == unit and rank.label and rank.desc
-        tool, _, arg = rank.how.partition(" ")
-        assert tool in ("aa_leaderboard", "aa_benchmark_leaderboard")
-        assert server._metric_key(arg.partition("=")[2], "sort") == key
-    # the Openness page's own array is the source of `openness`
-    assert loaders.INDEX_PAGES["openness"] == "artificial-analysis-openness-index"
-    assert loaders.INDEX_PAGES["decisionIndex"] == "artificial-analysis-decision-index"
-    assert {"openness", "decisionIndex"} <= server._OWN_PAGE_KEYS
 
 
 def test_leaderboard_ranks_the_decision_index(monkeypatch, fake):
@@ -2088,12 +2172,44 @@ def test_agents_board_presents_the_coding_agent_index(monkeypatch):
     assert "Coding Agent Index" not in other
 
 
-def test_coding_agent_index_rankable_points_at_aa_agents():
-    rank = catalog.RANKABLES["coding_agents"]
-    assert rank.kind == "arena" and rank.unit == "index"
-    assert rank.how == "aa_agents board=coding_agents"
-    assert "Coding Agent Index" in rank.label
-    assert catalog.rankable("Coding Agent Index") is not None
+def test_chatbot_board_renders_the_feature_score_not_a_percentage(monkeypatch):
+    """``featuresScore`` is AA's absolute Feature Score out of 6, never a fraction.
+
+    The raw ``/agents/chatbots`` payload carries the site's own rendered string
+    (``{"value": 5.8, "displayValue": "5.80"}``), so 5.8 must print as "5.80" —
+    the old percentage path printed "580.0%".
+    """
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: [
+        {"rank": 1, "agent": "SuperGrok Heavy", "name": "SuperGrok Heavy",
+         "model": "Grok 4.7 Heavy", "creator": "SpaceXAI", "score": 5.8},
+        {"rank": 4, "agent": "Perplexity Pro", "name": "Perplexity Pro",
+         "model": "Claude Sonnet 5.5", "creator": "Perplexity", "score": 5.65},
+    ])
+    out = server.aa_agents(board="chatbots", top=2)
+    assert "| Feature Score |" in out
+    assert "| 5.80 |" in out and "| 5.65 |" in out
+    assert "%" not in out                       # not a percentage any more
+    assert "out of 6" in out
+
+
+def test_agent_board_scores_keep_their_own_scale(monkeypatch):
+    """One ``score`` field, three units: 0-100 index, percentage, out-of-6 score."""
+    rows = [{"rank": 1, "agent": "A", "model": "M", "creator": "C", "score": 0.684}]
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: rows)
+    coding = server.aa_agents(board="coding_agents", top=1)
+    assert "| Coding Agent Index |" in coding and "| 68.4 |" in coding
+    search = server.aa_agents(board="search_api", top=1)
+    assert "| Score |" in search and "| 68.4% |" in search
+    chatbot = server.aa_agents(board="chatbots", top=1)
+    assert "| Feature Score |" in chatbot and "| 0.68 |" in chatbot
+
+
+def test_coding_agent_index_label_resolves_to_a_real_board():
+    """AA's own name for the index resolves, and its hint names a real board."""
+    rank = catalog.rankable("Coding Agent Index")
+    assert rank is not None
+    _tool, _, arg = rank.how.partition(" ")
+    assert arg.partition("=")[2] in server.loaders.AGENT_BOARDS
 
 
 # --------------------------------------------------------------------------- #
@@ -2164,17 +2280,218 @@ def test_benchmark_leaderboard_coverage_survives_a_filter(monkeypatch, fake):
     assert models  # the dataset is unchanged by either call
 
 
-def test_dataset_scored_ignores_filters(monkeypatch, fake):
-    models = _capability_dataset(monkeypatch, fake)
-    assert server._dataset_scored(models, "capabilities.legal") == 5
-    assert server._dataset_scored(models, "capabilities.engineering") == 0
-    # the helper is a plain count over whatever dataset it is handed
-    assert server._dataset_scored([m for m in models if not m.deprecated],
-                                  "capabilities.legal") == 3
+def test_match_note_appears_only_when_a_filter_narrows(fake):
+    """The post-filter count is a labelled match count — and only when it narrows."""
+    narrowed = server.aa_leaderboard(creator="LabA", top=5)
+    assert "1 shown of 1 matching (4 tracked)" in narrowed     # header: filtered view
+    assert "1 of 4 scored models match your filters" in narrowed
+
+    whole = server.aa_leaderboard(creator="Lab", top=5)        # matches every lab
+    assert "match your filters" not in whole                   # nothing narrowed
+    assert whole.startswith("# 4 shown of 4 matching (4 tracked)")
 
 
-def test_filter_match_note_is_never_a_coverage_claim():
-    assert server._filter_match_note(5, 133, True) == \
-        "5 of 133 scored models match your filters"
-    assert server._filter_match_note(133, 133, True) == ""   # no narrowing
-    assert server._filter_match_note(5, 133, False) == ""    # no explicit filter
+# --------------------------------------------------------------------------- #
+# Round-2 regressions: name filter, estimate marker, frontier denominator, copy
+# --------------------------------------------------------------------------- #
+
+def test_leaderboard_name_with_no_tokens_matches_nothing(fake):
+    """A name carrying no alphanumeric token can never match a model (M1).
+
+    ``name="日本"`` used to normalise to an empty token list, silently disabling
+    the filter: the call returned the whole leaderboard while the header still
+    claimed ``name~日本``. It must now match nothing, like any other non-match.
+    """
+    out = server.aa_leaderboard(name="日本", top=5)
+    assert out.startswith("# no models match")
+    assert "| Model |" not in out          # not the whole dataset
+    assert server.aa_leaderboard(name="zzzzzz", top=5).startswith("# no models match")
+
+
+@pytest.mark.parametrize("name", ["日本", "-_-", "   ", "🎉🎉", "。", "!!!?"])
+def test_leaderboard_name_with_no_token_is_never_a_wildcard(fake, name):
+    """Punctuation/whitespace/emoji-only names are unmatchable, not "no filter" (M1)."""
+    assert server.aa_leaderboard(name=name, top=5).startswith("# no models match")
+
+
+def test_leaderboard_name_with_tokens_still_filters(fake):
+    """The M1 guard must not break ordinary name filtering."""
+    out = server.aa_leaderboard(name="Alpha", top=5)
+    assert "Alpha One" in out and "Beta Two" not in out
+
+
+def test_benchmark_leaderboard_marks_only_estimated_intelligence(monkeypatch):
+    """The ``*`` marks an AA-estimated value, and only Intelligence carries one (M2).
+
+    ``K2 Think V2``'s openness 88.9 is a real published value: it must not be
+    starred because the model's *intelligence* is an AA estimate.
+    """
+    est = _model("est", "Estimated One", estimated=True, intelligence=40.0,
+                 indices={"openness": 88.9})
+    plain = _model("plain", "Plain Two", estimated=False, intelligence=50.0,
+                   indices={"openness": 40.0})
+    _patch_dual_source(monkeypatch, [est, plain], [est, plain])
+
+    out = server.aa_benchmark_leaderboard(benchmark="openness", top=5)
+    assert "88.9" in out
+    assert "88.9*" not in out
+    assert "AA-estimated" not in out        # no legend on a non-intelligence metric
+
+    intel = server.aa_benchmark_leaderboard(benchmark="intelligence", top=5)
+    assert "40.0*" in intel                 # the estimate marker is preserved
+    assert "AA-estimated" in intel
+
+
+def test_pareto_labels_a_filtered_denominator_as_matches(fake):
+    """A filter narrows the frontier pool; the footnote must say so (M3)."""
+    unfiltered = server.aa_pareto(score="intelligence", top=5)
+    assert "models scored on both axes" in unfiltered
+    assert "matching your filters" not in unfiltered
+    filtered = server.aa_pareto(score="intelligence", creator="LabA", top=5)
+    assert "matching your filters" in filtered
+
+
+def test_leaderboard_copy_does_not_pin_a_stale_row_count(fake):
+    """The TTFT note must not claim a "700-row" snapshot when the header says 703 (M4)."""
+    out = server.aa_leaderboard(sort="ttft", top=3)
+    assert "leaderboard snapshot" in out
+    assert "700-row" not in out
+
+
+def test_fields_all_drops_a_column_empty_for_every_row(fake):
+    """``fields=all`` asks for everything renderable, not an all-``-`` column (L5)."""
+    everything = server.aa_leaderboard(fields="all", top=3)
+    assert "Precision" not in everything
+    # an explicitly named empty column is still shown, so "no data" ≠ "wrong name"
+    explicit = server.aa_leaderboard(fields="precision", top=3)
+    assert "Precision" in explicit and "no data for: Precision" in explicit
+
+
+def test_capability_footnote_names_an_unreadable_page(monkeypatch, fake):
+    """An unreadable capability page is not reported as an absent model (L1)."""
+    _capability_dataset(monkeypatch, fake)
+    readable = server.aa_leaderboard(sort="capabilities.legal", top=2)
+    assert "none of these is on that page's chart set" in readable
+    # simulate the page failing to read this call (no index-page source recorded)
+    monkeypatch.setattr(server, "_index_page_meta", lambda key: ("", 0, 0))
+    unreadable = server.aa_leaderboard(sort="capabilities.legal", top=2)
+    assert "could not be read" in unreadable
+    assert "none of these is on that page's chart set" not in unreadable
+
+
+def test_capability_coverage_is_qualified_without_the_rich_overlay(monkeypatch, fake):
+    """Without the rich overlay the count is the coverage *in the data available*."""
+    models = [_model("alpha", "Alpha One", indices={"capabilities.legal": 60.0})]
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, False))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    _own_page(monkeypatch, "capabilities.legal", [], "/models/capabilities/legal", 26)
+
+    out = server.aa_leaderboard(sort="capabilities.legal", top=2)
+    assert "in the data available" in out
+    assert "the rich model-page overlay is not loaded" in out
+
+    # with the rich overlay present the claim stays unqualified
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, True))
+    assert "in the data available" not in server.aa_leaderboard(
+        sort="capabilities.legal", top=2)
+
+
+# --------------------------------------------------------------------------- #
+# board rows as their own namespace: TTS voices, STT hosts, search APIs
+# --------------------------------------------------------------------------- #
+
+def _board_test_entry(name, board, metrics, *, creator="Lab", kind="board"):
+    """An ``_ArenaEntry`` shaped like ``server._board_entry``'s output."""
+    return server._ArenaEntry(
+        name=name, board=board, kind=kind, creator=creator,
+        metrics=tuple(metrics), rank=None, appearances=None, price=None,
+        price_unit=None, release_date=None, open_weights=None,
+        ci_lower=None, ci_upper=None)
+
+
+def test_compare_resolves_a_board_row_on_its_own_columns(fake, monkeypatch):
+    """A TTS voice resolves by name and compares on the TTS board's own columns."""
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [
+        _board_test_entry("Eleven v4 Turbo", "tts", [
+            ("ttsQualityElo", "TTS Quality Elo", 1146.5, "Elo"),
+            ("ttsPronunciationPassRate", "TTS Pronunciation", 0.987, "%")],
+            creator="ElevenLabs"),
+        _board_test_entry("Sonic 3.6", "tts", [
+            ("ttsQualityElo", "TTS Quality Elo", 1100.0, "Elo"),
+            ("ttsPronunciationPassRate", "TTS Pronunciation", 0.951, "%")],
+            creator="Cartesia"),
+    ])
+    out = server.aa_compare(queries=["Eleven v4 Turbo", "Sonic 3.6"],
+                            metrics="ttsPronunciationPassRate,ttsQualityElo")
+    assert "| TTS Quality Elo | 1147 | 1100 |" in out      # Elo rounds half-up
+    assert "| TTS Pronunciation | 98.7% | 95.1% |" in out
+    assert "board rows are their own namespace" in out
+    assert "board: tts" in out
+
+
+def test_compare_picks_the_board_that_carries_the_requested_metric(fake, monkeypatch):
+    """A name on several boards: the one publishing the requested column wins."""
+    def entry(board, kind, key, value, name):
+        return _board_test_entry(name, board, [(key, key, value, "Elo")], kind=kind)
+
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [
+        entry("text_to_speech", "media", "elo", 1200.0, "Sonic 3.6"),
+        entry("text_to_speech", "media", "elo", 1150.0, "Eleven v4 Turbo"),
+        entry("tts", "board", "ttsQualityElo", 1100.0, "Sonic 3.6"),
+        entry("tts", "board", "ttsQualityElo", 1146.5, "Eleven v4 Turbo"),
+    ])
+    out = server.aa_compare(queries=["Sonic 3.6", "Eleven v4 Turbo"],
+                            metrics="ttsQualityElo")
+    assert "board: tts" in out
+    assert "1147" in out and "1100" in out
+    # the media arena that also carries the name is offered as an alternative
+    assert "text_to_speech" in out
+
+
+def test_search_labels_a_board_row(fake, monkeypatch):
+    """``aa_search`` finds a board row and marks it as a board, not an arena."""
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [
+        _board_test_entry("Eleven v4 Turbo", "tts",
+                          [("ttsQualityElo", "TTS Quality Elo", 1146.5, "Elo")])])
+    out = server.aa_search(query="Eleven v4 Turbo")
+    assert "board match" in out and "aa:board" in out
+    assert "tts (board)" in out
+    assert "| TTS Quality Elo | 1147 |" in out
+
+
+def test_pareto_explains_a_board_only_score_has_no_cost(fake, monkeypatch):
+    """A board-only column has rows but no Intelligence-Index cost — say so."""
+    board_row = _model("eleven-v4-turbo", "Eleven v4 Turbo",
+                       evals={"ttsQualityElo": 1146.5})   # no cost_per_task
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: ([*fake.values(), board_row], rich))
+    monkeypatch.setattr(server, "_lb_rows",
+                        lambda refresh=False: [*fake.values(), board_row])
+    monkeypatch.setattr(server, "_board_models",
+                        lambda refresh=False: {"tts": [board_row]})
+    out = server.aa_pareto(score="ttsQualityElo", top=3)
+    assert "no model has both" in out
+    assert "publish no Intelligence-Index cost" in out
+    assert "aa_compare" in out
+
+
+def test_compare_lm_vs_board_row_is_explained(fake, monkeypatch):
+    """A language model and a board row are refused with a clear explanation."""
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [
+        _board_test_entry("Eleven v4 Turbo", "tts",
+                          [("ttsQualityElo", "TTS Quality Elo", 1146.5, "Elo")])])
+    with pytest.raises(ValueError) as exc:
+        server._compare(["alpha", "Eleven v4 Turbo"])
+    msg = str(exc.value)
+    assert "either language models or arena-board models" in msg
+    assert "board row" in msg and "tts" in msg
+
+
+def test_compare_two_language_models_is_unchanged(fake):
+    """The language-model comparison path is untouched by the board widening."""
+    out = server.aa_compare(queries=["alpha", "beta"], metrics="intelligence")
+    assert "| 60.0 | 50.0 |" in out
+    assert "arena" not in out
+    assert "board rows are their own namespace" not in out

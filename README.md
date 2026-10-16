@@ -4,7 +4,9 @@
 
 MCP server for [artificialanalysis.ai](https://artificialanalysis.ai) — live AI model
 benchmarks, pricing, speed, context/parameter specs, provider endpoints and the
-image/video/speech/music arenas — shaped for agents that pay per token.
+image/video/speech/music arenas. Every benchmark and index AA publishes is covered —
+the leaderboard suite, the Decision Models, the Multilingual Index, the on-device
+benchmark set and the eval-chart breakdowns — shaped for agents that pay per token.
 
 No API key needed. One keyless data source: the site's Next.js RSC flight payloads,
 scraped and cached locally — no quota, no backend selection, no fallback logic.
@@ -14,7 +16,7 @@ Every response header shows `aa:rsc`.
 |---|---|
 | source | the site's Next.js RSC flight payloads |
 | needs | nothing |
-| carries | ~50 metrics per model incl. 17 cross-model benchmarks, pricing, speed, per-model cost-per-task breakdown, provider endpoints, media boards, the six Capability Indexes |
+| carries | ~50 metrics per model incl. 17 cross-model benchmarks, pricing, speed, per-model cost-per-task breakdown, provider endpoints, media boards (incl. the silent video arenas), the full speech/voice boards, the six Capability Indexes, the Decision-Models suite, the Multilingual Index, the on-device/mobile benchmark set and the Search-API metrics |
 | quota | none |
 
 ## Install
@@ -64,8 +66,8 @@ Register with an MCP client (omp, Claude Code, Codex, …):
 | `aa_benchmarks` | the search index over everything rankable (benchmarks, indexes, derived metrics, arenas): what it measures, its unit, live coverage and the exact `How to query` call; filter with `query=`/`domain=`/`tag=` |
 | `aa_benchmark_leaderboard` | who leads a given benchmark (full leaderboard when AA publishes one, otherwise AA's chart set — stated in the header; lower-is-better metrics rank lowest-first) |
 | `aa_providers` | which provider serves a model, at what price, quantization, TTFT and feature support; or the whole provider × model board |
-| `aa_media` | text-to-image, image-editing, text-to-video, image-to-video, video-editing, TTS, music, speech-to-text, realtime voice (`speech_to_speech` == `realtime_voice`) |
-| `aa_agents` | AA's coding-agent, chatbot and search-API leaderboards |
+| `aa_media` | text-to-image, image-editing, text-to-video, image-to-video (each with its silent/no-audio variant — `text_to_video_silent`, `image_to_video_silent`), video-editing, TTS, music, speech-to-text, realtime voice (`speech_to_speech` == `realtime_voice`); `category=` ranks one of a board's per-category sub-boards |
+| `aa_agents` | AA's coding-agent, chatbot and search-API leaderboards (the Search API's BrowseComp / DeepSearchQA / latency / $-per-query metrics are rankable too) |
 | `aa_search` | resolve a fuzzy model name to real names + slugs (use it before guessing) |
 | `aa_reference` | metric definitions, index composition, field names, provenance |
 | `aa_raw` | raw JSON escape hatch for anything the tables do not cover |
@@ -124,15 +126,15 @@ board ~160, the `aa_benchmarks` search index ~235, `aa_reference topic=overview`
 Example — `aa_leaderboard {"mode":"value","top":5}` (verbatim):
 
 ```text
-# 5 of 113 scored by value (703 tracked) · value = Intel per $/task, active only · 58m ago · aa:rsc
+# 5 of 114 scored by value (703 tracked) · value = Intel per $/task, active only · 34m ago · aa:rsc
 | Model | Slug | Creator | Intel | $/Task | tok/s | TTFT | Ctx | Intel/$ |
 |---|---|---|---|---|---|---|---|---|
-| GPT-6 Luna (Low) | gpt-6-luna-low | OpenAI | 21.5 | $0.0045 | 120.4 | 2.2s | 1.0M | 4766.0 |
+| GPT-6 Luna (Low) | gpt-6-luna-low | OpenAI | 21.5 | $0.0045 | 117.9 | 2.2s | 1.0M | 4766.0 |
 | GPT-6 Luna (Medium) | gpt-6-luna-medium | OpenAI | 29.9 | $0.02 | - | - | 1.0M | 1712.3 |
-| GPT-6 Luna (Non-reasoning) | gpt-6-luna-non-reasoning | OpenAI | 18.5 | $0.01 | 112.3 | 0.9s | 1.0M | 1627.8 |
-| Granite 4.2 3B | granite-4-2-3b | IBM | 9.1 | $0.0060 | 220.3 | 0.5s | 131k | 1512.5 |
-| Claude Haiku 5.5 (Low) | claude-haiku-5-5-low | Anthropic | 29.5 | $0.02 | 182.9 | 6.3s | 1.0M | 1204.1 |
-— 509 rows skipped: no measured cost per task (AA has cost per task for 194/703 variants)
+| GPT-6 Luna (Non-reasoning) | gpt-6-luna-non-reasoning | OpenAI | 18.5 | $0.01 | 113.0 | 0.9s | 1.0M | 1627.8 |
+| Granite 4.2 3B | granite-4-2-3b | IBM | 9.1 | $0.0060 | 219.0 | 0.5s | 131k | 1512.5 |
+| Claude Haiku 5.5 (Low) | claude-haiku-5-5-low | Anthropic | 29.5 | $0.02 | 186.5 | 6.3s | 1.0M | 1204.1 |
+— 508 rows skipped: no measured cost per task (AA has cost per task for 195/703 variants)
 ```
 
 ## Coverage and limits
@@ -140,18 +142,27 @@ Example — `aa_leaderboard {"mode":"value","top":5}` (verbatim):
 Covered: 703 model variants × ~50 leaderboard metrics **merged with** a 703 × 94
 dataset (capability indexes, AA-Briefcase/GDPval Elo, AIME, LiveCodeBench, GDP.pdf,
 AutomationBench, Harvey LAB, MLCR, cost breakdowns, per-eval costs, licenses, effort
-labels); per-model digests with prompt-type speed breakdowns; 1,199 provider endpoints
-across 64 hosts with prices, quantization, latency and feature flags; 9 media arenas
-plus speech-to-text / streaming / realtime voice; AA's coding-agent, chatbot and
-search-API boards; a 105-entry rankable index (57 cross-model benchmarks plus
-indexes, derived metrics and arenas) with descriptions, units, live
-coverage and the exact tool call for each.
+labels); per-model digests with prompt-type speed breakdowns; 1,222 provider endpoints
+across 64 hosts with prices, quantization, latency and feature flags; 11 media arenas
+(the nine image/video/TTS/music boards plus the two silent video boards) each with
+per-category sub-boards; the full speech boards (speech-to-text **36** rows, streaming
+**45**, speech-to-speech **27** — plus the agentic/non-agentic slices as their own
+rankables) with per-dataset WER, streaming latency, STS components and the TTS
+pronunciation/throughput suite; AA's coding-agent, chatbot and search-API boards, with
+the Search API's BrowseComp / DeepSearchQA / latency / $-per-query metrics; the
+Decision-Models suite, the Multilingual Index (16 languages), the on-device/mobile
+benchmark set (7 evals incl. BFCL-500/BFCL-Small) and the eval-chart breakdown
+sub-scores; a 223-entry rankable index (136 benchmarks plus indexes, derived metrics,
+arenas and views) with descriptions, units, live coverage and the exact tool call for
+each.
 
-Counts were measured live on 2026-10-15 and drift as AA adds or retires models.
+Counts were measured live on 2026-10-16 and drift as AA adds or retires models.
 
 Deliberately out of scope (and the server says so instead of guessing):
 
-- Benchmarks AA does not track (MathVista, DocVQA, BFCL) — no data exists.
+- Benchmarks AA does not track (MathVista, DocVQA) — no data exists. BFCL is tracked
+  only on the on-device/mobile set (`mobile.bfcl_500`, `mobile.bfcl_small`), not as a
+  server-grade leaderboard.
 - Cross-model *signature* leaderboards for benchmarks AA only exposes as a chart
   subset: the tool labels these `not a full leaderboard` and reports real coverage.
 - Model-level **Coding Index** and **Agentic Index**: AA publishes these only through
@@ -160,8 +171,11 @@ Deliberately out of scope (and the server says so instead of guessing):
   LiveCodeBench, FrontierCode, τ²-Bench/τ³-Banking, AutomationBench).
 - Performance-over-time history and raw per-provider measurements are Commercial-tier
   API features; not implemented.
-- Image/video/music *model detail* pages (per-family specs beyond arena rows) and
-  hardware/inference-stack pages are not exposed.
+- Surfaces AA publishes no cross-model ranking for: **HLE Diamond** (model pages only)
+  and **MicroEvals** (11,228 user-voted prompt responses, not an AA-run benchmark).
+- Image/video/music *model detail* pages (per-family specs beyond arena rows) and the
+  laptops/workstations and datacenter hardware pages are not exposed (the mobile
+  on-device benchmark set **is** — see below).
 
 ## Indexes
 
@@ -171,9 +185,10 @@ Free, keyless and scraped like everything else:
 |---|---|---|
 | Intelligence Index v4.3.2 | composite of 10 evaluations | leaderboard (703 variants) |
 | AA-Omniscience | factual recall minus hallucination | leaderboard |
-| **six Capability Indexes** — Finance & Accounting, Strategy & Ops, Legal, Healthcare & Medical, Engineering, Economics | weighted composites with published sub-scores (`knowledge`, `reasoning`, `longContext`, `agenticKnowledgeWork`, `agenticToolUse`, `agenticTerminalUse`, `nonHallucination` — the set differs per index) | model pages (`capabilities.<name>`; full coverage 221/221/221/82/220/228 of the 703 variants) plus a curated 26-row (20 for Healthcare & Medical) cross-model page per index |
+| **six Capability Indexes** — Finance & Accounting, Strategy & Ops, Legal, Healthcare & Medical, Engineering, Economics | weighted composites with published sub-scores (`knowledge`, `reasoning`, `longContext`, `agenticKnowledgeWork`, `agenticToolUse`, `agenticTerminalUse`, `nonHallucination` — the set differs per index) | model pages (`capabilities.<name>`; full coverage ≈222/222/222/82/221/229 of the 703 variants, measured 2026-10-16) plus a curated 26-row (20 for Healthcare & Medical) cross-model page per index |
 | Openness Index | availability, transparency, licensing (0-100) | 326-model array on the openness eval page |
 | Decision Index / Cyber Index | decision quality / safety composite | eval pages, homepage panels |
+| Multilingual Index | average over 16 languages (also per-language) | `/models/multilingual`, 13 chart-selected models |
 | AA Coding Agent Index | coding-agent composite (agent × harness, **not** models) | the coding-agents board, 41 rows |
 
 Not available: the **model-level Coding Index and Agentic Index**. AA publishes them
@@ -181,6 +196,79 @@ only through its paid data API — no public page, route, chunk string or payloa
 exists — so this server does not provide them. The free substitutes are the
 constituent benchmarks (SciCode, Terminal-Bench 4.0, LiveCodeBench, FrontierCode,
 τ²-Bench/τ³-Banking, AutomationBench), which `aa_benchmark_leaderboard` ranks.
+
+## Benchmark suites
+
+Beyond the classic leaderboard benchmarks, the server reads every published
+benchmark AA ships on its own eval pages and chart sets (counts measured
+2026-10-16):
+
+- **Decision Models** — `aa_benchmark_leaderboard benchmark=when2call`,
+  `wildguardtest`, `hleMultichoice`, `omniscienceDecision` (and
+  `omniscienceDecisionNonHallucination`). AA's four Decision-Models eval pages each
+  publish a **28-row** array; the four pages share one 28-row score blob with five
+  keys (`when2callAccuracy`, `wildguardtestAverageF1`, `hleTextMcqAccuracy`,
+  `omniscienceAccuracy`, `omniscienceNonHallucinationRate`), so each model can be
+  ranked on all four. Rows include `decisionModel` entries that are not in the
+  703-row leaderboard.
+- **Multilingual Index** — `aa_leaderboard sort=multilingual` ranks the average;
+  `sort=multilingual.<lang>` ranks one of the **16** languages (`ar, bn, de, en, es,
+  fr, hi, id, it, ja, ko, pt, sw, yo, zh, my`) on `/models/multilingual` (13
+  chart-selected models). The same page carries `globalMmluLite`, which unions with
+  the `/evaluations/global-mmlu-lite` page to 17 scored models.
+- **On-device / mobile benchmark set** — `aa_benchmark_leaderboard
+  benchmark=mobile.<eval>` (`aa_leaderboard sort=mobile.<eval>`) over the **90 rows
+  × 7 evals** on `/hardware-inference-stack/mobile-phones`: `mobile.gpqa` (57
+  scored), `mobile.ifbench` (55), `mobile.ifstruct` (11), `mobile.math_500` (57),
+  `mobile.omniscience` (58), `mobile.bfcl_500` (17) and `mobile.bfcl_small` (57).
+  This is where AA publishes **BFCL** — the old "AA does not track BFCL" claim was
+  wrong.
+- **Silent video arenas** — `aa_media board=text_to_video_silent` (**31** rows) and
+  `board=image_to_video_silent` (**82** rows). These are separate boards from the
+  audio-capable `text_to_video` (28) / `image_to_video` (23); the silent I2V board is
+  the largest of the four.
+- **Media category sub-boards** — `aa_media board=<board> category=<slug>` ranks one
+  of a board's per-category subsets (e.g. `text_to_image` ships 19, `image_editing`
+  17, `text_to_video` 20, `video_editing` 5, `text_to_speech_controlled` 11). Omit
+  `category=` for the overall board.
+- **Breakdown sub-scores** — `aa_model sections=benchmarks` renders the per-eval
+  breakdowns AA publishes on its chart sets (AA-Briefcase rubric pass rate /
+  analytical-quality / presentation Elo, Harvey criteria pass, GDP.pdf macro pass,
+  AutomationBench strict/completion, GDPval/ITBench/EnterpriseOps average turns,
+  AA-3D median turns). The multi-model ones are also rankable sub-metrics:
+  the 9 Openness components (`openness.*`), the 6 Omniscience domains
+  (`omniscience.domain.*`) and 14 SWE languages (`omniscience.language.*`), the 5
+  Terminal-Bench-Science domains and 8 EnterpriseOps-Gym domains.
+- **Speech, voice & search** (all rankable through `aa_leaderboard sort=<key>` /
+  `aa_benchmark_leaderboard benchmark=<key>`, counts measured 2026-10-16):
+  - **Speech-to-text** — `aa_media board=speech_to_text` serves the full
+    `/speech-to-text/non-streaming` board (**36** rows, was the 15-row homepage
+    panel). Metrics: `sttWerIndex` (36), `sttWordErrorRate` (11),
+    `sttEarnings22Wer`, `sttVoxpopuliWer`, `sttAgenttalkWer` (36 each; lower is
+    better).
+  - **Streaming speech-to-text** — `board=speech_to_text_streaming`, the full
+    `/speech-to-text/streaming` board (**45** rows): `sttStreamingWerIndex`,
+    `sttStreamingEarnings22Wer`, `sttStreamingAgenttalkWer` (45 each, lower is
+    better) plus `sttStreamingTimeToFirstPartial` and `sttStreamingTimeToFinal`
+    (seconds, lower is better).
+  - **Speech-to-speech** — `board=speech_to_speech` serves the arena's `overall`
+    slice (**27** rows; the page's 80 rows are the overall + agentic + non-agentic
+    slices). Metrics: `sts` index (19), `stsOverallElo`/`stsAgenticElo`/
+    `stsNonAgenticElo` (27/27/26), `stsTaskCompletionRate` (27),
+    `stsBigBenchAudio`/`stsTauVoice`/`stsArenaScore`/`stsTaskSuccess` (19 each).
+  - **TTS** — `aa_media board=text_to_speech category=<use-case>` ranks AA's
+    use-case sub-boards (`assistants` 90, `knowledge-sharing` 97, `entertainment`
+    90, `customer-service` 92; inline language boards `en-us` 96, `en-gb` 83).
+    Metrics: `ttsQualityElo` (97), `ttsCharactersPerSecond` (79, chars/s),
+    `ttsGenerationTime` (79 s, lower is better), and the pronunciation suite
+    `ttsPronunciationPassRate` / `ttsTermPronunciation` / `ttsTextNormalization` /
+    `ttsSequenceFidelity` / `ttsContextualDisambiguation` (30 each).
+  - **Search API** — `aa_agents board=search_api` plus the rankable
+    `searchQualityIndex`, `searchBrowsecompAccuracy`, `searchDeepsearchqaF1`,
+    `searchOmniscienceAccuracy`, `searchAvgLatency` (s, lower is better),
+    `searchCostPerQuery` (USD/query, lower is better), `searchCostPerTask`,
+    `searchQueriesPerTask` and `searchQualityLift` (26 scored each, 25 for the
+    cost/queries columns).
 
 ## Environment
 
@@ -211,11 +299,19 @@ constituent benchmarks (SciCode, Terminal-Bench 4.0, LiveCodeBench, FrontierCode
   (markdown metacharacters escaped, 120 chars per cell) and any reply is capped at
   200 kB, so one hostile page cannot blow up your context; oversized tables say how
   many rows were kept.
+- **Speech/arena board rows are their own namespace.** A TTS voice or an ASR host
+  is not a language model: those rows publish no Intelligence-Index cost or speed,
+  so `aa_pareto score=<board key>` reports that no frontier can be drawn and names
+  the board's row count. `aa_search` resolves board entries (tagged `aa:arena` with
+  their board) and `aa_compare` compares board rows within one board — the board's
+  own columns and its sub-metrics (`metrics=stsOverallElo`) both work, and the
+  footer says the rows are not language models.
 - **Hostile arguments are rejected up front**, not passed to a fetch or a cache
   path: control characters / lone surrogates, over-long strings (>256 chars, 2000
   for `fields`) and non-finite numbers (`NaN`/`Infinity`) return a `ValueError`
   naming the argument, and error text never echoes more than 60 chars of your input.
-- AA does not track MathVista, DocVQA or BFCL; the server says so instead of inventing.
+- AA does not track MathVista or DocVQA; BFCL is tracked only on the on-device/mobile
+  set (`mobile.bfcl_500`, `mobile.bfcl_small`). The server says so instead of inventing.
 
 ## Troubleshooting
 

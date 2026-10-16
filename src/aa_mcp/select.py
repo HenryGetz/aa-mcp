@@ -128,6 +128,11 @@ def filter_models(
     min_score = numeric["min_score"]
     cn = _norm(creator) if creator else None
     name_tokens = _tokens(name) if name else None
+    # A ``name`` that carries no alphanumeric token (CJK, emoji, punctuation,
+    # whitespace) can never match a model: treat it as "matches nothing" rather
+    # than letting an empty token list silently disable the filter and return the
+    # whole dataset while the header still claims ``name~…`` (audit round 2, M1).
+    name_unmatchable = bool(name) and not name_tokens
     out: list[Model] = []
     for m in models:
         if exclude_deprecated and m.deprecated:
@@ -137,10 +142,10 @@ def filter_models(
             or (m.creator_slug and cn in _norm(m.creator_slug))
         ):
             continue
-        if name_tokens and not all(
+        if name_unmatchable or (name_tokens and not all(
             any(t in f for f in (_norm(m.slug), _norm(m.name), _norm(m.short_name)))
             for t in name_tokens
-        ):
+        )):
             continue
         if open_weights is not None and m.is_open_weights != open_weights:
             continue

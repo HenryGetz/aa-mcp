@@ -12,16 +12,24 @@ present in the captured RSC payloads under ``tests/fixtures/``
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
 __all__ = [
     "BENCHMARKS",
     "DOMAINS",
+    "ENTERPRISE_OPS_DOMAINS",
     "FIELD_ALIASES",
     "METRICS",
+    "MOBILE_EVALS",
+    "MULTILINGUAL_LANGS",
+    "OMNISCIENCE_DOMAINS",
+    "OMNISCIENCE_LANGS",
+    "OPENNESS_COMPONENTS",
     "RANKABLES",
     "TASK_DOMAINS",
+    "TBSCIENCE_DOMAINS",
     "UNTRACKED_BENCHMARKS",
     "VALUE_SOURCE",
     "Benchmark",
@@ -168,11 +176,16 @@ _B = [
     ("math500", "MATH-500", "math-500", "%",
      "MATH-500 competition mathematics problems.", ("math",), False),
     ("globalMmluLiteScore", "Global-MMLU-Lite", "global-mmlu-lite", "%",
-     "Global-MMLU-Lite multilingual knowledge benchmark.", ("knowledge", "multilingual"), False),
-    ("when2call", "When2Call", None, "%",
-     "When2Call tool-calling decision benchmark (model pages only).", ("tool-use",), False),
-    ("wildguardtest", "WildGuardTest", None, "%",
-     "WildGuardTest safety/guardrail evaluation (model pages only).", ("safety",), False),
+     "Global-MMLU-Lite multilingual knowledge benchmark; charted on both "
+     "/evaluations/global-mmlu-lite and /models/multilingual, which overlap "
+     "(gemini-3-pro is on both) for a 17-model union.",
+     ("knowledge", "multilingual"), False),
+    ("when2call", "When2Call", "when2call", "%",
+     "When2Call tool-calling decision benchmark (28-row decision-model table).",
+     ("tool-use", "decision"), False),
+    ("wildguardtest", "WildGuardTest", "wildguardtest", "%",
+     "WildGuardTest safety/guardrail evaluation (28-row decision-model table).",
+     ("safety", "decision"), False),
     ("cyberIndex", "AA Cyber Index", "artificial-analysis-cyber-index", "index",
      "AA Cyber Index capability composite (homepage panel).", ("cyber", "index"), False),
     ("cweBench", "CWE-Bench-AA", "cwe-bench-aa", "%",
@@ -236,7 +249,329 @@ _B = [
     ("enterpriseOpsGymSuccessRateByDomain", "EnterpriseOps By Domain",
      "enterprise-ops-gym-aa", "mixed",
      "EnterpriseOps-Gym-AA success rate by domain.", ("agentic", "breakdown"), False),
+    # The Decision-Models family: four ``/evaluations/<slug>`` pages that ship one
+    # shared 28-row table (``indexScore`` + a ``scores`` map).  AA-Omniscience-
+    # Decision and HLE-MultiChoice had no entry at all; When2Call and WildGuardTest
+    # existed but carried no slug, so no surface could be found for them.
+    ("hleMultichoice", "HLE-MultiChoice", "hle-multichoice", "%",
+     "Humanity's Last Exam text multiple-choice subset, scored across AA's "
+     "decision-model cohort (28 contestants).", ("reasoning", "decision"), False),
+    ("omniscienceDecision", "AA-Omniscience-Decision", "aa-omniscience-decision", "%",
+     "AA-Omniscience accuracy on the decision-model cohort (factual recall on "
+     "decision tasks).", ("knowledge", "hallucination", "decision"), False),
+    ("omniscienceDecisionNonHallucination", "Omniscience-Decision Non-Halluc",
+     "aa-omniscience-decision", "%",
+     "AA-Omniscience non-hallucination rate on the decision-model cohort.",
+     ("knowledge", "hallucination", "decision"), False),
+    # The Multilingual Index lives on ``/models/multilingual`` (AA's OpenAPI calls
+    # it ``artificial_analysis_multilingual_index``); the same page also carries the
+    # per-language split and a 13-row ``globalMmluLite`` that is wider than the
+    # 5-row ``/evaluations/global-mmlu-lite`` chart set.
+    ("multilingual", "Multilingual Index", "multilingual", "%",
+     "AA Multilingual Index: mean accuracy across 16 languages (Global-MMLU-Lite).",
+     ("multilingual", "knowledge"), False),
 ]
+
+#: Multilingual Index languages: payload key -> display name.  The per-language
+#: scores are registered as rankables (``multilingual.<code>``) and flattened by
+#: :mod:`aa_mcp.normalize`, so both sides read the same table.
+MULTILINGUAL_LANGS: dict[str, str] = {
+    "ar": "Arabic", "bn": "Bengali", "de": "German", "en": "English",
+    "es": "Spanish", "fr": "French", "hi": "Hindi", "id": "Indonesian",
+    "it": "Italian", "ja": "Japanese", "ko": "Korean", "pt": "Portuguese",
+    "sw": "Swahili", "yo": "Yoruba", "zh": "Chinese", "my": "Burmese",
+}
+
+#: AA-Omniscience per-domain slices (``omniscienceBreakdown.byDomain``):
+#: payload key -> (key slug, display name).
+OMNISCIENCE_DOMAINS: dict[str, tuple[str, str]] = {
+    "Business": ("business", "Business"),
+    "Health": ("health", "Health"),
+    "Humanities & Social Sciences": ("humanitiesAndSocialSciences",
+                                     "Humanities & Social Sciences"),
+    "Law": ("law", "Law"),
+    "Science, Engineering & Mathematics": ("scienceAndEngineering",
+                                           "Science, Engineering & Mathematics"),
+    "Software Engineering (SWE)": ("softwareEngineering", "Software Engineering (SWE)"),
+}
+
+#: AA-Omniscience per-SWE-language slices (``omniscienceBreakdown.bySweLanguage``):
+#: payload key -> display name (the eval key is the lowercased key).
+OMNISCIENCE_LANGS: dict[str, str] = {
+    "C": "C", "R": "R", "Go": "Go", "PHP": "PHP", "Dart": "Dart", "HTML": "HTML",
+    "Java": "Java", "Rust": "Rust", "Julia": "Julia", "Swift": "Swift",
+    "Kotlin": "Kotlin", "Python": "Python", "JavaScript": "JavaScript",
+    "TypeScript": "TypeScript",
+}
+
+#: AA Openness Index components (``opennessBreakdown``): payload key -> display
+#: name (the eval key is ``openness.<payload key>``).
+OPENNESS_COMPONENTS: dict[str, str] = {
+    "modelAvailability": "Model availability",
+    "modelTransparency": "Model transparency",
+    "transparencyPreTrainingData": "Pre-training data transparency",
+    "transparencyPostTrainingData": "Post-training data transparency",
+    "transparencyMethodology": "Methodology transparency",
+    "dataPretrainAccess": "Pre-training data access",
+    "dataPretrainLicense": "Pre-training data license",
+    "dataPosttrainAccess": "Post-training data access",
+    "dataPosttrainLicense": "Post-training data license",
+}
+
+#: Terminal-Bench-Science domains (``terminalBenchSciencePassRateByDomain``):
+#: payload key -> display name (the eval key keeps the payload's kebab slug).
+TBSCIENCE_DOMAINS: dict[str, str] = {
+    "life-sciences": "Life sciences",
+    "physical-sciences": "Physical sciences",
+    "mathematical-sciences": "Mathematical sciences",
+    "engineering-sciences": "Engineering sciences",
+    "earth-sciences": "Earth sciences",
+}
+
+#: EnterpriseOps-Gym domains (``enterpriseOpsGymSuccessRateByDomain``).
+ENTERPRISE_OPS_DOMAINS: dict[str, str] = {
+    "csm": "CSM", "hr": "HR", "itsm": "ITSM", "email": "Email",
+    "calendar": "Calendar", "teams": "Teams", "drive": "Drive", "hybrid": "Hybrid",
+}
+
+#: The on-device benchmark set (``/hardware-inference-stack/mobile-phones``):
+#: ``evalScores`` key -> display name.  The eval keys are namespaced
+#: (``mobile.<key>``) so an on-device quantised run never mixes into the
+#: first-party leaderboard column of the same evaluation.
+MOBILE_EVALS: dict[str, str] = {
+    "gpqa": "GPQA Diamond",
+    "ifbench": "IFBench",
+    "ifstruct": "IFStruct",
+    "math_500": "MATH-500",
+    "omniscience": "AA-Omniscience",
+    "bfcl_500": "BFCL-500",
+    "bfcl_small": "BFCL-Small",
+}
+
+
+#: Benchmark rows for AA's per-model breakdown sub-scores.  AA publishes several
+#: benchmarks as a per-model *map* of sub-scores rather than a flat column; each
+#: scalar in those maps is registered as its own rankable so the breakdown is not
+#: merely readable on one model page but rankable across models — the treatment
+#: the refusal rates, pass@k siblings and capability sub-scores already get.
+#: Every row is a chart-set value (``slug`` names the page that carries it), so
+#: ``source_hint`` is filled in below.
+_SUBSCORES: list[tuple] = []
+# Multilingual Index per language (``multilingual.<code>``).
+for _code, _name in MULTILINGUAL_LANGS.items():
+    _SUBSCORES.append((
+        f"multilingual.{_code}", f"Multilingual {_name}", "multilingual", "%",
+        f"Multilingual Index accuracy in {_name} (Global-MMLU-Lite).",
+        ("multilingual", "language"), False,
+    ))
+# Openness Index components (``openness.<component>``).
+for _comp, _name in OPENNESS_COMPONENTS.items():
+    _SUBSCORES.append((
+        f"openness.{_comp}", f"Openness · {_name}",
+        "artificial-analysis-openness-index", "index",
+        f"AA Openness Index component: {_name} (0-100).",
+        ("openness", "index", "openness-component"), False,
+    ))
+# AA-Omniscience per-domain and per-SWE-language slices.
+for _raw, (_slug, _name) in OMNISCIENCE_DOMAINS.items():
+    _SUBSCORES.append((
+        f"omniscience.domain.{_slug}", f"Omniscience · {_name}", "omniscience", "index",
+        f"AA-Omniscience Index on the {_name} domain (same scale as the headline index).",
+        ("knowledge", "hallucination", "domain"), False,
+    ))
+for _raw, _name in OMNISCIENCE_LANGS.items():
+    _SUBSCORES.append((
+        f"omniscience.language.{_raw.lower()}", f"Omniscience · {_name}",
+        "omniscience", "index",
+        f"AA-Omniscience Index on {_name} software-engineering questions.",
+        ("knowledge", "coding", "language"), False,
+    ))
+# Terminal-Bench-Science and EnterpriseOps-Gym domain splits.
+for _dom, _name in TBSCIENCE_DOMAINS.items():
+    _SUBSCORES.append((
+        f"terminalBenchScience.domain.{_dom}", f"TB-Science · {_name}",
+        "terminal-bench-science", "%",
+        f"Terminal-Bench-Science 0.1 pass rate on {_name} tasks.",
+        ("agentic", "science", "domain"), False,
+    ))
+for _dom, _name in ENTERPRISE_OPS_DOMAINS.items():
+    _SUBSCORES.append((
+        f"enterpriseOpsGym.domain.{_dom}", f"EnterpriseOps · {_name}",
+        "enterprise-ops-gym-aa", "%",
+        f"EnterpriseOps-Gym-AA success rate on the {_name} domain.",
+        ("agentic", "ops", "domain"), False,
+    ))
+# The on-device benchmark set (namespaced so it never mixes into the leaderboard
+# column of the same evaluation).
+for _name, _label in MOBILE_EVALS.items():
+    _SUBSCORES.append((
+        f"mobile.{_name}", f"On-device {_label}", "mobile", "%",
+        f"{_label} run on-device by AA's mobile benchmark set (quantised weights, "
+        "bounded context).",
+        ("mobile", "on-device", "local"), False,
+    ))
+# Headline scalars inside the breakdown maps.
+_SUBSCORES.extend([
+    ("briefcaseAnalyticalQualityElo", "Briefcase Analytical Elo", "aa-briefcase", "Elo",
+     "AA-Briefcase analytical-quality Elo (sub-score of the AA-Briefcase Elo).",
+     ("agentic", "knowledge-work", "elo"), False),
+    ("briefcasePresentationElo", "Briefcase Presentation Elo", "aa-briefcase", "Elo",
+     "AA-Briefcase presentation-quality Elo (sub-score of the AA-Briefcase Elo).",
+     ("agentic", "knowledge-work", "elo"), False),
+    ("briefcaseRubricPassRate", "Briefcase Rubric Pass", "aa-briefcase", "%",
+     "AA-Briefcase rubric pass rate (share of rubric criteria met).",
+     ("agentic", "knowledge-work"), False),
+    ("harveyCriteriaPass", "Harvey Criteria Pass", "harvey-lab-aa", "%",
+     "Harvey LAB-AA share of rubric criteria passed.",
+     ("legal", "agentic"), False),
+    ("harveyGatedAllPass", "Harvey Gated All-Pass", "harvey-lab-aa", "%",
+     "Harvey LAB-AA share of tasks passing every gated criterion.",
+     ("legal", "agentic"), False),
+    ("gdpPdfMacroPassRate", "GDP.pdf Macro Pass", "gdp-pdf", "%",
+     "GDP.pdf macro-criterion pass rate (fraction of document-level criteria met).",
+     ("agentic", "knowledge-work"), False),
+    ("automationBenchStrictScore", "AutomationBench Strict", "automationbench-aa", "%",
+     "AutomationBench-AA strict score (full task completion without violations).",
+     ("agentic", "tool-use"), False),
+    ("automationBenchCompletion", "AutomationBench Completion", "automationbench-aa", "%",
+     "AutomationBench-AA task completion rate (guardrail violations ignored).",
+     ("agentic", "tool-use"), False),
+    ("gdpvalAvgTurns", "GDPval Avg Turns", "gdpval-aa", "index",
+     "Mean agent turns per GDPval-AA task.",
+     ("agentic", "knowledge-work"), False),
+    ("itbenchAvgTurnsPerTask", "ITBench Avg Turns", "itbench-aa", "index",
+     "Mean agent turns per ITBench-AA (SRE) task.",
+     ("agentic", "ops"), False),
+    ("enterpriseOpsGymAvgTurns", "EnterpriseOps Avg Turns", "enterprise-ops-gym-aa", "index",
+     "Mean conversation turns per EnterpriseOps-Gym-AA task.",
+     ("agentic", "ops"), False),
+    ("aa3dTurnsP50", "AA-3D Median Turns", "aa-3d", "index",
+     "Median agent turns to build one AA-3D experience.",
+     ("media", "agentic"), False),
+    ("medianCanonicalAnswerOutputSpeed", "Answer Output Speed",
+     "artificial-analysis-intelligence-index", "tok/s",
+     "Median output speed (tokens/s) on the Intelligence Index answer phase.",
+     ("speed",), False),
+])
+_B.extend(_SUBSCORES)
+
+#: Per-model metric columns of the speech / TTS / search boards.  Each board page
+#: publishes a table rather than an eval chart set, so ``loaders.parse_chart``
+#: adapts its rows (``_CHART_ADAPTERS``) and these keys are ranked through the same
+#: chart-set path as every other published column.
+_BOARD_METRICS: list[tuple] = [
+    # /speech-to-text/non-streaming (36 rows)
+    ("sttWerIndex", "STT WER Index", "stt", "%",
+     "AA-WER Index for speech-to-text: aggregate word error rate across AA's "
+     "transcription datasets; lower is better.", ("speech", "wer", "stt"), False),
+    ("sttWordErrorRate", "STT Word Error Rate", "stt", "%",
+     "Word error rate on the model's own transcription dataset, as published on "
+     "AA's speech-to-text board; lower is better.", ("speech", "wer", "stt"), False),
+    ("sttEarnings22Wer", "STT Earnings22 WER", "stt", "%",
+     "Word error rate on Earnings22-Cleaned-AA (earnings-call audio); lower is better.",
+     ("speech", "wer", "stt"), False),
+    ("sttVoxpopuliWer", "STT VoxPopuli WER", "stt", "%",
+     "Word error rate on VoxPopuli-Cleaned-AA (parliamentary speech); lower is better.",
+     ("speech", "wer", "stt"), False),
+    ("sttAgenttalkWer", "STT AgentTalk WER", "stt", "%",
+     "Word error rate on AA-AgentTalk (agentic voice transcripts); lower is better.",
+     ("speech", "wer", "stt"), False),
+    # /speech-to-text/streaming (45 rows)
+    ("sttStreamingWerIndex", "STT Stream WER Idx", "stt_streaming", "%",
+     "AA-WER streaming index: word error rate of the streaming transcript; "
+     "lower is better.", ("speech", "wer", "stt", "streaming"), False),
+    ("sttStreamingEarnings22Wer", "Stream Earnings22", "stt_streaming", "%",
+     "Streaming word error rate on Earnings22-Cleaned-AA; lower is better.",
+     ("speech", "wer", "stt", "streaming"), False),
+    ("sttStreamingAgenttalkWer", "Stream AgentTalk", "stt_streaming", "%",
+     "Streaming word error rate on AA-AgentTalk; lower is better.",
+     ("speech", "wer", "stt", "streaming"), False),
+    ("sttStreamingTimeToFinal", "Stream Final Time", "stt_streaming", "s",
+     "Seconds from end of speech to the final transcript; lower is better.",
+     ("speech", "latency", "stt", "streaming"), False),
+    ("sttStreamingTimeToFirstPartial", "Stream 1st Partial", "stt_streaming", "s",
+     "Seconds from end of speech to the first partial transcript; lower is better.",
+     ("speech", "latency", "stt", "streaming"), False),
+    # /speech-to-speech/arena (80 rows across three slices)
+    ("sts", "STS Index", "sts", "index",
+     "Artificial Analysis Speech to Speech Index (0-100) over the arena's "
+     "overall slice.", ("speech", "index", "sts", "realtime-voice"), False),
+    ("stsOverallElo", "STS Overall Elo", "sts", "Elo",
+     "Arena Elo on the STS overall slice (human pairwise preference).",
+     ("speech", "elo", "sts"), False),
+    ("stsAgenticElo", "STS Agentic Elo", "sts", "Elo",
+     "Arena Elo on the STS agentic slice (agentic voice tasks).",
+     ("speech", "elo", "sts", "agentic"), False),
+    ("stsNonAgenticElo", "STS Non-Agentic Elo", "sts", "Elo",
+     "Arena Elo on the STS non-agentic slice (plain conversation).",
+     ("speech", "elo", "sts"), False),
+    ("stsTaskCompletionRate", "STS Task %", "sts", "%",
+     "Share of STS arena tasks the model completed successfully.",
+     ("speech", "sts", "agentic"), False),
+    ("stsBigBenchAudio", "STS BigBenchAudio", "sts", "index",
+     "Big Bench Audio component of the STS Index (0-100).",
+     ("speech", "sts", "index"), False),
+    ("stsTauVoice", "STS tau3-Voice", "sts", "index",
+     "tau3-Voice component of the STS Index (0-100).",
+     ("speech", "sts", "index"), False),
+    ("stsArenaScore", "STS Arena Score", "sts", "index",
+     "Arena-preference component of the STS Index (0-100).",
+     ("speech", "sts", "index"), False),
+    ("stsTaskSuccess", "STS Succ Idx", "sts", "index",
+     "Task-success component of the STS Index (0-100).",
+     ("speech", "sts", "index"), False),
+    # /text-to-speech/models (107 rows, 30 with pronunciation results)
+    ("ttsQualityElo", "TTS Quality Elo", "tts", "Elo",
+     "Text-to-speech arena-preference Elo for the model (AA TTS quality).",
+     ("speech", "tts", "elo"), False),
+    ("ttsPronunciationPassRate", "TTS Pronunciation", "tts", "%",
+     "Pronunciation robustness: share of highlighted spans human reviewers judged "
+     "as pronounced correctly (English).", ("speech", "tts"), False),
+    ("ttsTermPronunciation", "TTS Term Pron.", "tts", "%",
+     "Pronunciation robustness on standalone terms.", ("speech", "tts"), False),
+    ("ttsTextNormalization", "TTS Text Norm.", "tts", "%",
+     "Pronunciation robustness on expanded shorthand (text normalisation).",
+     ("speech", "tts"), False),
+    ("ttsSequenceFidelity", "TTS Sequence Fid.", "tts", "%",
+     "Pronunciation robustness on preserving exact sequences.", ("speech", "tts"), False),
+    ("ttsContextualDisambiguation", "TTS Context", "tts", "%",
+     "Pronunciation robustness on contextually appropriate readings.",
+     ("speech", "tts"), False),
+    ("ttsCharactersPerSecond", "TTS chars/s", "tts", "chars/s",
+     "Median generation throughput in characters per second.",
+     ("speech", "tts", "speed"), False),
+    ("ttsGenerationTime", "TTS Gen Time", "tts", "s",
+     "Median generation time in seconds (lower is better).",
+     ("speech", "tts", "latency"), False),
+    # /agents/search-api (26 provider rows)
+    ("searchQualityIndex", "Search Index", "search-api", "%",
+     "AA Search API Index: composite search quality across AA's search benchmarks.",
+     ("agents", "search", "tool-use"), False),
+    ("searchBrowsecompAccuracy", "Search BrowseComp", "search-api", "%",
+     "BrowseComp accuracy for the search provider.",
+     ("agents", "search", "knowledge"), False),
+    ("searchDeepsearchqaF1", "Search DSQA F1", "search-api", "%",
+     "DeepSearchQA average F1 for the search provider.",
+     ("agents", "search", "tool-use"), False),
+    ("searchOmniscienceAccuracy", "Search Omni Acc", "search-api", "%",
+     "AA-Omniscience accuracy of the provider's answer model.",
+     ("agents", "search", "knowledge"), False),
+    ("searchAvgLatency", "Search Latency", "search-api", "s",
+     "Average end-to-end latency per task in seconds; lower is better.",
+     ("agents", "search", "latency"), False),
+    ("searchCostPerQuery", "Search $/query", "search-api", "USD/query",
+     "Search-API cost per search query in USD; lower is better.",
+     ("agents", "search", "cost"), False),
+    ("searchCostPerTask", "Search $/task", "search-api", "USD/task",
+     "Search-API cost per task in USD; lower is better.",
+     ("agents", "search", "cost"), False),
+    ("searchQueriesPerTask", "Search Q/task", "search-api", "index",
+     "Mean search queries issued per task.", ("agents", "search"), False),
+    ("searchQualityLift", "Search Lift", "search-api", "%",
+     "Search quality lift over the same model answering without search.",
+     ("agents", "search"), False),
+]
+_B.extend(_BOARD_METRICS)
 
 #: benchmark key -> best surface that yields a *cross-model* value.
 #: Everything not listed defaults to "leaderboard" (the 700-row array).
@@ -297,7 +632,14 @@ _SOURCE_HINTS: dict[str, str] = {
     "mmluPro": "chart",
     "when2call": "chart",
     "wildguardtest": "chart",
+    "hleMultichoice": "chart",
+    "omniscienceDecision": "chart",
+    "omniscienceDecisionNonHallucination": "chart",
+    "multilingual": "chart",
 }
+#: every breakdown sub-score and board metric is a per-model chart-set value
+for _row in _SUBSCORES + _BOARD_METRICS:
+    _SOURCE_HINTS.setdefault(_row[0], "chart")
 
 BENCHMARKS: dict[str, Benchmark] = {
     key: Benchmark(key, label, slug, unit, desc, tuple(tags), member,
@@ -323,12 +665,19 @@ UNTRACKED_BENCHMARKS: dict[str, str] = {
                  "plus the per-model image/video input modality flags.",
     "docvqa": "AA does not track DocVQA; the closest document-style evaluation is "
               "GDP.pdf (with MMLU-Pro for broad knowledge).",
-    "bfcl": "AA does not track BFCL (Berkeley Function Calling); tool use is covered by "
-            "the per-endpoint functionCalling/jsonMode flags and by "
-            "\u03c4\u00b2-Bench / \u03c4\u00b3-Banking.",
-    "berkeley function calling": "AA does not track BFCL (Berkeley Function Calling); "
-            "tool use is covered by the per-endpoint functionCalling/jsonMode flags and "
-            "by \u03c4\u00b2-Bench / \u03c4\u00b3-Banking.",
+    "bfcl": "AA tracks BFCL only on its on-device benchmark set "
+            "(/hardware-inference-stack/mobile-phones, fields bfcl_500 / bfcl_small) — "
+            "there is no first-party BFCL column. For server-side tool use see "
+            "\u03c4\u00b2-Bench / \u03c4\u00b3-Banking and the per-endpoint "
+            "functionCalling/jsonMode flags.",
+    "berkeley function calling": "AA tracks BFCL only on its on-device benchmark set "
+            "(/hardware-inference-stack/mobile-phones, fields bfcl_500 / bfcl_small) — "
+            "there is no first-party BFCL column. For server-side tool use see "
+            "\u03c4\u00b2-Bench / \u03c4\u00b3-Banking and the per-endpoint "
+            "functionCalling/jsonMode flags.",
+    "ifstruct": "AA tracks IFStruct only on its on-device benchmark set "
+                "(/hardware-inference-stack/mobile-phones); the closest first-party "
+                "instruction-following evaluation is IFBench.",
     "human eval": "AA does not track HumanEval; the closest coding evaluation is "
                   "LiveCodeBench (also SciCode / FrontierCode).",
     "humaneval": "AA does not track HumanEval; the closest coding evaluation is "
@@ -551,7 +900,9 @@ for _key, _label, _kind, _group, _desc, _better in _M:
 
 # Benchmark metrics (scalar data fields living in Model.evals / .indices).
 _UNIT_KIND = {"%": "pct", "Elo": "elo", "index": "index", "s": "sec",
-              "tok/s": "tps", "USD/task": "usd", "mixed": "str", "text": "str"}
+              "tok/s": "tps", "USD/task": "usd", "mixed": "str", "text": "str",
+              # the TTS/search boards publish throughput and per-query prices
+              "chars/s": "tps", "USD/query": "usd"}
 #: Benchmark metrics where a *lower* value is the better result. Audited against
 #: `BENCHMARKS` (2026-10-14): the only benchmark descriptions that say "lower is
 #: better" are these four, plus the `METRICS` cost/TTFT/verbosity family above.
@@ -562,7 +913,112 @@ _LOWER_IS_BETTER = {
     "cyberRefusalRate",
     "cybergymE2eRefusalRate",
     "deepsecBenchRefusalRate",
+    # every word-error-rate / latency / cost column says "lower is better"
+    "sttWerIndex", "sttWordErrorRate", "sttEarnings22Wer", "sttVoxpopuliWer",
+    "sttAgenttalkWer", "sttStreamingWerIndex", "sttStreamingEarnings22Wer",
+    "sttStreamingAgenttalkWer", "sttStreamingTimeToFinal",
+    "sttStreamingTimeToFirstPartial", "ttsGenerationTime", "searchAvgLatency",
+    "searchCostPerQuery", "searchCostPerTask",
 }
+#: Benchmark key -> the short label a table head shows.  A benchmark's own label
+#: is truncated to 12 characters for column headers, which mangles the longer ones
+#: ("On-device BFCL-500" and "-Small" both become "On-device BF"; every
+#: "Openness · …" component becomes "Openness · M").  These give each one a label
+#: that fits and stays distinguishable; the canonical key never changes.
+_SHORT_LABELS: dict[str, str] = {
+    "globalMmluLiteScore": "Global-MMLU",
+    # these four/six all collapsed to one header ("Terminal-Ben", "Analyst Pass")
+    # under plain truncation, so a reader could not tell the columns apart
+    "terminalBench21": "TB 2.1",
+    "terminalbenchHard": "TB Hard",
+    "terminalBench40": "TB 4.0",
+    "terminalBenchScience": "TB Science",
+    "analystAgentPassAt1": "Analyst P@1",
+    "analystAgentPassAtK": "Analyst P@k",
+    "wildguardtest": "WildGuard",
+    "hleMultichoice": "HLE-MCQ",
+    "omniscienceDecision": "OmniDecision",
+    "omniscienceDecisionNonHallucination": "Omni-Dec NH",
+    "multilingual": "Multilingual",
+    "briefcaseAnalyticalQualityElo": "BC Analytic",
+    "briefcasePresentationElo": "BC Present.",
+    "briefcaseRubricPassRate": "BC Rubric",
+    "harveyCriteriaPass": "Harvey Crit.",
+    "harveyGatedAllPass": "Harvey Gated",
+    "gdpPdfMacroPassRate": "GDP.pdf Mac",
+    "automationBenchStrictScore": "AutoBench St",
+    "automationBenchCompletion": "AutoBench Cp",
+    "gdpvalAvgTurns": "GDPval Turns",
+    "itbenchAvgTurnsPerTask": "ITBench Trn",
+    "enterpriseOpsGymAvgTurns": "EntOps Turns",
+    "aa3dTurnsP50": "AA-3D Turns",
+    "medianCanonicalAnswerOutputSpeed": "Answer tok/s",
+    "mobile.gpqa": "Dev GPQA",
+    "mobile.ifbench": "Dev IFBench",
+    "mobile.ifstruct": "Dev IFStruct",
+    "mobile.math_500": "Dev MATH-500",
+    "mobile.omniscience": "Dev Omni",
+    "mobile.bfcl_500": "Dev BFCL-500",
+    "mobile.bfcl_small": "Dev BFCL-Sm",
+}
+#: the per-language / per-domain families, generated from the same tables that
+#: define their keys so a new entry can never be left without a short label
+_SHORT_LABELS.update({
+    f"multilingual.{_code}": _name for _code, _name in MULTILINGUAL_LANGS.items()
+})
+_SHORT_LABELS.update({
+    f"openness.{_comp}": _short for _comp, _short in (
+        ("modelAvailability", "Open Avail"),
+        ("modelTransparency", "Open Model"),
+        ("transparencyPreTrainingData", "Open PreData"),
+        ("transparencyPostTrainingData", "Open PostDat"),
+        ("transparencyMethodology", "Open Method"),
+        ("dataPretrainAccess", "Open PreAcc"),
+        ("dataPretrainLicense", "Open PreLic"),
+        ("dataPosttrainAccess", "Open PstAcc"),
+        ("dataPosttrainLicense", "Open PstLic"),
+    )
+})
+_SHORT_LABELS.update({
+    f"omniscience.domain.{_slug}": _short for _slug, _short in (
+        ("business", "Omni Bus."),
+        ("health", "Omni Health"),
+        ("humanitiesAndSocialSciences", "Omni Hum&Soc"),
+        ("law", "Omni Law"),
+        ("scienceAndEngineering", "Omni Sci&Eng"),
+        ("softwareEngineering", "Omni SWE"),
+    )
+})
+_SHORT_LABELS.update({
+    f"omniscience.language.{_code.lower()}": _short for _code, _short in (
+        ("JavaScript", "Omni JS"), ("TypeScript", "Omni TS"),
+    )
+})
+for _code, _name in OMNISCIENCE_LANGS.items():
+    _SHORT_LABELS.setdefault(f"omniscience.language.{_code.lower()}", f"Omni {_name}")
+_SHORT_LABELS.update({
+    f"terminalBenchScience.domain.{_dom}": _short for _dom, _short in (
+        ("life-sciences", "TB-Sci Life"), ("physical-sciences", "TB-Sci Phys"),
+        ("mathematical-sciences", "TB-Sci Math"),
+        ("engineering-sciences", "TB-Sci Eng"),
+        ("earth-sciences", "TB-Sci Earth"),
+    )
+})
+_SHORT_LABELS.update({
+    f"enterpriseOpsGym.domain.{_dom}": _short for _dom, _short in (
+        ("csm", "EntOps CSM"), ("hr", "EntOps HR"), ("itsm", "EntOps ITSM"),
+        ("email", "EntOps Email"), ("calendar", "EntOps Cal"),
+        ("teams", "EntOps Teams"), ("drive", "EntOps Drive"),
+        ("hybrid", "EntOps Hyb"),
+    )
+})
+
+
+def _short_label(key: str, label: str) -> str:
+    """The column label for benchmark ``key`` (AA's own label, shortened)."""
+    return _SHORT_LABELS.get(key, label)[:12]
+
+
 for _b in BENCHMARKS.values():
     if _b.unit == "mixed":
         continue
@@ -571,7 +1027,8 @@ for _b in BENCHMARKS.values():
     _kind = _UNIT_KIND.get(_b.unit, "str")
     _group = "index" if _b.unit == "index" else "eval"
     _better = "low" if _b.key in _LOWER_IS_BETTER else "high"
-    METRICS[_b.key] = Metric(_b.key, _b.label[:12], _kind, _group, _b.desc, _better)
+    METRICS[_b.key] = Metric(_b.key, _short_label(_b.key, _b.label),
+                             _kind, _group, _b.desc, _better)
 
 
 # --------------------------------------------------------------------------- #
@@ -702,6 +1159,7 @@ _OPENAPI_ALIASES = {
     "gdpval_aa_normalized": "gdpvalNormalized",
     "mmmu_pro": "mmmuPro",
     "mlcr_overall": "mlcrOverall",
+    "artificial_analysis_multilingual_index": "multilingual",
     "price_1m_input_tokens": "price_in",
     "price_1m_output_tokens": "price_out",
 }
@@ -780,6 +1238,20 @@ def _infer_kind(value) -> str:
     return "str"
 
 
+def _elo_text(value: float) -> str:
+    """An Elo cell as AA's own table renders it: ``.5`` rounds away from zero.
+
+    Python's ``:.0f`` rounds half-to-even, so it prints ``1146.5`` as ``"1146"``
+    where the site shows ``"1147"`` (and ``1092.5`` as ``"1092"`` vs ``"1093"``).
+    AA's payload carries the rendered string in ``formatted.elo``, so the site's
+    convention is observable rather than assumed.  Display only — the stored Elo
+    stays the exact float.
+    """
+    if not math.isfinite(value):
+        return str(value)
+    return str(math.floor(value + 0.5) if value >= 0 else math.ceil(value - 0.5))
+
+
 def _compact_tokens(value: float) -> str:
     if value >= 1_000_000:
         return f"{value / 1_000_000:.1f}M"
@@ -808,7 +1280,7 @@ def format_value(key: str, value) -> str:
         if kind == "pct":
             return f"{float(value) * 100:.1f}%"
         if kind == "elo":
-            return f"{float(value):.0f}"
+            return _elo_text(float(value))
         if kind == "index":
             return f"{float(value):.1f}"
         if kind == "usd":
@@ -857,7 +1329,8 @@ class Rankable:
 
 #: benchmark unit -> Rankable unit
 _BENCH_UNIT = {"%": "%", "Elo": "Elo", "index": "index", "mixed": "text",
-               "text": "text", "s": "s", "tok/s": "tok/s", "USD/task": "USD/task"}
+               "text": "text", "s": "s", "tok/s": "tok/s", "USD/task": "USD/task",
+               "chars/s": "chars/s", "USD/query": "USD/query"}
 
 #: canonical full names for the composites whose short label is ambiguous in search
 _LABEL_OVERRIDES = {
@@ -868,6 +1341,7 @@ _LABEL_OVERRIDES = {
     "omniscience": "AA-Omniscience Index",
     "cyberIndex": "Artificial Analysis Cyber Index",
     "decisionIndex": "Artificial Analysis Decision Index",
+    "multilingual": "Artificial Analysis Multilingual Index",
     "capabilities.financeAndAccounting": "Finance & Accounting Index",
     "capabilities.strategyAndOps": "Strategy & Ops Index",
     "capabilities.legal": "Legal Index",
@@ -895,6 +1369,51 @@ _EXTRA_ALIASES = {
     "frontierCode": ("FrontierCode 1.1", "FrontierCode v1.1"),
     "aa3dElo": ("AA-3D", "AA 3D", "AA-3D Elo"),
     "decisionIndex": ("Decision Index", "AA Decision Index"),
+    "multilingual": ("Multilingual Index", "AA Multilingual Index",
+                     "Multilingual", "Languages Index", "Languages"),
+    "hleMultichoice": ("HLE-MultiChoice", "HLE MultiChoice", "HLE-MCQ",
+                       "Humanity's Last Exam MultiChoice"),
+    "omniscienceDecision": ("AA-Omniscience-Decision", "Omniscience Decision",
+                            "Omniscience-Decision", "Omniscience Decision Accuracy"),
+    "omniscienceDecisionNonHallucination": (
+        "Omniscience-Decision Non-Hallucination", "Omniscience Decision Non-Halluc",
+        "AA-Omniscience-Decision Non-Hallucination"),
+    "when2call": ("When 2 Call", "When2Call Accuracy"),
+    "wildguardtest": ("WildGuard Test", "WildGuard", "WildGuardTest Average F1"),
+    "mobile.bfcl_500": ("BFCL-500", "BFCL 500", "Berkeley Function Calling 500",
+                        "BFCL"),
+    "mobile.bfcl_small": ("BFCL-Small", "BFCL Small", "BFCL-S"),
+    "mobile.ifstruct": ("IFStruct", "IF-Struct"),
+    "mobile.gpqa": ("On-device GPQA", "Mobile GPQA"),
+    "mobile.ifbench": ("On-device IFBench", "Mobile IFBench"),
+    "mobile.math_500": ("On-device MATH-500", "Mobile MATH-500"),
+    "mobile.omniscience": ("On-device Omniscience", "Mobile Omniscience"),
+    # speech / search board columns
+    "sttWerIndex": ("AA-WER", "AA WER", "Speech Recognition WER", "STT WER",
+                    "Word Error Rate"),
+    "sttEarnings22Wer": ("Earnings22", "Earnings22-Cleaned-AA", "Earnings22 WER"),
+    "sttVoxpopuliWer": ("VoxPopuli", "VoxPopuli-Cleaned-AA", "VoxPopuli WER"),
+    "sttAgenttalkWer": ("AgentTalk", "AA-AgentTalk", "AgentTalk WER"),
+    "sts": ("Speech to Speech Index", "Realtime Voice Index", "STS Index"),
+    "stsTaskCompletionRate": ("STS Task Completion", "Task Completion Rate"),
+    "stsBigBenchAudio": ("Big Bench Audio", "BBA"),
+    "stsTauVoice": ("tau3-Voice", "Tau Voice", "tau-Voice"),
+    "stsArenaScore": ("STS Arena Preference", "Arena Score"),
+    "ttsPronunciationPassRate": ("Pronunciation Robustness", "Pronunciation"),
+    "ttsTermPronunciation": ("Standalone Terms", "Term Pronunciation"),
+    "ttsTextNormalization": ("Expanding Shorthand", "Text Normalization"),
+    "ttsSequenceFidelity": ("Preserving Exact Sequences", "Sequence Fidelity"),
+    "ttsContextualDisambiguation": ("Contextually Appropriate",
+                                    "Contextual Disambiguation"),
+    "ttsCharactersPerSecond": ("Characters Per Second", "TTS Throughput"),
+    "ttsGenerationTime": ("TTS Latency", "Generation Time"),
+    "ttsQualityElo": ("TTS Arena Preference", "TTS Elo"),
+    "searchQualityIndex": ("Search API Index", "AA Search Index"),
+    "searchBrowsecompAccuracy": ("BrowseComp", "BrowseComp Accuracy"),
+    "searchDeepsearchqaF1": ("DeepSearchQA", "DeepSearchQA F1"),
+    "searchAvgLatency": ("Search Latency", "Avg Latency"),
+    "searchCostPerQuery": ("Cost per Search Query", "Search Query Cost"),
+    "searchCostPerTask": ("Search API Cost", "Search Task Cost"),
     "capabilities.financeAndAccounting": ("Finance & Accounting", "Finance and Accounting",
                                           "Finance & Accounting Index"),
     "capabilities.strategyAndOps": ("Strategy & Ops", "Strategy and Ops",
@@ -918,6 +1437,23 @@ def _dedupe(items) -> tuple[str, ...]:
 
 RANKABLES: dict[str, Rankable] = {}
 
+#: Breakdown container -> the scalar sub-scores registered for it (best first).
+#: A container's own value is a per-model map, so its ``how`` hint must name a
+#: *rankable* sub-score rather than the container itself (a hint may never point
+#: at an empty output).
+_BREAKDOWN_SUBSCORES: dict[str, tuple[str, ...]] = {
+    "briefcaseBreakdown": ("briefcaseRubricPassRate", "briefcaseAnalyticalQualityElo",
+                           "briefcasePresentationElo"),
+    "automationBenchBreakdown": ("automationBenchStrictScore", "automationBenchCompletion"),
+    "gdpvalBreakdown": ("gdpvalAvgTurns",),
+    "harveyLabBreakdown": ("harveyCriteriaPass", "harveyGatedAllPass"),
+    "gdpPdfBreakdown": ("gdpPdfMacroPassRate",),
+    "aa3dBreakdown": ("aa3dTurnsP50",),
+    "enterpriseOpsGymSuccessRateByDomain": tuple(
+        f"enterpriseOpsGym.domain.{_dom}" for _dom in ENTERPRISE_OPS_DOMAINS
+    ),
+}
+
 # benchmarks + composite indexes (kind follows the benchmark's unit)
 for _key, _b in BENCHMARKS.items():
     _kind = "index" if _b.unit == "index" else "benchmark"
@@ -930,7 +1466,7 @@ for _key, _b in BENCHMARKS.items():
     # few chart keys with no eval-page slug stay on ``aa_benchmark_leaderboard``.
     _lb_reachable = (
         _b.unit != "mixed"
-        and _b.source_hint not in ("api", "none")
+        and _b.source_hint != "none"
         and (_b.source_hint != "chart" or bool(_b.slug))
     )
     # A hint must always name a call that works: for a composite with no public
@@ -940,6 +1476,11 @@ for _key, _b in BENCHMARKS.items():
         _how = f"aa_benchmark_leaderboard benchmark={_constituents[0]}"
     elif _lb_reachable:
         _how = f"aa_leaderboard sort={_key}"
+    elif _b.unit == "mixed":
+        # a container's own value is a per-model map: name a rankable sub-score
+        _subs = _BREAKDOWN_SUBSCORES.get(_key, ())
+        _how = (f"aa_benchmark_leaderboard benchmark={_subs[0]}" if _subs
+                else "aa_model <model-slug> sections=benchmarks")
     else:
         _how = f"aa_benchmark_leaderboard benchmark={_key}"
     RANKABLES[_key] = Rankable(
@@ -1158,6 +1699,13 @@ DOMAINS: dict[str, tuple[str, ...]] = {
     "cost": ("cost", "pricing"),
     "speed": ("speed",),
     "openness": ("openness",),
+    "multilingual": ("multilingual", "language"),
+    "languages": ("multilingual", "language"),
+    "search": ("search", "agents"),
+    "agents": ("agents",),
+    "tts": ("tts", "speech"),
+    "mobile": ("mobile", "on-device", "local"),
+    "on-device": ("mobile", "on-device", "local"),
 }
 
 _DOMAIN_KEYS = {_norm(_d): _d for _d in DOMAINS}
