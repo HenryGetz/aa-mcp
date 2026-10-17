@@ -55,6 +55,17 @@ Register with an MCP client (omp, Claude Code, Codex, …):
 }
 ```
 
+### Skills and MCP install
+
+The JSON above installs the **MCP server** (callable tools, exposed as
+`mcp__aa_<tool>`). A **skill** is a different thing — markdown instructions an agent
+reads on demand via `skill://<name>`, installed by copying a directory (or
+`npx skills add …`) into a skills root such as `~/.agents/skills/` or
+`<repo>/.agents/skills/`; it adds no tools, and omp only notices it after a restart.
+This repo ships one at [`skills/aa-mcp/SKILL.md`](skills/aa-mcp/SKILL.md).
+
+Full commands, paths and troubleshooting for both: [`docs/SKILLS.md`](docs/SKILLS.md).
+
 ## Tools
 
 | tool | answers |

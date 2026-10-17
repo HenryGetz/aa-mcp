@@ -2,7 +2,7 @@
 
 This is the integration point: it wires the frozen modules (:mod:`fetch`,
 :mod:`loaders`, :mod:`catalog`, :mod:`normalize`, :mod:`select`, :mod:`render`)
-into the eleven agent-facing tools and renders every answer as
+into the twelve agent-facing tools and renders every answer as
 compact markdown. Nothing here talks to the network at import time; data is
 only loaded inside tool calls, and stdout carries nothing but the MCP protocol.
 """

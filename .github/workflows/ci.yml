@@ -27,3 +27,5 @@ jobs:
           test -z "$out" || { echo "server import wrote to stdout"; exit 1; }
       - name: Tool inventory over stdio
         run: uv run python eval/client.py tools
+      - name: Reference doc drift (docs/REFERENCE.md vs reference.py)
+        run: uv run python scripts/gen_reference_md.py --check
