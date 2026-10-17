@@ -18,6 +18,41 @@ def _read(name: str) -> str:
     return (FIXTURES / name).read_text(encoding="utf-8", errors="replace")
 
 
+#: Two independent full scans of the same multi-megabyte payload must stay within this
+#: factor of each other. Both are measured in the same test on the same machine, so the
+#: ratio is load-insensitive (measured 0.3-1.2x over 8 samples at load average 44-50,
+#: 24 extra CPU burners included), whereas an absolute budget is not: the identical
+#: scan took 0.3 s with the box quiet and 2.2 s under load, which is exactly why the
+#: old ``< 1.5 s`` bound flaked. A scan that stops being linear overshoots 8x by orders
+#: of magnitude. (A regression that made *both* scanners quadratic would keep the ratio
+#: and escape this pair; the memo assertion below and the record-count assertions
+#: throughout this module still hold.)
+_SCAN_PEER_MAX_FACTOR = 8.0
+
+#: The content-addressed scan memo must make the repeat call nearly free (measured
+#: ~5000x faster than the cold scan); the 50 ms floor is timer noise under load.
+_WARM_MAX_FRACTION = 0.2
+_WARM_FLOOR_SECONDS = 0.05
+
+_FULL_SCAN_KEYS = ["__absent_key_for_full_scan__"]
+
+
+def _cold_full_scan(payload: str) -> float:
+    """Seconds for a memo-miss full :func:`flight.find_array` scan of ``payload``."""
+    flight._clear_memos()          # a cold scan must actually be measured cold
+    start = time.perf_counter()
+    with pytest.raises(LookupError):
+        flight.find_array(payload, _FULL_SCAN_KEYS)
+    return time.perf_counter() - start
+
+
+def _objects_scan(payload: str) -> tuple[float, list[dict]]:
+    """``(seconds, records)`` for the anchor-driven :func:`flight.find_objects` scan."""
+    start = time.perf_counter()
+    objs = flight.find_objects(payload, ["slug", "name"])
+    return time.perf_counter() - start, objs
+
+
 # --------------------------------------------------------------------------- #
 # payload()
 # --------------------------------------------------------------------------- #
@@ -93,12 +128,30 @@ def test_find_array_skips_non_dict_arrays():
 
 @pytest.mark.parametrize("name", ["providers_board.rsc", "model_page_legacy.rsc"])
 def test_find_array_performance(name):
+    """A cold full scan is linear-ish and the content memo serves the repeat.
+
+    Both assertions are relative — the call's own cold cost, and a peer full scan of
+    the same payload — so machine load cannot flake them (see the constants above).
+    """
     p = flight.payload(_read(name))
+    cold = _cold_full_scan(p)
+
     start = time.perf_counter()
     with pytest.raises(LookupError):
-        flight.find_array(p, ["__absent_key_for_full_scan__"])
-    elapsed = time.perf_counter() - start
-    assert elapsed < 1.5, f"{name} full scan took {elapsed:.3f}s"
+        flight.find_array(p, _FULL_SCAN_KEYS)
+    warm = time.perf_counter() - start
+    assert warm <= max(cold * _WARM_MAX_FRACTION, _WARM_FLOOR_SECONDS), (
+        f"{name}: the repeat scan took {warm:.3f}s against {cold:.3f}s cold — the "
+        "content-addressed scan memo is not serving the second call"
+    )
+
+    peer, objs = _objects_scan(p)
+    assert objs, f"{name}: the peer object scan found nothing"
+    assert cold < peer * _SCAN_PEER_MAX_FACTOR, (
+        f"{name}: the array scan took {cold:.3f}s against {peer:.3f}s for the object "
+        f"scan of the same payload (over {_SCAN_PEER_MAX_FACTOR}x) — it is no longer "
+        "linear in the payload"
+    )
 
 
 def test_find_array_chart_and_providers():
@@ -166,12 +219,23 @@ def test_find_objects_home_eval_panels():
 
 
 def test_find_objects_performance_legacy():
+    """``find_objects`` stays linear on a legacy page and decodes each object once.
+
+    Guarded relatively — against a cold array scan of the same payload — rather than by
+    a wall-clock budget, so machine load cannot flake it (see the constants above).
+    """
     p = flight.payload(_read("model_page_legacy.rsc"))
-    start = time.perf_counter()
-    objs = flight.find_objects(p, ["slug", "name"])
-    elapsed = time.perf_counter() - start
+    peer = _cold_full_scan(p)
+    elapsed, objs = _objects_scan(p)
     assert objs and all("slug" in o and "name" in o for o in objs)
-    assert elapsed < 1.5, f"find_objects took {elapsed:.3f}s"
+    assert elapsed < peer * _SCAN_PEER_MAX_FACTOR, (
+        f"find_objects took {elapsed:.3f}s against {peer:.3f}s for a cold array scan of "
+        f"the same payload (over {_SCAN_PEER_MAX_FACTOR}x) — the scan is no longer "
+        "linear in the payload"
+    )
+    # the anchor-driven scan decodes each enclosing object once, so a repeat is equal
+    _, again = _objects_scan(p)
+    assert again == objs
 
 
 # --------------------------------------------------------------------------- #

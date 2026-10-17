@@ -15,6 +15,11 @@ import pytest
 
 from aa_mcp import fetch
 
+#: How long the ``hang=True`` loopback server stalls before replying — the reference
+#: the "a stalled upstream is bounded" assertion is measured against, so that guard
+#: is relative rather than an absolute wall-clock budget.
+_HANG_SECONDS = 30.0
+
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
@@ -96,7 +101,7 @@ class _CountingServer:
                 with outer._lock:
                     outer.hits += 1
                 if outer.hang:
-                    time.sleep(30)  # never replies within the test's timeout
+                    time.sleep(_HANG_SECONDS)  # never replies within the test's timeout
                     return
                 if outer.delay:
                     time.sleep(outer.delay)
@@ -451,18 +456,29 @@ def test_slow_upstream_is_bounded_and_not_retried(env, monkeypatch):
         elapsed = time.monotonic() - started
         hits = srv.hits
     assert hits == 1, f"{hits} attempts against a stalled upstream"
-    assert elapsed < 3.0, f"stalled {elapsed:.1f}s"
+    # relative to the upstream's own hang (30 s), not a wall-clock budget: the call
+    # must return long before the server would have answered, and _HANG_SECONDS / 3 is
+    # 25x the configured 0.4 s timeout, so load cannot flake it (the previous
+    # `< 3.0 s` bound had only 7.5x headroom).
+    assert elapsed < _HANG_SECONDS / 3, f"stalled {elapsed:.1f}s"
 
 
 def test_total_deadline_caps_retries(env, monkeypatch):
     monkeypatch.setenv("AA_HTTP_TIMEOUT", "0.3")
     monkeypatch.setenv("AA_HTTP_DEADLINE", "0.5")
-    with _CountingServer(status=500) as url:
+    srv = _CountingServer(status=500)
+    with srv as url:
         started = time.monotonic()
         with pytest.raises(fetch.AAFetchError):
             fetch.get(url, "boom")
         elapsed = time.monotonic() - started
-    assert elapsed < 3.0, f"took {elapsed:.1f}s"
+        hits = srv.hits
+    # the deadline (0.5 s) is shorter than the retry backoff (0.7 s), so the second
+    # attempt must never be made: the attempt count is the deterministic statement of
+    # "the deadline capped the retries", and it cannot flake on a loaded machine.
+    assert hits == 1, f"{hits} attempts despite a deadline shorter than the backoff"
+    # the elapsed bound is only a hang guard, so it is generous (10x the 0.7 s backoff)
+    assert elapsed < 10 * 0.7, f"took {elapsed:.1f}s"
 
 
 def test_retry_only_on_5xx_and_connect_errors(env, monkeypatch):
