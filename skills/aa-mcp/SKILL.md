@@ -25,6 +25,12 @@ omp registration lives in `~/.omp/agent/mcp.json` (project: `.omp/mcp.json`):
                        "timeout": 180000, "enabled": true}}}
 ```
 
+**No MCP client?** The same tools are one shell command away — `aa-mcp-cli` (or
+`python -m aa_mcp.cli` from a checkout) calls the very same functions, so the output is
+byte-identical: `aa-mcp-cli call aa_leaderboard '{"top":3}'`, `aa-mcp-cli list`,
+`aa-mcp-cli schema aa_pareto`, `aa-mcp-cli read aa://sources`. stdout is only the
+payload; exit 1 means the tool reported an error (message on stderr).
+
 ## Surface
 
 Twelve tools. The inventory is **live, not this list**:

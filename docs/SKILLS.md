@@ -6,10 +6,11 @@ server** (a separate process exposing callable tools). Installing one does not i
 the other.
 
 This page documents both, plus the exact commands for this machine (omp
-`@oh-my-pi/pi-coding-agent` 18.11.0 on Linux). The omp-side claims come from the
-installed package source (`~/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src/…`)
-and were verified on 2026-10-16; see `docs/process/OMP_SKILLS_PATH.md` for the full
-reconnaissance.
+`@oh-my-pi/pi-coding-agent` 18.11.0 on Linux). A third door that needs no MCP client at
+all — the bundled CLI (§6) — calls the very same functions from a plain shell. The
+omp-side claims come from the installed package source
+(`~/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src/…`) and were verified
+on 2026-10-16; see `docs/process/OMP_SKILLS_PATH.md` for the full reconnaissance.
 
 ---
 
@@ -223,7 +224,37 @@ install both if you want an agent to be able to *act* on it.
 
 ---
 
-## 6. The Streamlit case (`npx skills add streamlit/agent-skills …`)
+## 6. Using it without an MCP client (CLI)
+
+Some clients cannot speak MCP at all (a plain chat or raw LLM API has no `tools/list`),
+and some skills-only setups have no MCP registration. For those, the package ships a
+second front door onto the **same functions** — no second parser, no second cache, no
+extra dependency, so the reply text is byte-identical to the MCP tool's:
+
+```bash
+uv tool install --from git+https://github.com/HenryGetz/aa-mcp aa-mcp   # installs aa-mcp AND aa-mcp-cli
+uv run python -m aa_mcp.cli list                                        # local checkout, same thing
+```
+
+| command | does |
+|---|---|
+| `aa-mcp-cli list` | tool inventory: name, one-line description, parameter names |
+| `aa-mcp-cli schema [tool …]` | input schemas as JSON — one tool, or all twelve |
+| `aa-mcp-cli call <tool> '<json args>'` | calls the tool and prints exactly what the MCP tool returns |
+| `aa-mcp-cli read <uri>` | a resource's text, e.g. `aa://sources` |
+| `aa-mcp-cli prompts` / `aa-mcp-cli prompt <name> '<json args>'` | the prompt inventory / one rendered prompt |
+
+stdout carries **only** the payload (agents parse it); every diagnostic goes to stderr.
+Exit `0` ok, `1` the tool reported an error (its message on stderr, no traceback), `2`
+bad usage (unknown tool/resource, malformed JSON). It reads the same env knobs the
+server does (`AA_OFFLINE=1`, `AA_CACHE_DIR`, `AA_CACHE_TTL`, `AA_RICH_TTL`,
+`AA_MAX_BYTES`, `AA_BASE_URL`, `AA_LOG_LEVEL`), so CLI and MCP calls share one warm
+cache and the same `_validate` guards. `skills/aa-mcp/SKILL.md` points an agent here as
+the fallback when no MCP client is available.
+
+---
+
+## 7. The Streamlit case (`npx skills add streamlit/agent-skills …`)
 
 ```bash
 npx skills add streamlit/agent-skills -s developing-with-streamlit -g
@@ -249,7 +280,7 @@ Two caveats:
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | symptom | cause / fix |
 |---|---|

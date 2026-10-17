@@ -66,6 +66,10 @@ This repo ships one at [`skills/aa-mcp/SKILL.md`](skills/aa-mcp/SKILL.md).
 
 Full commands, paths and troubleshooting for both: [`docs/SKILLS.md`](docs/SKILLS.md).
 
+No MCP client? The same tools are reachable from a plain shell as `aa-mcp-cli` (same
+install as `aa-mcp`; `python -m aa_mcp.cli` from a checkout) — e.g.
+`aa-mcp-cli call aa_leaderboard '{"top":3}'` prints exactly what the MCP tool returns.
+
 ## Tools
 
 | tool | answers |

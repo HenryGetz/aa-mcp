@@ -8,6 +8,7 @@ selection, axis resolution, coverage labels, YAML subset, response bounds).
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -2495,3 +2496,44 @@ def test_compare_two_language_models_is_unchanged(fake):
     assert "| 60.0 | 50.0 |" in out
     assert "arena" not in out
     assert "board rows are their own namespace" not in out
+
+
+# --------------------------------------------------------------------------- #
+# fixed-context budget (the wire tool list is paid at every session start)
+# --------------------------------------------------------------------------- #
+
+# mcp 2.x sets the tool ``description`` to the *whole* docstring and derives
+# ``inputSchema`` from the signature alone — an ``Args:`` block never becomes a
+# per-parameter description, so every docstring byte is a wire byte. Measured
+# 2026-10-16 after the trim; the before/after table is in
+# docs/process/SHAPE_AB_TEST.md. Trim src/aa_mcp/server.py, never this test.
+_TOOL_DESC_SCHEMA_TOK_CEILING = 3200   # description + inputSchema, all 12 tools
+_TOOL_WIRE_TOK_CEILING = 3400          # the serialized tools/list result
+
+
+def _wire_tools() -> list[dict]:
+    """The 12 tools exactly as ``tools/list`` serializes them."""
+    return [t.model_dump(by_alias=True, exclude_none=True)
+            for t in asyncio.run(server.srv.list_tools())]
+
+
+def test_tool_list_fixed_context_stays_within_budget():
+    """The tool list must not creep back up: it is paid on every session start."""
+    payload = _wire_tools()
+    assert len(payload) == 12
+    desc_schema = sum(
+        len(t.get("description", ""))
+        + len(json.dumps(t.get("inputSchema", {}), separators=(",", ":")))
+        for t in payload
+    )
+    wire = len(json.dumps(payload, separators=(",", ":")))
+    assert desc_schema / 4 < _TOOL_DESC_SCHEMA_TOK_CEILING, (
+        f"tool description+schema is {desc_schema / 4:.0f} tok ({desc_schema} chars), "
+        f"over the {_TOOL_DESC_SCHEMA_TOK_CEILING} tok budget — trim the docstrings "
+        "in src/aa_mcp/server.py, not this test"
+    )
+    assert wire / 4 < _TOOL_WIRE_TOK_CEILING, (
+        f"serialized tools/list is {wire / 4:.0f} tok ({wire} chars), over the "
+        f"{_TOOL_WIRE_TOK_CEILING} tok budget — trim the docstrings in "
+        "src/aa_mcp/server.py, not this test"
+    )

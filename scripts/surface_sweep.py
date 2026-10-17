@@ -9,6 +9,14 @@ one branch of a tool). Requires network (or a warm cache).
     .venv/bin/python scripts/surface_sweep.py --json     # machine output
     AA_MCP_CMD=/path/to/aa-mcp .venv/bin/python scripts/surface_sweep.py
 
+The model panel every model-shaped case uses is **derived from the live data at
+run time** (top two active models by Intelligence Index, the best active
+open-weights model, the cheapest active model, and one model AA marks deprecated)
+and printed with the counts, so a failure is reproducible and a hardcoded slug
+cannot go stale as AA rolls a generation over. The one shape the live site may
+simply stop offering — a legacy model page (``currentModel``, no embedded chart
+set) — is reported as ``SKIP`` with the reason instead of failing the run.
+
 Exit code 1 if any call fails unexpectedly.
 """
 
@@ -19,8 +27,10 @@ import asyncio
 import json
 import os
 import pathlib
+import re
 import sys
 import time
+from typing import NamedTuple
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
@@ -30,10 +40,115 @@ from aa_mcp import catalog, loaders, reference
 SECTIONS = ["identity", "indexes", "benchmarks", "pricing", "speed", "cost",
             "openness", "modalities", "specs", "all"]
 
-MODEL_CANDIDATES = ["claude-opus-5-5", "gpt-6-luna", "step-5", "glm-4-5v"]
+
+class Panel(NamedTuple):
+    """The live model panel the model-shaped cases are built from.
+
+    AA deprecates and drops models continuously (2026-10-16: ``glm-4-5v`` and
+    ``gpt-5-2`` went deprecated under a hardcoded panel and the whole happy path
+    went red), so every active slug here is read from the data layer the tools
+    read, once per run, and printed with the counts.
+    """
+
+    leaders: tuple[str, ...]     # top 2 active models by Intelligence Index
+    open_weights: str            # best-scoring active open-weights model
+    cheap: str                   # cheapest active model by $/task
+    ranked: tuple[str, ...]      # 12 active slugs for the 3/8/12-model compares
+    top_name: str                # display name of ``leaders[0]`` (name -> slug)
+    deprecated: str              # best-scoring model AA marks deprecated ("" if none)
+    legacy_page: bool            # /models/<deprecated> still carries ``currentModel``
+    deprecated_active: bool      # ...and the deprecated slug is a live leaderboard row
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        """The active slugs the per-section ``aa_model`` sweep walks."""
+        return tuple(s for s in (*self.leaders, self.open_weights, self.cheap) if s)
+
+    @property
+    def fuzzy(self) -> str:
+        """A human-style query for the name -> slug path (drop the variant suffix)."""
+        return re.sub(r"\s*\(.*?\)\s*$", "", self.top_name) or self.top_name
+
+    @property
+    def summary(self) -> str:
+        return (f"panel: leaders={'+'.join(self.leaders)} "
+                f"open_weights={self.open_weights} cheap={self.cheap} "
+                f"ranked={len(self.ranked)} "
+                f"deprecated={self.deprecated or 'none'} "
+                f"(active={'yes' if self.deprecated_active else 'no'}, "
+                f"legacy_page={'yes' if self.legacy_page else 'no'})")
 
 
-def cases() -> list[tuple[str, dict]]:
+def _deprecated_slug(refresh: bool = False) -> str:
+    """The best-scoring model AA marks deprecated.
+
+    The leaderboard's metrics array carries only active rows (every row has a
+    ``deprecated`` key and every one is false today); the deprecated ones live in
+    the chart-shaped rich dataset, which is also where the chart-backed rankings
+    read them from.
+    """
+    try:
+        rows = loaders.rich_dataset(refresh=refresh)
+    except Exception as exc:  # a live-source hiccup must not stop the sweep
+        print(f"panel: no deprecated slug ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+        return ""
+    deprecated = [m for m in rows if m.deprecated and m.intelligence is not None]
+    return max(deprecated, key=lambda m: (m.intelligence, m.slug)).slug if deprecated else ""
+
+
+def _legacy_page(slug: str) -> bool:
+    """Whether ``/models/<slug>`` still carries the legacy ``currentModel`` object."""
+    if not slug:
+        return False
+    try:
+        path = loaders.SOURCE_URLS["model"].format(slug=slug)
+        got = loaders.fetch.get(loaders.url(path), f"model_{slug}")
+    except Exception:  # a page AA no longer serves is "no legacy page", not a crash
+        return False
+    return loaders.parse_legacy_model(got.text) is not None
+
+
+def live_panel(refresh: bool = False) -> Panel:
+    """Derive the model panel from the live data layer (once per run)."""
+    rows = loaders.leaderboard(refresh=refresh)
+    scored = sorted((m for m in rows if m.intelligence is not None),
+                    key=lambda m: (-m.intelligence, m.slug))
+    leaders = tuple(m.slug for m in scored[:2])
+    open_weights = next((m.slug for m in scored if m.is_open_weights), "")
+    cheap = min((m for m in rows if m.cost_per_task is not None),
+                key=lambda m: (m.cost_per_task, m.slug)).slug
+    # the open-weights and cheap leaders ride in front of the by-intelligence order
+    # so the 8- and 12-model compares span labs, not one lab's variants.
+    ranked = tuple(dict.fromkeys(
+        s for s in (*leaders, open_weights, cheap, *(m.slug for m in scored)) if s))[:12]
+    deprecated = _deprecated_slug(refresh)
+    return Panel(leaders, open_weights, cheap, ranked,
+                 scored[0].name if scored else "", deprecated, _legacy_page(deprecated),
+                 deprecated in {m.slug for m in rows})
+
+
+def skippable(panel: Panel) -> dict[tuple[str, str], str]:
+    """Cases reported as ``SKIP`` + a note instead of failing the run.
+
+    The legacy model page is the one shape the live site may simply stop serving
+    (AA's current pages embed a chart set); when it is gone — or when nothing can
+    reach it — the coverage is unavailable rather than broken, and the note says
+    which.
+    """
+    if not panel.deprecated or panel.deprecated_active:
+        return {}
+    why = (
+        f"{panel.deprecated} is deprecated and aa_model resolves names against the "
+        "active leaderboard rows only, so no tool reaches its page"
+        if panel.legacy_page else
+        f"/models/{panel.deprecated} carries no legacy currentModel object (the page "
+        "has a chart set), so there is no legacy page to parse"
+    )
+    return {("aa_model", json.dumps({"query": panel.deprecated})): why}
+
+
+def cases(panel: Panel) -> list[tuple[str, dict]]:
     out: list[tuple[str, dict]] = []
 
     # --- leaderboard: modes, sorts, filters, fields -------------------------
@@ -75,7 +190,10 @@ def cases() -> list[tuple[str, dict]]:
         ("aa_leaderboard", {"sort": "cyberIndex", "mode": "value", "top": 3}),
         ("aa_leaderboard", {"sort": "cyberIndex", "top": 3,
                             "fields": "cyberIndex,cyberRefusalRate,cyberMitigationStatus"}),
-        # a chart key whose values only exist for deprecated models still explains itself
+        # the deprecated path, exercised deliberately: AA publishes MMLU-Pro only
+        # for deprecated models, so the default call explains itself and names the
+        # include_deprecated twin, which then ranks those rows — never the active
+        # panel as if it were deprecated.
         ("aa_leaderboard", {"sort": "mmluPro", "top": 2}),
         ("aa_leaderboard", {"sort": "mmluPro", "top": 2, "include_deprecated": True}),
     ]
@@ -106,21 +224,30 @@ def cases() -> list[tuple[str, dict]]:
         ("aa_leaderboard", {"sort": "nonsense_sort", "top": 2}),   # expected fail
     ]
 
-    # --- model: sections x representative models ----------------------------
-    for slug in MODEL_CANDIDATES:
+    # --- model: sections x the live panel (leaders / open-weights / cheapest) ---
+    for slug in panel.models:
         for section in SECTIONS:
             out.append(("aa_model", {"query": slug, "sections": section}))
-    out.append(("aa_model", {"query": "claude opus 5.5"}))          # fuzzy
-    out.append(("aa_model", {"query": "glm-4-5v"}))                 # legacy page
+    out.append(("aa_model", {"query": panel.fuzzy}))                # name -> slug
+    if panel.deprecated:
+        # the legacy page (``currentModel``, no embedded chart set); SKIPped with a
+        # note when the live site no longer serves that shape — see ``skippable``.
+        out.append(("aa_model", {"query": panel.deprecated}))
+        # the deprecated path, deliberately: a deprecated slug is not a live resolver
+        # hit, and asking for it by name (even with include_deprecated=true) explains
+        # itself rather than ranking a ghost as if it were active.
+        out.append(("aa_search", {"query": panel.deprecated, "top": 3}))
+        out.append(("aa_leaderboard", {"name": panel.deprecated,
+                                       "include_deprecated": True, "top": 2}))
 
     # --- compare ------------------------------------------------------------
-    cmp3 = ["claude-opus-5-5", "gpt-6-luna", "gemini-3-5-flash"]
-    cmp8 = cmp3 + ["mimo-v2-6-pro", "kimi-k3", "glm-5-3", "step-5", "grok-4-7"]
-    cmp12 = cmp8 + ["qwen3-8-max", "ling-3-1-flash", "deepseek-v4-1-flash", "gpt-6-astra"]
+    cmp3 = list(panel.ranked[:3])
+    cmp8 = list(panel.ranked[:8])
+    cmp12 = list(panel.ranked[:12])
     out += [
-        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-6-luna"]}),
-        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-6-luna", "step-5"], "compact": False}),
-        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-6-luna"],
+        ("aa_compare", {"queries": cmp3[:2]}),
+        ("aa_compare", {"queries": cmp3, "compact": False}),
+        ("aa_compare", {"queries": cmp3[:2],
                         "metrics": "intelligence,cost_per_task,tps,ttft,context_tokens"}),
         ("aa_compare", {"queries": cmp3, "metrics": "all"}),
         ("aa_compare", {"queries": cmp3, "metrics": "all", "view": "diff"}),
@@ -156,30 +283,31 @@ def cases() -> list[tuple[str, dict]]:
                                     "gpt-6-luna-xhigh", "muse-wonder-full"]}),
         # Wave G: one metric never means two numbers — the ttft alias, the key and
         # metrics=all all resolve to the same (model-page) value
-        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-5-2"],
+        ("aa_compare", {"queries": list(panel.leaders),
                         "metrics": "ttft,time_to_first_token,tps"}),
-        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-5-2"], "metrics": "ttft",
+        ("aa_compare", {"queries": list(panel.leaders), "metrics": "ttft",
                         "compact": False}),
-        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-5-2"], "metrics": "tps",
+        ("aa_compare", {"queries": list(panel.leaders), "metrics": "tps",
                         "compact": False}),
         # Wave G: a bare family slug says which effort variant it is
-        ("aa_compare", {"queries": ["gpt-6-luna", "gpt-5-2"], "metrics": "intelligence"}),
-        # Wave G: one unknown name in a list must not abort the whole call
-        ("aa_compare", {"queries": ["claude-opus-5-5", "gpt-6-astra"],
+        ("aa_compare", {"queries": list(reversed(panel.leaders)),
+                        "metrics": "intelligence"}),
+        # Wave G: an unknown metric name in a list must not abort the whole call
+        ("aa_compare", {"queries": [panel.leaders[0], panel.open_weights],
                         "metrics": ["livecodebench", "frontierCode", "terminalBench40",
                                     "lcr", "swe-bench-verified"]}),
         # Wave G: score/$ is a derived ratio, and metrics=all carries it
-        ("aa_compare", {"queries": ["claude-opus-5-5", "mimo-v2-6-pro"],
+        ("aa_compare", {"queries": [panel.leaders[0], panel.open_weights],
                         "metrics": "intel/$,coding/$", "compact": False}),
         # documented error paths (listed in EXPECTED_FAILURES): never a broken table
         ("aa_compare", {"queries": ["Grok Voice 3.0", "claude-opus-5-5"]}),
         # YAML / JSON spec round-trip (the emitted `spec:` block is re-runnable)
-        ("aa_compare", {"spec": "models: [claude-opus-5-5, gpt-6-luna, gemini-3-5-flash]\n"
+        ("aa_compare", {"spec": f"models: [{', '.join(cmp3)}]\n"
                                 "metrics: all\nview: diff\n"}),
-        ("aa_compare", {"spec": "models:\n  - claude-opus-5-5\n  - gpt-6-luna\n"
+        ("aa_compare", {"spec": f"models:\n  - {cmp3[0]}\n  - {cmp3[1]}\n"
                                 "metrics: benchmarks\nfilters:\n  min_intelligence: 20\n"}),
-        ("aa_compare", {"spec": '{"models": ["claude-opus-5-5", "gpt-6-luna"], '
-                                '"metrics": "tps,ttft", "view": "diff"}'}),
+        ("aa_compare", {"spec": json.dumps({"models": cmp3[:2], "metrics": "tps,ttft",
+                                            "view": "diff"})}),
     ]
 
     # --- pareto: every x axis, several scores -------------------------------
@@ -269,19 +397,21 @@ def cases() -> list[tuple[str, dict]]:
 
     # --- providers ----------------------------------------------------------
     out += [
-        ("aa_providers", {"model": "claude-opus-5-5"}),
-        ("aa_providers", {"model": "glm-5-3", "fields": "precision,cache_read,cache_write"}),
+        ("aa_providers", {"model": panel.leaders[0]}),
+        ("aa_providers", {"model": panel.open_weights,
+                          "fields": "precision,cache_read,cache_write"}),
         ("aa_providers", {"host": "groq", "top": 3}),
         ("aa_providers", {"open_weights": True, "min_context": 200000, "top": 3}),
     ]
     for sort in ("cost_per_task", "price_in", "price_out", "cache_read", "tps", "ttft",
                  "intelligence", "context_tokens"):
-        out.append(("aa_providers", {"model": "kimi-k3", "sort": sort, "top": 2}))
+        out.append(("aa_providers", {"model": panel.leaders[0], "sort": sort, "top": 2}))
     out += [
         # the sorted-by column must be visible, and fields=all must work
-        ("aa_providers", {"model": "kimi-k3", "sort": "ttft", "fields": "all", "top": 3}),
+        ("aa_providers", {"model": panel.leaders[0], "sort": "ttft", "fields": "all",
+                          "top": 3}),
         # Wave G: identity fields resolve from the endpoint record (never blank)
-        ("aa_providers", {"model": "mimo-v2-6-pro", "top": 3,
+        ("aa_providers", {"model": panel.open_weights, "top": 3,
                           "fields": "model,slug,host,creator,price_in"}),
         # Wave G: a model AA lists no endpoints for is explained, not errored
         ("aa_providers", {"model": "muse-wonder-full", "fields": "model,price_in"}),
@@ -497,7 +627,7 @@ def _content_violations(results: list[dict]) -> list[str]:
     return out
 
 
-async def run(extra_env: dict[str, str]) -> list[dict]:
+async def run(extra_env: dict[str, str], panel: Panel) -> list[dict]:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
@@ -516,7 +646,7 @@ async def run(extra_env: dict[str, str]) -> list[dict]:
     async with stdio_client(params) as (read, write), \
             ClientSession(read, write) as session:
         await session.initialize()
-        for tool, args in cases():
+        for tool, args in cases(panel):
             t0 = time.time()
             try:
                 res = await session.call_tool(tool, args)
@@ -541,19 +671,26 @@ def main() -> int:
     a = ap.parse_args()
     extra = dict(kv.split("=", 1) for kv in a.env)
 
-    results = asyncio.run(run(extra))
+    panel = live_panel()
+    results = asyncio.run(run(extra, panel))
+    skips = skippable(panel)
     failures = [r for r in results if r["error"]]
     expected = [r for r in failures if _case_key(r) in EXPECTED_FAILURES]
-    unexpected = [r for r in failures if _case_key(r) not in EXPECTED_FAILURES]
+    skipped = [r for r in failures if _case_key(r) in skips]
+    unexpected = [r for r in failures
+                  if _case_key(r) not in EXPECTED_FAILURES and _case_key(r) not in skips]
     violations = _content_violations(results)
     slow = sorted([r for r in results if r["ms"] >= a.slow_ms], key=lambda r: -r["ms"])
 
     if a.json:
         print(json.dumps({k: v for k, v in
-                          {"results": results, "calls": len(results),
+                          {"panel": dict(panel._asdict()), "calls": len(results),
                            "failures": len(failures),
                            "unexpected_failures": len(unexpected),
                            "content_violations": violations,
+                           "skipped": [{"tool": r["tool"], "args": r["args"],
+                                        "why": skips[_case_key(r)]}
+                                       for r in skipped],
                            "expected_failures": [
                                {"tool": r["tool"], "args": r["args"],
                                 "why": EXPECTED_FAILURES[_case_key(r)]}
@@ -563,21 +700,28 @@ def main() -> int:
                          indent=1))
     else:
         tokens = sum(r['tokens_est'] for r in results)
+        print(f"PANEL {panel.summary}")
         print(f"{len(results)} calls · {len(failures)} failures "
-              f"({len(expected)} expected, {len(unexpected)} unexpected) · "
+              f"({len(expected)} expected, {len(skipped)} skipped, "
+              f"{len(unexpected)} unexpected) · "
               f"≈{tokens} tokens total (avg {tokens // max(1, len(results))})")
         for r in expected:
             print(f"EXPECTED FAIL {r['tool']} {json.dumps(r['args'])[:80]}\n"
                   f"     why: {EXPECTED_FAILURES[_case_key(r)]}")
         for r in unexpected:
             print(f"FAIL {r['tool']} {json.dumps(r['args'])[:90]}\n     {r['text'][:220]}")
+        for r in skipped:
+            print(f"SKIP {r['tool']} {json.dumps(r['args'])[:90]}\n"
+                  f"     why: {skips[_case_key(r)]}")
         for v in violations:
             print(f"CONTENT CONTRACT VIOLATION {v}")
         for r in slow:
             print(f"SLOW {r['ms']}ms {r['tool']} {json.dumps(r['args'])[:70]}")
         if not unexpected and not violations:
             print("UNEXPECTED FAILURES: 0 — the run is clean"
-                  + (f" ({len(expected)} documented expectation(s) above)" if expected else ""))
+                  + (f" ({len(expected)} documented expectation(s) above)" if expected else "")
+                  + (f" ({len(skipped)} shape(s) unavailable — SKIP notes above)"
+                     if skipped else ""))
     return 1 if unexpected or violations else 0
 
 

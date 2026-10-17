@@ -5865,36 +5865,13 @@ def aa_leaderboard(
     include_deprecated: bool = False,
     refresh: bool = False,
 ) -> str:
-    """Rank and filter the ~700 tracked model variants — the default starting point.
+    """Rank/filter the ~700 tracked model variants — the default starting point.
 
-    Answers "which model is smartest / cheapest / fastest / best value right now".
-    Returns a compact markdown table sorted by ``sort`` (default: intelligence).
-    Rows that *display* the same value are ordered by a named secondary key
-    (intelligence, then slug) and one footnote says so, so a tie at the published
-    precision is visible and reproducible.
-
-    Args:
-        mode: "rank" (default), "value" (intelligence per $/task), or "frontier"
-            (the Pareto intelligence-vs-$/task frontier — the same code path as
-            ``aa_pareto``, which also plots other x axes; the footnote gives the
-            knee).
-        sort: metric/alias to sort by — e.g. intelligence, cost_per_task, tps,
-            ttft, context_tokens, price_in, price_out, params_b, release_date, or
-            any benchmark key. Use aa_reference topic=fields for all names.
-        fields: comma list of columns to show instead of the default set.
-        top: rows to return (default 10; >15 drops the Creator column for brevity).
-        creator: substring match on the creator/lab (e.g. "anthropic").
-        name: substring match on the model name/slug.
-        open_weights: True/False to keep only open- or closed-weights models.
-        reasoning: True/False to keep only reasoning or non-reasoning models.
-        min_intelligence: drop models below this Intelligence Index value.
-        max_cost_per_task: drop models above this $/task (cache-aware).
-        min_speed: drop models below this median output tok/s.
-        max_ttft: drop models above this median time-to-first-token (seconds).
-        min_context: drop models with a smaller context window (tokens).
-        released_after: ISO date (YYYY-MM-DD); keep models released on/after it.
-        include_deprecated: include deprecated rows (default False).
-        refresh: bypass the cache and re-fetch (use for "released today").
+    The tool for "smartest / cheapest / fastest / best value right now".
+    mode=rank | value (intelligence per $/task) | frontier (Pareto curve with its
+    knee, same as aa_pareto). sort=<metric alias or benchmark key>; fields=<comma
+    list> for exact columns. refresh=true bypasses the cache. Resolve uncertain
+    names with aa_search first. The header labels coverage and ties.
     """
     return _leaderboard(
         mode=mode, sort=sort, fields=fields, top=top, creator=creator, name=name,
@@ -5909,18 +5886,12 @@ def aa_leaderboard(
 @srv.tool(name="aa_model", title="Model digest", structured_output=False)
 @_tool
 def aa_model(query: str, sections: str | list[str] = "", refresh: bool = False) -> str:
-    """One model's full digest: specs, indices, benchmark scores, pricing and speed.
+    """One model's full digest: specs, indices, benchmarks, pricing and speed.
 
-    Use after aa_leaderboard/aa_search when you need everything about a single
-    model. The header and footnote always carry the round-trippable slug.
-
-    Args:
-        query: model name or slug (fuzzy). Ambiguous names return a candidate table.
-        sections: comma string (or list) of identity/indexes/benchmarks/pricing/
-            speed/cost/openness/modalities, or all. Default: identity, indexes,
-            benchmarks, pricing, speed. Alias: specs = identity. Unknown names
-            error with the valid list.
-        refresh: bypass the cache and re-fetch.
+    Use after aa_leaderboard/aa_search for everything about one model. query= name
+    or slug (fuzzy; ambiguous names return candidates). sections= comma list or
+    all of identity | indexes | benchmarks | pricing | speed | cost | openness |
+    modalities (alias specs=identity). refresh=true bypasses the cache.
     """
     return _model(query, sections=sections, refresh=refresh)
 
@@ -5933,32 +5904,14 @@ def aa_pareto(score: str = "intelligence", x: str = "cost_per_task", top: int = 
               min_intelligence: float | None = None, min_context: int | None = None,
               include_deprecated: bool = False, include_all: bool = False,
               refresh: bool = False) -> str:
-    """The Pareto frontier: any score vs any cost/size/speed axis, with the knee.
+    """Pareto frontier: any score vs any cost/size/speed axis, with the knee.
 
-    Always available — no per-benchmark tool needed. Returns the models where no
-    other model has both a lower-or-equal ``x`` and a higher-or-equal ``score``,
-    ordered by ``x`` ascending, plus a knee line and coverage.
-
-    The three site views this covers:
-      * ``aa_pareto`` (default)            = "Intelligence Index vs. Cost per Index Task"
-      * ``aa_pareto x=out_tokens_per_task`` = "Intelligence Index vs. Output Tokens per Task"
-      * ``aa_pareto x=index_total_cost``   = "Intelligence Index vs. Cost to Run the
-                                              AA Intelligence Index" (whole suite)
-
-    Args:
-        score: any rankable with per-model numbers (default intelligence); e.g.
-            cyberIndex, terminalBench40, gpqa, capabilities.legal, openness.
-        x: the trade-off axis — cost_per_task (default), index_total_cost,
-            out_tokens_per_task, time_per_task, context_tokens, params_b, ttft,
-            price_in, price_out.
-        top: frontier points to return (default 15; cheapest first).
-        creator: substring match on the creator/lab.
-        open_weights: True/False to keep only open- or closed-weights models.
-        min_intelligence: drop models below this Intelligence Index value.
-        min_context: drop models with a smaller context window (tokens).
-        include_deprecated: include deprecated rows (default False).
-        include_all: return every frontier point instead of the ``top`` cheapest.
-        refresh: bypass the cache and re-fetch.
+    Non-dominated models ordered by x ascending, plus the knee and coverage.
+    score= any rankable with per-model numbers (default intelligence), e.g.
+    cyberIndex, terminalBench40. x= cost_per_task (default) | index_total_cost |
+    out_tokens_per_task | time_per_task | context_tokens | params_b | ttft |
+    price_in | price_out. include_all=true returns every point. refresh=true
+    bypasses the cache.
     """
     return _pareto(
         score=score, x=x, top=top, creator=creator, open_weights=open_weights,
@@ -5976,48 +5929,12 @@ def aa_compare(queries: list[str] = [],  # noqa: B006 - the MCP schema wants a l
                refresh: bool = False) -> str:
     """Side-by-side comparison of 2-12 models on any benchmark (site parity).
 
-    Mirrors artificialanalysis.ai's comparison pages: models as columns (or a
-    per-metric delta view), every rankable metric, and a reproducible YAML spec.
-    Rows AA publishes only on an eval chart set / homepage panel (the cyber
-    boards, AA-3D, …) are joined in and the source is footnoted; any cell that
-    stays ``-`` is footnoted (a per-model ``missing on requested metrics: …``
-    count, the per-metric detail while the gap is small, or a whole-model
-    "no published pricing or speed" line) so no gap is silent.
-
-    One metric never means two numbers: ``tps``/``ttft``/``ttfa``/``e2e`` always
-    come from the first-party model page (the same value whichever alias you
-    type), and when the leaderboard snapshot differs by more than 2% one
-    footnote names both numbers. ``metrics=all`` carries every published row
-    including the derived ``Intel/$`` ratio; a ``score/$`` name asks for that
-    ratio on any other score axis. A name that resolves to nothing is ignored
-    with one footnote (``unknown, ignored: …``) instead of aborting the call, and
-    a fuzzy name / bare family slug is announced (which slug, which
-    reasoning-effort variant, its siblings).
-
-    Media/speech arena models (e.g. "Grok Voice 3.0") also resolve: comparing
-    only arena entries renders their board metrics (Elo / STS / WER, appearances,
-    price, release, open weights) with a footer warning that per-board scores are
-    not cross-comparable; mixing a language model with an arena entry is refused
-    with an explanation.
-
-    Args:
-        queries: 2-12 model names or slugs (language models, or arena entries on
-            one board).
-        metrics: "all" (every rankable key any selected model has, plus the
-            derived score/$ ratios), "benchmarks" (benchmark/index kinds only),
-            or a comma list of keys/labels/aliases; empty uses the default rows
-            (Intelligence, Intel/$, $/task, in/out $/1M, tok/s, TTFT, Context).
-            For an arena comparison the names are arena fields (elo, sts, wer,
-            ci, appearances, price, release, open_weights, rank, board, creator).
-        view: "table" (models as columns) or "diff" (one row per metric, value
-            plus the delta vs the first model, e.g. 57.6 (+4.9)).
-        compact: default metric set only — keep the core rows instead of the full
-            set; ignored (and stated in the footer) whenever metrics= is given.
-        spec: a YAML or JSON document with models/metrics/view/compact/filters,
-            merged with the explicit arguments; every reply ends with a
-            copy-pasteable ``spec:`` block that reproduces the call (view and
-            compact included, so the round-trip is lossless).
-        refresh: bypass the cache and re-fetch.
+    queries= 2-12 model names or slugs (or arena entries on one board).
+    metrics=all (every published row plus derived score/$ ratios) | benchmarks | a
+    comma list of keys/aliases; empty uses the default rows. view=table (models as
+    columns) or diff (per-metric delta vs the first model). Cells from a chart set /
+    homepage panel are joined and footnoted, and any ``-`` cell is footnoted, so no
+    gap is silent. refresh=true bypasses the cache.
     """
     return _compare(queries, metrics=metrics, view=view, compact=compact,
                     spec=spec, refresh=refresh)
@@ -6030,21 +5947,12 @@ def aa_benchmarks(query: str = "", domain: str = "", tag: str = "",
                   verbose: bool = False) -> str:
     """Search everything rankable: benchmarks, indexes, derived metrics, arenas.
 
-    Each hit carries its ``How to query`` hint (the exact tool call), so finding
-    "Artificial Analysis Speech to Speech Index" immediately gives you
-    ``aa_media board=speech_to_speech``. A task word AA publishes no benchmark for
-    (classification, summarization, translation, retrieval/RAG, SQL/data analysis,
-    tool calling, …) answers with the closest AA measures instead of dead-ending.
-
-    Args:
-        query: tokenised AND-match over key/label/aliases/description/tags
-            (e.g. "speech", "cyber", "long context").
-        domain: one domain name (coding, math, science, security, agentic,
-            tool-use, long-context, instruction-following, knowledge, reasoning,
-            safety, multimodal, speech, media, music, video, business, finance,
-            legal, medical, engineering, economics, cost, speed, openness, ...).
-        tag: one raw tag (a narrower filter than domain=).
-        verbose: also show what each thing measures.
+    Each hit carries the exact tool call that ranks it. query= tokenised AND-match
+    over key/label/aliases/description/tags; domain= one domain name (coding,
+    security, agentic, legal, speech, media, finance, ...); tag= one raw tag
+    (narrower); verbose=true also shows what each thing measures. A task AA
+    publishes no benchmark for answers with the closest AA measures instead of
+    dead-ending.
     """
     return _benchmarks(query=query, domain=domain, tag=tag, verbose=verbose)
 
@@ -6064,21 +5972,12 @@ def aa_benchmark_leaderboard(
 ) -> str:
     """Rank models on one benchmark, stating the source and coverage honestly.
 
-    Auto-selects the richest source: the full leaderboard when the field
-    exists there, else AA's curated eval chart set, else the homepage panel; the
-    header says which and warns when it is not a full leaderboard.
-
-    Args:
-        benchmark: benchmark key, label or eval slug (e.g. gpqa, gpqa-diamond,
-            "GPQA Diamond", briefcaseElo).
-        top: rows to return (default 15).
-        fields: comma list of columns to show instead of the default set.
-        creator: substring match on the creator/lab.
-        open_weights: True/False to keep only open- or closed-weights models.
-        min_intelligence: drop models below this Intelligence Index value.
-        include_estimates: include AA-estimated scores (default True); estimates
-            are marked with * and footnoted.
-        refresh: bypass the cache and re-fetch.
+    benchmark= key, label or eval slug (e.g. gpqa, gpqa-diamond, briefcaseElo).
+    Picks the richest source (full leaderboard → AA's curated eval chart set →
+    homepage panel); the header says which and warns when it is not a full
+    leaderboard (chart sets cover ~5-32 models). fields=<comma list> for exact
+    columns; include_estimates=false drops AA-estimated (``*``) scores;
+    refresh=true bypasses the cache.
     """
     return _benchmark_leaderboard(
         benchmark, top=top, fields=fields, creator=creator,
@@ -6095,25 +5994,12 @@ def aa_providers(model: str = "", host: str = "", top: int = 15,
                  refresh: bool = False) -> str:
     """Provider endpoints: per-host pricing, precision, speed and feature flags.
 
-    Pass ``model`` for one model's serving endpoints (with per-endpoint $/task and
-    precision), or ``host``/filters for the 1,200-row provider board. With neither,
-    returns the cheapest endpoints globally. A model AA lists no API endpoints for
-    is explained rather than errored, and ``fields=model``/``slug``/``host``/
-    ``creator`` always resolve from the endpoint's own record.
-
-    Args:
-        model: model name or slug — switches to per-model endpoint detail.
-        host: substring match on the serving host (e.g. "groq").
-        top: rows to return (default 15).
-        sort: cost_per_task (default), price_in, price_out, tps, ttft,
-            intelligence or context_tokens. Lower-is-better keys sort ascending.
-        fields: comma list of columns; supports model/name, slug, host, creator,
-            precision, cache_read, discount, e2e, function_calling, json_mode,
-            context_tokens. A name that resolves to nothing is ignored with one
-            footnote.
-        open_weights: keep only endpoints for open- or closed-weights models.
-        min_context: drop endpoints with a smaller context window (tokens).
-        refresh: bypass the cache and re-fetch.
+    model= one model's serving endpoints (per-endpoint $/task and precision); host=
+    substring on the serving host; neither returns the cheapest endpoints globally.
+    sort= cost_per_task (default) | price_in | price_out | tps | ttft |
+    intelligence | context_tokens; fields=<comma list> for exact columns
+    (precision, cache_read, e2e, function_calling, ...); refresh=true bypasses the
+    cache. A model AA lists no endpoints for is explained rather than errored.
     """
     return _providers(model=model, host=host, top=top, sort=sort, fields=fields,
                       open_weights=open_weights, min_context=min_context,
@@ -6127,23 +6013,13 @@ def aa_media(board: str, top: int = 15, fields: str | list[str] = "",
              refresh: bool = False) -> str:
     """Human-preference arenas: image, video, speech, music (Elo + 95% CI).
 
-    Args:
-        board: any image/video/TTS/music board key (text_to_image, image_editing,
-            text_to_video, image_to_video, video_editing, text_to_speech,
-            text_to_speech_controlled, music_instrumental, music_with_vocals) or a
-            speech board (speech_to_text, speech_to_text_streaming,
-            speech_to_speech — also accepted as realtime_voice / "realtime voice").
-            Hyphens/spaces/case are ignored (text-to-image == text_to_image).
-        top: rows to return (default 15).
-        fields: comma string (or list) of columns; supports ci_lower, ci_upper, ci
-            (95% CI), open_weights, url. Elo CI is not shown by default.
-        open_weights: keep only open- or closed-weights entries.
-        category: rank one of the board's per-category sub-boards instead of the
-            overall board (e.g. category=marketing-and-advertising on
-            text_to_image, category=ja on text_to_speech_controlled). Omit it for
-            the board's primary ranking; an unknown slug errors with the published
-            categories. Not available on the homepage speech panels.
-        refresh: bypass the cache and re-fetch.
+    board= text_to_image | image_editing | text_to_video | image_to_video |
+    video_editing | text_to_speech[_controlled] | music_instrumental |
+    music_with_vocals | speech_to_text[_streaming] | speech_to_speech (alias
+    realtime_voice); aa_benchmarks lists the rest. category= ranks one
+    per-category sub-board instead of the overall board. fields= adds the 95% CI
+    (ci) and url. A board entry is not a language model: board metrics are not
+    cross-comparable and carry no Intelligence cost or speed.
     """
     return _media(board, top=top, fields=fields, open_weights=open_weights,
                   category=category, refresh=refresh)
@@ -6154,10 +6030,9 @@ def aa_media(board: str, top: int = 15, fields: str | list[str] = "",
 def aa_agents(board: str = "coding_agents", top: int = 15, refresh: bool = False) -> str:
     """AA agent leaderboards: coding agents, chatbots and search APIs.
 
-    Args:
-        board: coding_agents (default), chatbots or search_api.
-        top: rows to return (default 15).
-        refresh: bypass the cache and re-fetch.
+    board= coding_agents (default) | chatbots | search_api; top= rows (default
+    15); refresh=true bypasses the cache. An agent row is not a language model,
+    so it carries no Intelligence cost or speed.
     """
     return _agents(board=board, top=top, refresh=refresh)
 
@@ -6168,21 +6043,10 @@ def aa_search(query: str = "", creator: str = "", open_weights: bool | None = No
               top: int = 15, refresh: bool = False) -> str:
     """Cheap name -> slug resolver; call this first whenever a name is uncertain.
 
-    Always returns the slug so the next tool call can be exact. Media/speech
-    arena models (image/video/speech/music boards) are searched too and returned
-    with their board, so a name like "Grok Voice 3.0" resolves instead of coming
-    back empty. A query that was resolved for you says so — the fuzzy match
-    (``matched 'opus max' → claude-opus-5-5``) and the reasoning-effort variant
-    when a bare family slug matched one. A query that names a task AA publishes
-    no benchmark for ("best model for classification") answers with the closest
-    AA measures instead of dead-ending.
-
-    Args:
-        query: fuzzy model name or partial slug (e.g. "claude opus").
-        creator: optional creator/lab substring filter.
-        open_weights: True/False to keep only open- or closed-weights models.
-        top: rows to return (default 15).
-        refresh: bypass the cache and re-fetch.
+    Always returns the slug so the next tool call can be exact, and announces a
+    fuzzy match and the reasoning-effort variant. query= fuzzy model name or
+    partial slug; creator=, open_weights= filters; refresh=true bypasses the cache.
+    Media/speech arena models are searched too, with their board.
     """
     return _search(query=query, creator=creator, open_weights=open_weights,
                    top=top, refresh=refresh)
@@ -6193,11 +6057,9 @@ def aa_search(query: str = "", creator: str = "", open_weights: bool | None = No
 def aa_reference(topic: str = "overview") -> str:
     """Static reference text: tool routing, metric/eval definitions, provenance.
 
-    No network. Use to learn what the fields mean and which tool answers what.
-
-    Args:
-        topic: overview (default), indexes, benchmarks, pricing, speed, providers,
-            media, fields (alias list), sources, or all.
+    No network, keyless — there is no API-key path. topic= overview (default) |
+    indexes | benchmarks | pricing | speed | providers | media | fields (alias
+    list) | sources | all.
     """
     return _reference(topic=topic)
 
@@ -6208,14 +6070,10 @@ def aa_raw(kind: str, query: str = "", fields: str | list[str] = "", top: int = 
            refresh: bool = False) -> str:
     """Raw JSON escape hatch (token-expensive — prefer the table tools).
 
-    Args:
-        kind: model, leaderboard, providers, providers_board, media, agents, home,
-            eval or catalog.
-        query: slug/board/slug argument for the chosen kind (e.g. a model slug for
-            "model", a board key for "media"/"agents", an eval slug for "eval").
-        fields: comma list of top-level keys to keep per record.
-        top: records to return, capped at 5 (default 1).
-        refresh: bypass the cache and re-fetch.
+    kind= model | leaderboard | providers | providers_board | media | agents |
+    home | eval | catalog. query= slug/board/eval for the kind. fields= top-level
+    keys to keep (ignored for kind=model); top= records, capped at 5 (default 1);
+    refresh=true bypasses the cache.
     """
     return _raw(kind, query=query, fields=fields, top=top, refresh=refresh)
 

@@ -15,6 +15,7 @@ dependencies = ["mcp>=2.0.0"]
 
 [project.scripts]
 aa-mcp = "aa_mcp.server:main"
+aa-mcp-cli = "aa_mcp.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/HenryGetz/aa-mcp"
