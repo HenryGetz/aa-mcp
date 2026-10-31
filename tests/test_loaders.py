@@ -1770,3 +1770,21 @@ def test_model_pool_includes_rich_only_deprecated_records(
     pool = loaders.model_pool()
     assert [m.slug for m in pool] == ["active", "old-model"]
     assert pool[1].deprecated is True
+
+
+def test_personalitybench_chart_set_carries_all_eight_indexes() -> None:
+    """Gap 1: the eval page's ``judged.indexScores`` reach ``Model.evals``."""
+    models = loaders.parse_chart(_text("eval_personalitybench.rsc"),
+                                 slug="aa-personalitybench")
+    assert len(models) == 10
+    m = next(m for m in models if m.slug == "claude-opus-5-5")
+    assert m.evals["personality.expressiveness"] == pytest.approx(90.1)
+    assert m.evals["personality.slop"] == pytest.approx(18.325)
+    assert {k for k in m.evals if k.startswith("personality.")} == {
+        "personality.expressiveness", "personality.organization",
+        "personality.informativeness", "personality.transparency",
+        "personality.warmth", "personality.conviction",
+        "personality.imagination", "personality.slop",
+    }
+    assert all(len([k for k in mm.evals if k.startswith("personality.")]) == 8
+               for mm in models)

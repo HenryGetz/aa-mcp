@@ -282,6 +282,8 @@ def test_lower_is_better_marks_match_descriptions():
         "sttStreamingAgenttalkWer", "sttStreamingTimeToFinal",
         "sttStreamingTimeToFirstPartial", "ttsGenerationTime", "searchAvgLatency",
         "searchCostPerQuery", "searchCostPerTask",
+        # 2026-10-31: AA-PersonalityBench's Slop index (formulaic writing)
+        "personality.slop",
     }
     for key in lowered:
         assert catalog.metric(key).better == "low", key
@@ -873,3 +875,30 @@ def test_new_long_labels_get_a_short_display_label():
     # the canonical keys are unchanged
     assert catalog.metric("mobile.bfcl_500").key == "mobile.bfcl_500"
     assert catalog.benchmark("mobile.bfcl_500").label == "On-device BFCL-500"
+
+
+def test_personalitybench_registers_eight_index_scores():
+    """Gap 1: AA-PersonalityBench's eight 0-100 index scores are rankable."""
+    for name in ("personality", "personalitybench", "AA-PersonalityBench",
+                 "aa-personalitybench"):
+        bench = catalog.benchmark(name)
+        assert bench is not None, name
+        assert bench.key == "personality.expressiveness", name
+        assert bench.slug == "aa-personalitybench", name
+        assert bench.source_hint == "chart", name
+    for key in ("personality.expressiveness", "personality.organization",
+                "personality.informativeness", "personality.transparency",
+                "personality.warmth", "personality.conviction",
+                "personality.imagination", "personality.slop"):
+        bench = catalog.BENCHMARKS[key]
+        assert bench.unit == "index" and bench.slug == "aa-personalitybench", key
+    assert catalog.metric("personality.slop").better == "low"
+    assert catalog.metric("personality.expressiveness").better == "high"
+
+
+def test_decision_index_benchmark_carries_its_eval_slug():
+    """Gap 2: the Decision Index's own eval page is the ranker's chart set."""
+    bench = catalog.BENCHMARKS["decisionIndex"]
+    assert bench.slug == "artificial-analysis-decision-index"
+    assert bench.source_hint == "chart"
+    assert catalog.benchmark("artificial-analysis-decision-index") is bench

@@ -223,6 +223,7 @@ sort=<key>` joins them by slug and the header/footnote state the real coverage):
 - GDPval-AA raw Elo · Elo · pairwise preference Elo.
 - AA-Briefcase · Elo · see `indexes`.
 - AA-3D · Elo · three-dimensional reasoning/design tasks.
+- AA-PersonalityBench · index · eight 0-100 percentile indexes (41-model cohort, 10-model chart set) · how models communicate rather than whether they are correct; `personality` / `personalitybench` resolve to the first index AA lists (Expressiveness).
 - Global-MMLU-Lite · % · 17 (union of its 5-row eval page and the 13-row
   `/models/multilingual` page) · multilingual knowledge; also split per language.
 - MMLU-Pro, Math-500 · % · knowledge and math suites (only ~1 active model each —

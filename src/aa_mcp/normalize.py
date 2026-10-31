@@ -589,6 +589,29 @@ def _multilingual_scores(rec) -> dict[str, float]:
     return out
 
 
+def _personality_scores(rec) -> dict[str, float]:
+    """AA-PersonalityBench index scores, namespaced ``personality.<index>``.
+
+    The eval page publishes them under ``judged.indexScores`` and model pages
+    under ``personalityBench.indexScores``; both are 0-100 percentiles, so no
+    rescaling is applied.  The same containers carry the raw per-trait Elos
+    (``scores``) — not catalogued, because AA's own ranking surface is the eight
+    indexes (AA publishes no single overall Personality score).
+    """
+    out: dict[str, float] = {}
+    for container in (rec.get("personalityBench"), rec.get("judged")):
+        if not isinstance(container, dict):
+            continue
+        scores = container.get("indexScores")
+        if not isinstance(scores, dict):
+            continue
+        for name, raw in scores.items():
+            value = _num(raw)
+            if value is not None:
+                out.setdefault(f"personality.{name}", value)
+    return out
+
+
 def _map_suffix(prefix: str, raw: str) -> str:
     """The eval-key suffix for one key of a breakdown map (matches catalog)."""
     if prefix == "omniscience.domain":
@@ -672,7 +695,8 @@ def from_chart(rec: dict, *, primary_metric: str = "",
 
     evals = _evals(rec, _CHART_EVAL_KEYS, _CHART_KEY_ALIASES)
     for extra in (_decision_scores(rec, primary_metric, primary_key),
-                  _mobile_scores(rec), _multilingual_scores(rec)):
+                  _mobile_scores(rec), _multilingual_scores(rec),
+                  _personality_scores(rec)):
         for key, value in extra.items():
             evals.setdefault(key, value)
     breakdowns, flat = _breakdown_fields(rec)

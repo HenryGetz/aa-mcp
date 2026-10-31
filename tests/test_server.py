@@ -2663,3 +2663,40 @@ def test_tool_list_fixed_context_stays_within_budget():
         f"{_TOOL_WIRE_TOK_CEILING} tok budget — trim the docstrings in "
         "src/aa_mcp/server.py, not this test"
     )
+
+
+def test_benchmark_leaderboard_ranks_personalitybench(monkeypatch):
+    """Gap 1: ``benchmark=personalitybench`` resolves and ranks the index scores."""
+    models = [
+        _model("a", "Alpha", evals={"personality.expressiveness": 40.0}),
+        _model("b", "Beta", evals={"personality.expressiveness": 90.0}),
+    ]
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (models, rich))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
+    monkeypatch.setattr(server, "_extra_score_models", lambda key, refresh=False: [])
+    out = server.aa_benchmark_leaderboard(benchmark="personalitybench", top=3)
+    assert "Personality · Expressiveness" in out
+    assert out.index("Beta") < out.index("Alpha")
+
+
+def test_benchmark_leaderboard_ranks_the_decision_index(monkeypatch):
+    """Gap 2: with its real slug, the Decision Index ranks its own page's rows."""
+    base = [_model("a", "Alpha"), _model("b", "Beta")]
+    scored = [_model("a", "Alpha", evals={"decisionIndex": 80.0}),
+              _model("b", "Beta", evals={"decisionIndex": 60.0})]
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: base)
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: (base, rich))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
+    monkeypatch.setattr(server, "_extra_score_models",
+                        lambda key, refresh=False: scored if key == "decisionIndex" else [])
+    out = server.aa_benchmark_leaderboard(benchmark="decisionIndex", top=3)
+    assert "AA Decision Index" in out
+    assert out.index("Alpha") < out.index("Beta")
+    assert "80.0" in out

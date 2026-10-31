@@ -9,7 +9,7 @@ without touching the network.
 
 The loaders hold no request state: they are safe to call concurrently from the
 MCP server's thread pool.  The only module-level mutable state is a set of small
-memos of parsed payloads (the 700-row leaderboard plus the media/model/provider/
+memos of parsed payloads (the leaderboard plus the media/model/provider/
 agents/home/eval surfaces), each keyed by the cache file's path and mtime.  They
 trade one payload parse for lock-free reads on the hottest paths and are bounded
 so they cannot grow without limit.
@@ -445,7 +445,7 @@ def _validate(
 #: Sentinel for "no memo entry"; parsed values are never ``None``.
 _MISS = object()
 
-#: Bound for the per-slug/per-board memos.  A small LRU keeps the rich ~700-model
+#: Bound for the per-slug/per-board memos.  A small LRU keeps the wide rich
 #: chart sets and endpoint lists from accumulating across dozens of slugs.
 _MEMO_MAXSIZE = 24
 
@@ -596,7 +596,7 @@ def _join_release(model: Model, index: dict[str, dict], by_length: list[str]) ->
 
 
 def parse_leaderboard(text: str) -> list[Model]:
-    """Parse the metrics array (the 700-row one) from ``/leaderboards/models``.
+    """Parse the metrics array from ``/leaderboards/models``.
 
     Rows are joined to the payload's sibling release array so ``release_date``
     and ``creator_slug`` are populated (the metrics array carries neither).
@@ -613,7 +613,7 @@ def parse_leaderboard(text: str) -> list[Model]:
 
 
 _MODELS_REF_RE = re.compile(r":models:(\d+)$")
-_RICH_MIN = 100  # chart arrays are 27-32 entries; the rich dataset is ~700
+_RICH_MIN = 100  # chart arrays are 27-32 entries; the rich dataset is far larger
 
 
 def _initial_models_items(payload: str) -> list | None:
@@ -629,7 +629,7 @@ def _initial_models_items(payload: str) -> list | None:
 
 
 def _rich_records(payload: str) -> list[dict] | None:
-    """The >100-entry chart-shaped array (the rich ~700-model dataset), if present."""
+    """The >100-entry chart-shaped array (the wide model-page dataset), if present."""
     candidates = [a for a in flight.find_arrays(payload, _CHART_REQUIRED) if len(a) > _RICH_MIN]
     if not candidates:
         return None
@@ -904,7 +904,7 @@ def parse_chart(text: str, *, slug: str = "") -> list[Model]:
 
     Preferred shape is ``initialModels`` (model pages, eval pages, capability-like
     charts). On "rich" pages that array holds flight-reference strings into the
-    sibling ~700-entry dataset; those are resolved.  Pages without ``initialModels``
+    sibling wide dataset; those are resolved.  Pages without ``initialModels``
     are read through :data:`_CHART_FALLBACK_SHAPES` — the Decision-Models table and
     the on-device benchmark set both publish their per-model rows that way.  Non-dict
     entries are always skipped, so a single odd entry can never crash a tool.
@@ -1168,7 +1168,7 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
 
 
 def _leaderboard_rsc(refresh: bool = False) -> list[Model]:
-    """The 700-row RSC leaderboard (memoized on the cache file's fetch time)."""
+    """The RSC leaderboard payload (memoized on the cache file's fetch time)."""
     global _LEADERBOARD_MEMO
     source_url = url(SOURCE_URLS["leaderboard"])
     got = fetch.get(
@@ -1371,7 +1371,7 @@ def parse_provider_endpoints(text: str) -> list[Endpoint]:
 
 
 def parse_provider_board(text: str) -> list[Endpoint]:
-    """Parse the 1201-row ``rows`` array of ``/leaderboards/providers``."""
+    """Parse the ``rows`` array of ``/leaderboards/providers``."""
     records = flight.find_array(
         flight.payload(text), ("host", "model", "features", "pricing")
     )
@@ -1397,7 +1397,7 @@ def provider_endpoints(slug: str, refresh: bool = False) -> list[Endpoint]:
 
 
 def provider_board(refresh: bool = False) -> list[Endpoint]:
-    """The 1201-row provider leaderboard."""
+    """The provider leaderboard (every serving endpoint AA lists)."""
     source_url = url(SOURCE_URLS["providers_board"])
     got = fetch.get(
         source_url,

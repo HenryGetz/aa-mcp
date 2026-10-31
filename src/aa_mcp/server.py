@@ -264,7 +264,7 @@ def _metric_value(model: Model, key: str) -> float | None:
         return None
 
 
-#: metrics AA publishes on **two** surfaces: the 700-row leaderboard snapshot
+#: metrics AA publishes on **two** surfaces: the leaderboard snapshot
 #: (``medianOutputTokensPerSecond`` / ``medianTimeToFirstTokenSeconds`` / …) and the
 #: first-party model page (``timescaleData.medianOutputSpeed`` /
 #: ``medianTimeToFirstChunk`` / ``timeToFirstAnswerToken`` / ``endToEndResponseTime``).
@@ -1761,7 +1761,7 @@ def _extra_score_models(key: str, refresh: bool = False) -> list[Model]:
     """Models carrying ``key`` from AA's eval chart set or homepage panel.
 
     The same source chain ``aa_benchmark_leaderboard`` uses; needed so a
-    frontier works for a benchmark the 700-row leaderboard does not carry
+    frontier works for a benchmark the leaderboard does not carry
     (e.g. the cyber boards, which AA publishes only on an eval page / panel).
     """
     models, source = _score_surface(key, refresh)
@@ -1781,7 +1781,7 @@ def _join_extra_scores(
 
     Returns ``(models, source)``; ``source`` is ``""`` when AA publishes no
     per-model surface for ``key`` (so the caller keeps its honest no-rank error).
-    The merged 700-row record is the base and the extra record is merged under it
+    The merged leaderboard record is the base and the extra record is merged under it
     (same slug), so leaderboard-only columns (cost, speed, identity) survive while
     the extra score is added.  For a key that has its **own page** (a capability
     index, or the Openness / Decision index) that page is authoritative for its own
@@ -2507,7 +2507,7 @@ def _model_chart_evals(slug: str, have: set[str],
 
     The same source chain ``aa_compare`` / ``aa_pareto`` join; only benchmarks AA
     serves from an eval chart set or homepage panel are probed, so a model page
-    never fans out over the 700-row leaderboard.
+    never fans out over the leaderboard.
     """
     try:
         panel_slugs = {key.split(":", 1)[1] for key in _home_rows(refresh)
@@ -2975,7 +2975,7 @@ def _compare_extra_values(key: str, models: Sequence[Model],
                           refresh: bool = False) -> tuple[dict[str, float], str, int]:
     """``({slug: value}, source, scored)`` for ``key`` from AA's chart set/panel.
 
-    Fills a comparison row whose values live outside the 700-row leaderboard and
+    Fills a comparison row whose values live outside the leaderboard and
     the rich overlay (the cyber boards, AA-3D, …) — the same source chain
     ``aa_pareto`` and ``aa_benchmark_leaderboard`` use.
     """
@@ -4147,9 +4147,9 @@ def _known_tags() -> list[str]:
 def _rankable_coverage(r: Any, lb: Sequence[Model], merged: Sequence[Model]) -> str:
     """Live coverage of one rankable in the current source.
 
-    Computed from the same source chain the ranking tools use (the 700-row
-    leaderboard, the rich overlay, then AA's eval chart set / homepage panel), so
-    a benchmark AA now fetches live is never labelled "not fetched".
+    Computed from the same source chain the ranking tools use (the leaderboard,
+    the rich overlay, then AA's eval chart set / homepage panel), so a benchmark
+    AA now fetches live is never labelled "not fetched".
     """
     if str(getattr(r, "kind", "")) == "arena":
         return "arena board"
@@ -5931,7 +5931,7 @@ def aa_leaderboard(
     include_deprecated: bool = False,
     refresh: bool = False,
 ) -> str:
-    """Rank/filter the ~700 tracked model variants — the default starting point.
+    """Rank/filter the tracked model variants — the default starting point.
 
     The tool for "smartest / cheapest / fastest / best value right now".
     mode=rank | value (intelligence per $/task) | frontier (Pareto curve with its

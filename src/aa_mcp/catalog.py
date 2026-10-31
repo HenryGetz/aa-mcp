@@ -65,7 +65,7 @@ class Benchmark:
     tags: tuple[str, ...]
     index_member: bool
     #: best free surface for a cross-model value:
-    #: "leaderboard" (700-row array) | "rich" (~700-model model-page dataset) |
+    #: "leaderboard" (the full leaderboard array) | "rich" (the wide model-page dataset) |
     #: "chart" (eval-page chart set / homepage panel) | "board" (arena board) |
     #: "none" (AA publishes it only through its paid data API — no public page).
     source_hint: str = "leaderboard"
@@ -85,7 +85,7 @@ _B = [
      "AA Coding Index: composite weighted toward coding evaluations.", ("index", "coding"), False),
     ("agentic", "Agentic", None, "index",
      "AA Agentic Index: composite weighted toward agentic evaluations.", ("index", "agentic"), False),
-    ("decisionIndex", "AA Decision Index", None, "index",
+    ("decisionIndex", "AA Decision Index", "artificial-analysis-decision-index", "index",
      "AA Decision Index: weighted average of AA-Omniscience-Decision, "
      "HLE-MultiChoice, When2Call and WildGuardTest across decision models.",
      ("index", "decision"), False),
@@ -293,6 +293,55 @@ _B = [
      ("science", "reasoning", "agentic"), False),
     ("frontierCode20", "FrontierCode 2.0", "frontiercode-2-0", "%",
      "FrontierCode 2.0 coding benchmark.", ("coding",), False),
+    # AA-PersonalityBench (verified live 2026-10-31).  The eval page
+    # ``/evaluations/aa-personalitybench`` and every model page publish eight
+    # independent *index* scores (``judged.indexScores`` on the eval chart set,
+    # ``personalityBench.indexScores`` on model pages) on a 0-100 percentile
+    # scale — "the mean of its traits' Elo z-scores, percentile ranked the same
+    # way" (AA's own subtitle).  AA publishes **no single overall score**, so
+    # each index is its own rankable and ``personality``/``personalitybench``
+    # resolve to the first one AA lists (Expressiveness).  The raw per-trait
+    # Elos (30 traits) ride in the same maps but are not catalogued here.
+    ("personality.expressiveness", "Personality · Expressiveness",
+     "aa-personalitybench", "index",
+     "AA-PersonalityBench Expressiveness index: rich, varied, well-crafted "
+     "language (0-100 percentile across the evaluated models).",
+     ("personality", "communication", "index"), False),
+    ("personality.organization", "Personality · Organization",
+     "aa-personalitybench", "index",
+     "AA-PersonalityBench Organization index: well-structured, scannable, "
+     "answer-first responses (0-100 percentile).",
+     ("personality", "communication", "index"), False),
+    ("personality.informativeness", "Personality · Informativeness",
+     "aa-personalitybench", "index",
+     "AA-PersonalityBench Informativeness index: practical depth, evidence and "
+     "actionable content (0-100 percentile).",
+     ("personality", "communication", "index"), False),
+    ("personality.transparency", "Personality · Transparency",
+     "aa-personalitybench", "index",
+     "AA-PersonalityBench Transparency index: truthful, acknowledges "
+     "uncertainty, non-sycophantic (0-100 percentile).",
+     ("personality", "communication", "index"), False),
+    ("personality.warmth", "Personality · Warmth",
+     "aa-personalitybench", "index",
+     "AA-PersonalityBench Warmth index: friendly, humorous, sincere, "
+     "emotionally attuned (0-100 percentile).",
+     ("personality", "communication", "index"), False),
+    ("personality.conviction", "Personality · Conviction",
+     "aa-personalitybench", "index",
+     "AA-PersonalityBench Conviction index: direct, confident positions and "
+     "constructive pushback (0-100 percentile).",
+     ("personality", "communication", "index"), False),
+    ("personality.imagination", "Personality · Imagination",
+     "aa-personalitybench", "index",
+     "AA-PersonalityBench Imagination index: creative and open-ended responses "
+     "(0-100 percentile).",
+     ("personality", "communication", "index"), False),
+    ("personality.slop", "Personality · Slop",
+     "aa-personalitybench", "index",
+     "AA-PersonalityBench Slop index: formulaic, low-effort writing "
+     "(0-100 percentile, lower is better).",
+     ("personality", "communication", "quality"), False),
 ]
 
 #: Multilingual Index languages: payload key -> display name.  The per-language
@@ -597,7 +646,7 @@ _BOARD_METRICS: list[tuple] = [
 _B.extend(_BOARD_METRICS)
 
 #: benchmark key -> best surface that yields a *cross-model* value.
-#: Everything not listed defaults to "leaderboard" (the 700-row array).
+#: Everything not listed defaults to "leaderboard" (the leaderboard array).
 _SOURCE_HINTS: dict[str, str] = {
     # AA publishes these two composites only through its paid data API: no public
     # page carries a per-model value, so there is no free surface to hint at
@@ -606,7 +655,7 @@ _SOURCE_HINTS: dict[str, str] = {
     "agentic": "none",
     # AA's own eval page for the index carries its full per-model array
     "decisionIndex": "chart",
-    # present in the ~700 x 94 rich dataset (model pages), incl. derived fields
+    # present in the wide (94-key) rich dataset on model pages, incl. derived fields
     "aime25": "rich",
     "automationBenchPartialScore": "rich",
     "briefcaseBreakdown": "rich",
@@ -668,6 +717,17 @@ _SOURCE_HINTS: dict[str, str] = {
     "omniscienceDecision": "chart",
     "omniscienceDecisionNonHallucination": "chart",
     "multilingual": "chart",
+    # AA-PersonalityBench: the eval page's chart set (``judged.indexScores``)
+    # and the model pages (``personalityBench.indexScores``) are the only free
+    # surfaces — no leaderboard ``scores`` key carries these indexes.
+    "personality.expressiveness": "chart",
+    "personality.organization": "chart",
+    "personality.informativeness": "chart",
+    "personality.transparency": "chart",
+    "personality.warmth": "chart",
+    "personality.conviction": "chart",
+    "personality.imagination": "chart",
+    "personality.slop": "chart",
 }
 #: every breakdown sub-score and board metric is a per-model chart-set value
 for _row in _SUBSCORES + _BOARD_METRICS:
@@ -957,6 +1017,8 @@ _LOWER_IS_BETTER = {
     "sttStreamingAgenttalkWer", "sttStreamingTimeToFinal",
     "sttStreamingTimeToFirstPartial", "ttsGenerationTime", "searchAvgLatency",
     "searchCostPerQuery", "searchCostPerTask",
+    # AA-PersonalityBench Slop: formulaic, low-effort writing — lower is better
+    "personality.slop",
 }
 #: Benchmark key -> the short label a table head shows.  A benchmark's own label
 #: is truncated to 12 characters for column headers, which mangles the longer ones
@@ -1006,6 +1068,16 @@ _SHORT_LABELS: dict[str, str] = {
     "mobile.omniscience": "Dev Omni",
     "mobile.bfcl_500": "Dev BFCL-500",
     "mobile.bfcl_small": "Dev BFCL-Sm",
+    # AA-PersonalityBench's eight indexes all truncate to "Personality "; keep
+    # the 12-char headers distinguishable.
+    "personality.expressiveness": "Pers Express",
+    "personality.organization": "Pers Organiz",
+    "personality.informativeness": "Pers Inform",
+    "personality.transparency": "Pers Transp",
+    "personality.warmth": "Pers Warmth",
+    "personality.conviction": "Pers Convic",
+    "personality.imagination": "Pers Imagin",
+    "personality.slop": "Pers Slop",
 }
 #: the per-language / per-domain families, generated from the same tables that
 #: define their keys so a new entry can never be left without a short label
@@ -1144,6 +1216,12 @@ _SHORTHANDS = {
     "reasoning_time": "reasoning_s",
     "date": "release_date",
     "elo": "briefcaseElo",
+    # AA-PersonalityBench names the bench, not one of its eight indexes; resolve
+    # to the first index AA lists (Expressiveness) so the ranking path works.
+    "personalitybench": "personality.expressiveness",
+    "personalitybenchai": "personality.expressiveness",
+    "aapersonalitybench": "personality.expressiveness",
+    "personality": "personality.expressiveness",
 }
 
 
@@ -1476,6 +1554,26 @@ _EXTRA_ALIASES = {
                                           "Healthcare & Medical Index"),
     "capabilities.engineering": ("Engineering", "Engineering Index"),
     "capabilities.economics": ("Economics", "Economics Index"),
+    # AA-PersonalityBench: AA publishes eight independent index scores and no
+    # single overall one, so the bench's own names resolve to the first index
+    # AA lists (Expressiveness).  Each other index keeps its own spellings.
+    "personality.expressiveness": (
+        "Personality", "PersonalityBench", "Personality Bench",
+        "personalitybench", "personality bench",
+        "AA-PersonalityBench", "AA PersonalityBench", "Personality Index",
+        "Expressiveness", "Expressiveness Index", "Personality Expressiveness"),
+    "personality.organization": ("Organization", "Organization Index",
+                                 "Personality Organization"),
+    "personality.informativeness": ("Informativeness", "Informativeness Index",
+                                    "Personality Informativeness"),
+    "personality.transparency": ("Transparency", "Transparency Index",
+                                 "Personality Transparency"),
+    "personality.warmth": ("Warmth", "Warmth Index", "Personality Warmth"),
+    "personality.conviction": ("Conviction", "Conviction Index",
+                               "Personality Conviction"),
+    "personality.imagination": ("Imagination", "Imagination Index",
+                                "Personality Imagination"),
+    "personality.slop": ("Slop", "Slop Index", "Personality Slop"),
 }
 
 
@@ -1513,7 +1611,7 @@ for _key, _b in BENCHMARKS.items():
     _label = _LABEL_OVERRIDES.get(_key, _b.label)
     _aliases = _dedupe((_b.key, _b.label, _b.slug, *_EXTRA_ALIASES.get(_key, ())))
     # ``aa_leaderboard sort=`` is the default ranking path for every key that has
-    # per-model values on some surface it can reach (the 700-row leaderboard, the
+    # per-model values on some surface it can reach (the leaderboard, the
     # rich overlay, or an eval chart set / homepage panel — joined by slug). Keys
     # AA serves only through its paid data API, container/breakdown kinds, and the
     # few chart keys with no eval-page slug stay on ``aa_benchmark_leaderboard``.

@@ -95,10 +95,10 @@ def header(
     source: str = "",
     as_of: float | None = None,
 ) -> str:
-    """One-line table header, e.g. ``# 42/700 models · 3m ago · aa:rsc``.
+    """One-line table header, e.g. ``# 42/N models · 3m ago · aa:rsc``.
 
     ``count`` overrides the ``shown/total`` left-hand text (the server passes a
-    ready-made ``"15 of 270 scored (700 tracked)"``); ``note`` is appended to it
+    ready-made ``"15 of 270 scored (N tracked)"``); ``note`` is appended to it
     with a space, matching the historical shape.
     """
     count_txt = count if count is not None else (
