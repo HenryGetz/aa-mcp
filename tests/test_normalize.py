@@ -511,3 +511,114 @@ def test_decision_contestant_slug_is_restored(decision_row):
     assert normalize.from_chart(
         {"slug": "host_a_b", "hostName": "Host", "scores": {"x": 1.0},
          "name": "Y"}).slug == "host_a_b"
+
+
+# --------------------------------------------------------------------------- #
+# v5.0: the leaderboard's slug-keyed ``scores`` map
+# --------------------------------------------------------------------------- #
+
+_V5_SCORES = {
+    "gpqa-diamond": 0.9393939393939394,
+    "humanitys-last-exam": 0.527,
+    "scicode": 0.5417,
+    "terminalbench-4-0": 0.4949,
+    "gdpval-aa-normalized": 1498.47,
+    "aa-briefcase": 1461.69,
+    "healthbench": 0.5698718859725104,
+    "critpt-v2-hard": 0.63,
+    "frontiercode-2-0": 0.464359595959596,
+    "hle-diamond": 0.679,
+    "code2video-aa": 1535.57,
+}
+
+
+def test_leaderboard_scores_map_is_parsed():
+    m = normalize.from_leaderboard({"slug": "x", "name": "X", "scores": _V5_SCORES})
+    assert m.evals["gpqa"] == pytest.approx(0.9393939393939394)
+    assert m.evals["hle"] == pytest.approx(0.527)
+    assert m.evals["scicode"] == pytest.approx(0.5417)
+    assert m.evals["terminalBench40"] == pytest.approx(0.4949)
+    assert m.evals["healthbench"] == pytest.approx(0.5698718859725104)
+    assert m.evals["critptAgenticHard"] == pytest.approx(0.63)
+    assert m.evals["frontierCode20"] == pytest.approx(0.464359595959596)
+    assert m.evals["hleDiamond"] == pytest.approx(0.679)
+    assert m.evals["code2videoElo"] == pytest.approx(1535.57)
+
+
+def test_leaderboard_gdpval_is_elo_and_never_the_fraction():
+    """``gdpval-aa-normalized`` ships Elo; it must land on ``gdpval`` only."""
+    m = normalize.from_leaderboard(
+        {"slug": "x", "scores": {"gdpval-aa-normalized": 1498.47}})
+    assert m.evals["gdpval"] == pytest.approx(1498.47)
+    assert "gdpvalNormalized" not in m.evals
+
+
+def test_leaderboard_legacy_flat_keys_still_parse():
+    m = normalize.from_leaderboard({"slug": "x", "gpqa": 0.9, "hle": 0.5})
+    assert m.evals["gpqa"] == pytest.approx(0.9)
+    assert m.evals["hle"] == pytest.approx(0.5)
+
+
+def test_leaderboard_flat_key_wins_over_a_scores_collision():
+    m = normalize.from_leaderboard(
+        {"slug": "x", "gpqa": 0.5, "scores": {"gpqa-diamond": 0.9}})
+    assert m.evals["gpqa"] == pytest.approx(0.5)
+
+
+#: AA's live model page for ``gemini-4-carbon`` publishes
+#: ``omniscienceAccuracy=0.5826666666666667`` and
+#: ``omniscienceHallucinationRate=0.11421725239616613``; the leaderboard's
+#: ``scores`` map publishes the same accuracy plus
+#: ``omniscience-non-hallucination=0.8857827476038339``.
+#: https://artificialanalysis.ai/models/gemini-4-carbon (fetched 2026-10-31)
+_OMNI_ACCURACY = 0.5826666666666667
+_OMNI_HALLUCINATION_RATE = 0.11421725239616613
+_OMNI_NON_HALLUCINATION = 0.8857827476038339
+
+
+@pytest.fixture(scope="module")
+def omniscience_v5_records():
+    p = flight.payload(_read("leaderboard_omniscience_v5.rsc"))
+    return {r["slug"]: r for r in flight.find_array(p, ["intelligenceIndex"])}
+
+
+def test_leaderboard_v5_omniscience_columns_land_on_their_own_keys(
+    omniscience_v5_records,
+):
+    """``omniscience-accuracy``/``omniscience-non-hallucination`` are score keys."""
+    m = normalize.from_leaderboard(omniscience_v5_records["gemini-4-carbon"])
+    assert m.evals["omniscienceAccuracy"] == pytest.approx(_OMNI_ACCURACY)
+    assert m.evals["omniscienceNonHallucination"] == pytest.approx(
+        _OMNI_NON_HALLUCINATION)
+    # the index is the row's own ``omniscience`` field, not a scores-map key
+    assert m.indices["omniscience"] == pytest.approx(41.2)
+    # the leaderboard scores map has no hallucination-rate key: it stays absent
+    assert "omniscienceHallucinationRate" not in m.evals
+
+
+def test_leaderboard_v5_non_hallucination_is_the_complement_not_the_rate():
+    """AA publishes 1 - hallucination rate; the rate must never fill the key."""
+    m = normalize.from_leaderboard(
+        {"slug": "x", "scores": {"omniscience-non-hallucination":
+                                 _OMNI_NON_HALLUCINATION}})
+    assert m.evals["omniscienceNonHallucination"] == pytest.approx(
+        1 - _OMNI_HALLUCINATION_RATE, abs=1e-12)
+    assert m.evals["omniscienceNonHallucination"] != pytest.approx(
+        _OMNI_HALLUCINATION_RATE)
+
+
+def test_leaderboard_v5_hallucination_rate_never_becomes_non_hallucination():
+    """A payload carrying the rate itself must not populate either key."""
+    m = normalize.from_leaderboard(
+        {"slug": "x", "scores": {"omniscience-hallucination-rate":
+                                 _OMNI_HALLUCINATION_RATE}})
+    assert "omniscienceNonHallucination" not in m.evals
+    assert "omniscienceHallucinationRate" not in m.evals
+
+
+def test_leaderboard_v5_omniscience_legacy_flat_keys_still_parse(
+    omniscience_v5_records,
+):
+    m = normalize.from_leaderboard(omniscience_v5_records["legacy-row"])
+    assert m.evals["omniscienceAccuracy"] == pytest.approx(0.4)
+    assert m.evals["omniscienceNonHallucination"] == pytest.approx(0.7)

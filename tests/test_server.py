@@ -64,6 +64,7 @@ def fake(monkeypatch):
                         lambda refresh=False, rich=True: (models, rich))
     monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
     monkeypatch.setattr(server, "_rich_models", lambda refresh=False: models)
+    monkeypatch.setattr(server, "_models", lambda refresh=False: models)
     monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
     monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
@@ -276,6 +277,7 @@ def _patch_leaderboard(monkeypatch, base, extra):
     monkeypatch.setattr(server, "_models_state",
                         lambda refresh=False, rich=True: (list(base), rich))
     monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: list(base))
+    monkeypatch.setattr(server, "_models", lambda refresh=False: list(base))
     monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
     monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
@@ -1140,6 +1142,129 @@ def test_leaderboard_and_pareto_reject_a_container_key():
         assert "container benchmark" in str(exc.value)
 
 
+# --------------------------------------------------------------------------- #
+# GDPval semantics (audit D1): an Elo must never reach a percent metric
+# --------------------------------------------------------------------------- #
+
+
+class _FetchedText:
+    """The ``.text`` attribute ``server._get`` returns for a cached payload."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+def _chart_text(records: list[dict]) -> str:
+    """A minimal eval-page payload: one chart-set array with the probe keys."""
+    return json.dumps({"initialModels": records})
+
+
+def _fake_get(text: str):
+    def get(url, name, refresh=False, **kwargs):
+        return _FetchedText(text)
+    return get
+
+
+def test_briefcase_elo_never_reaches_a_percent_metric(monkeypatch):
+    """The old fallback fed briefcase Elo to *every* missing key (161019.0%)."""
+    record = {"slug": "alpha", "chartDefaultSelected": True,
+              "releaseDate": "2026-01-01", "suffix": "",
+              "briefcaseBreakdown": {"elo": 1610.19}}
+    monkeypatch.setattr(server, "_get", _fake_get(_chart_text([record])))
+    model = _model("alpha", "Alpha One")
+    percent = [b.key for b in catalog.BENCHMARKS.values() if b.unit == "%"]
+    assert "gdpvalNormalized" in percent
+    for key in percent:
+        assert server._raw_chart_pairs("gdpval-aa", key, [model],
+                                       lambda _m: True) == []
+    # the metric that owns the breakdown still reads it (guards a silent failure)
+    assert server._raw_chart_pairs("aa-briefcase", "briefcaseElo", [model],
+                                   lambda _m: True) == [(model, 1610.19)]
+
+
+def test_gdpval_normalized_reports_no_values(monkeypatch):
+    """GDPval's normalized fraction is gone: say so, never render the Elo ×100."""
+    base = [_model("alpha", "Alpha One", intelligence=50.0)]
+    _patch_leaderboard(monkeypatch, base, {})
+    chart = [_model("alpha", "Alpha One", evals={"briefcaseElo": 1610.19})]
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: chart)
+    record = {"slug": "alpha", "chartDefaultSelected": True,
+              "releaseDate": "2026-01-01", "suffix": "",
+              "briefcaseBreakdown": {"elo": 1610.19}}
+    monkeypatch.setattr(server, "_get", _fake_get(_chart_text([record])))
+    monkeypatch.setattr(server, "_home_rows", lambda refresh=False: {})
+
+    out = server.aa_benchmark_leaderboard(benchmark="gdpvalNormalized", top=3)
+    assert "no longer publishes" in out
+    assert "no per-model values" in out
+    assert "benchmark=gdpval" in out      # points at the value AA does publish
+    assert "1610" not in out and "%" not in out
+
+
+def test_gdpval_ranks_the_published_elo_without_a_percent(monkeypatch):
+    base = [_model("alpha", "Alpha One", intelligence=50.0)]
+    _patch_leaderboard(monkeypatch, base, {})
+    chart = [_model("alpha", "Alpha One", evals={"gdpval": 1732.68})]
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: chart)
+
+    out = server.aa_benchmark_leaderboard(benchmark="gdpval", top=3)
+    assert "1733" in out
+    assert "%" not in out
+
+
+# --------------------------------------------------------------------------- #
+# resolution over the merged pool (audit D3)
+# --------------------------------------------------------------------------- #
+
+
+def test_models_resolve_over_the_pool(monkeypatch):
+    active = _model("active", "Active One")
+    old = _model("old-model", "Old Model", deprecated=True)
+    monkeypatch.setattr(loaders, "model_pool", lambda refresh=False: [active, old],
+                        raising=False)
+    assert [m.slug for m in server._models()] == ["active", "old-model"]
+
+
+def test_search_finds_a_deprecated_model_and_labels_it(fake, monkeypatch):
+    old = _model("old-model", "Old Model", deprecated=True)
+    monkeypatch.setattr(server, "_models",
+                        lambda refresh=False: [*fake.values(), old])
+
+    out = server.aa_search(query="old-model")
+    assert "old-model" in out
+    assert "deprecated" in out
+    assert "| Status |" in out
+
+    # the default listing stays the active field (deprecated rows filtered after
+    # resolution, so they never inflate "most intelligent")
+    assert "old-model" not in server.aa_search()
+
+
+def test_model_digest_marks_a_deprecated_row(monkeypatch):
+    base = _model("old-model", "Old Model", deprecated=True)
+    monkeypatch.setattr(server, "_models", lambda refresh=False: [base])
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: {})
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+
+    out = server.aa_model(query="old-model", sections="identity")
+    assert "deprecated" in out
+
+
+def test_leaderboard_include_deprecated_lists_pool_rows(monkeypatch):
+    active = _model("active", "Active One", intelligence=60.0)
+    old = _model("old-model", "Old Model", deprecated=True, intelligence=40.0)
+    _patch_leaderboard(monkeypatch, [active], {})
+    monkeypatch.setattr(server, "_models", lambda refresh=False: [active, old])
+
+    active_only = server._leaderboard(sort="intelligence", top=5)
+    assert "Active One" in active_only and "Old Model" not in active_only
+
+    with_deprecated = server._leaderboard(sort="intelligence", top=5,
+                                          include_deprecated=True)
+    assert "Old Model" in with_deprecated
+
+
 def test_search_resolves_an_arena_model(fake, monkeypatch):
     entries = [_arena_entry("Grok Voice 3.0", "speech_to_speech", kind="speech",
                             creator="SpaceXAI",
@@ -1467,6 +1592,7 @@ def _patch_models(monkeypatch, models):
                         lambda refresh=False, rich=True: (models, rich))
     monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: models)
     monkeypatch.setattr(server, "_rich_models", lambda refresh=False: models)
+    monkeypatch.setattr(server, "_models", lambda refresh=False: models)
     monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
     monkeypatch.setattr(server, "_source_key", lambda: "rsc")
     monkeypatch.setattr(server, "_fresh", lambda name: (None, False))

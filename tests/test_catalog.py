@@ -230,9 +230,10 @@ def test_source_hint_values_are_known_and_counted():
 
     hints = Counter(b.source_hint for b in catalog.BENCHMARKS.values())
     assert set(hints) <= {"leaderboard", "rich", "api", "chart", "none"}
-    assert hints["leaderboard"] == 20
-    # "none" = AA publishes the composite only through its paid data API
-    assert hints["none"] == 2
+    assert hints["leaderboard"] == 19
+    # "none" = AA publishes the composite only through its paid data API, or
+    # stopped publishing the metric (gdpvalNormalized since Intelligence Index v5.0)
+    assert hints["none"] == 3
     assert hints["api"] == 0
     assert sum(hints.values()) == len(catalog.BENCHMARKS)
 
@@ -582,7 +583,7 @@ def test_aa_leaderboard_hint_covers_every_reachable_surface():
             if r.surface == "chart":
                 assert bench.slug, (key, r.slug)
         else:
-            assert (bench.unit == "mixed" or bench.source_hint == "api"
+            assert (bench.unit == "mixed" or bench.source_hint in ("api", "none")
                     or not bench.slug), (key, r.how)
     # the audited panel/chart index and its companions are now first-class
     for key in ("cyberIndex", "cyberRefusalRate", "cyberMitigationStatus"):

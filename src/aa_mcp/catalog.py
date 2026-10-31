@@ -106,8 +106,9 @@ _B = [
     ("hle", "HLE", "humanitys-last-exam", "%",
      "Humanity's Last Exam: 2,500 expert-vetted frontier questions.",
      ("reasoning", "intelligence-index"), True),
-    ("hleDiamond", "HLE Diamond", None, "%",
-     "Diamond subset of Humanity's Last Exam (model pages only).", ("reasoning",), False),
+    ("hleDiamond", "HLE Diamond", "hle-diamond", "%",
+     "Diamond subset of Humanity's Last Exam; published on its eval page and on "
+     "model pages.", ("reasoning",), False),
     ("scicode", "SciCode", "scicode", "%",
      "SciCode: 288 scientist-curated coding subproblems from 80 lab problems.",
      ("coding", "science", "intelligence-index"), True),
@@ -140,7 +141,9 @@ _B = [
      "GDPval-AA v2.1 raw Elo (44 occupations, 9 industries, agentic).",
      ("agentic", "knowledge-work", "elo"), False),
     ("gdpvalNormalized", "GDPval-AA", "gdpval-aa", "%",
-     "GDPval-AA v2.1 normalized 0-1 score used in the Intelligence Index.",
+     "GDPval-AA v2.1 normalized 0-1 score (Intelligence Index member). AA stopped "
+     "publishing this fraction with Intelligence Index v5.0 — the free pages and "
+     "the leaderboard's scores map now carry the raw Elo only (see gdpval).",
      ("agentic", "knowledge-work", "intelligence-index"), True),
     ("gdpPdfAllPass", "GDP.pdf", "gdp-pdf", "%",
      "GDP.pdf all-pass score.", ("agentic", "knowledge-work", "intelligence-index"), True),
@@ -270,6 +273,26 @@ _B = [
     ("multilingual", "Multilingual Index", "multilingual", "%",
      "AA Multilingual Index: mean accuracy across 16 languages (Global-MMLU-Lite).",
      ("multilingual", "knowledge"), False),
+    # Intelligence Index v5.0 additions (verified live 2026-10-31): each has its
+    # own /evaluations/<slug> chart set and a slug key in the leaderboard scores map.
+    ("healthbench", "HealthBench", "healthbench", "%",
+     "HealthBench: physician-written health conversations scored against rubric "
+     "criteria (14 model rows on the eval chart set).",
+     ("medical", "health", "safety"), False),
+    ("healthbenchProfessional", "HealthBench Professional", "healthbench-professional", "%",
+     "HealthBench professional subset: rubric-scored clinician conversations.",
+     ("medical", "health", "safety"), False),
+    ("code2videoElo", "Code2Video Elo", "code2video-aa", "Elo",
+     "AA-Code2Video: code-to-video generation quality, reported as Elo.",
+     ("media", "video", "coding", "elo"), False),
+    ("critptAgentic", "CritPt Agentic", "critpt-v2", "%",
+     "CritPt v2 agentic subset: research-level physics challenges solved with tools.",
+     ("science", "reasoning", "agentic"), False),
+    ("critptAgenticHard", "CritPt Agentic Hard", "critpt-v2", "%",
+     "CritPt v2 agentic hard subset: the hardest tool-assisted physics challenges.",
+     ("science", "reasoning", "agentic"), False),
+    ("frontierCode20", "FrontierCode 2.0", "frontiercode-2-0", "%",
+     "FrontierCode 2.0 coding benchmark.", ("coding",), False),
 ]
 
 #: Multilingual Index languages: payload key -> display name.  The per-language
@@ -597,6 +620,15 @@ _SOURCE_HINTS: dict[str, str] = {
     "gdpval": "rich",
     "harveyLab": "rich",
     "hleDiamond": "rich",
+    # v5.0 eval-page chart sets (also present in the leaderboard scores map)
+    "healthbench": "chart",
+    "healthbenchProfessional": "chart",
+    "code2videoElo": "chart",
+    "critptAgentic": "chart",
+    "critptAgenticHard": "chart",
+    "frontierCode20": "rich",
+    # AA stopped publishing the GDPval normalized fraction (v5.0): no free surface
+    "gdpvalNormalized": "none",
     "livecodebench": "rich",
     "mlcrOverall": "rich",
     "omniscienceHallucinationRate": "rich",
@@ -640,6 +672,12 @@ _SOURCE_HINTS: dict[str, str] = {
 #: every breakdown sub-score and board metric is a per-model chart-set value
 for _row in _SUBSCORES + _BOARD_METRICS:
     _SOURCE_HINTS.setdefault(_row[0], "chart")
+
+#: metrics AA stopped publishing -> the still-published metric that carries the
+#: same evaluation, used so a rankable hint never names an empty call.
+_UNPUBLISHED_FALLBACK: dict[str, str] = {
+    "gdpvalNormalized": "gdpval",
+}
 
 BENCHMARKS: dict[str, Benchmark] = {
     key: Benchmark(key, label, slug, unit, desc, tuple(tags), member,
@@ -953,6 +991,14 @@ _SHORT_LABELS: dict[str, str] = {
     "enterpriseOpsGymAvgTurns": "EntOps Turns",
     "aa3dTurnsP50": "AA-3D Turns",
     "medianCanonicalAnswerOutputSpeed": "Answer tok/s",
+    # v5.0 benchmarks: keep the headers distinguishable under 12-char truncation
+    "healthbench": "HealthBench",
+    "healthbenchProfessional": "HealthB Prof",
+    "code2videoElo": "Code2Video",
+    "critptAgentic": "CritPt Agt",
+    "critptAgenticHard": "CritPt Hard",
+    "frontierCode20": "Frontier 2.0",
+    "hleDiamond": "HLE Diamond",
     "mobile.gpqa": "Dev GPQA",
     "mobile.ifbench": "Dev IFBench",
     "mobile.ifstruct": "Dev IFStruct",
@@ -1367,6 +1413,13 @@ _EXTRA_ALIASES = {
     "terminalBench40": ("Terminal-Bench 4.0", "TerminalBench 4.0"),
     "terminalBenchScience": ("Terminal-Bench-Science 0.1", "Terminal-Bench Science 0.1"),
     "frontierCode": ("FrontierCode 1.1", "FrontierCode v1.1"),
+    "frontierCode20": ("FrontierCode 2.0", "FrontierCode v2.0", "FrontierCode v2"),
+    "healthbench": ("HealthBench", "Health Bench"),
+    "healthbenchProfessional": ("HealthBench Professional", "HealthBench Pro"),
+    "code2videoElo": ("Code2Video", "Code to Video", "AA-Code2Video"),
+    "critptAgentic": ("CritPt v2", "CritPt 2", "CritPt Agentic"),
+    "critptAgenticHard": ("CritPt v2 Hard", "CritPt Agentic Hard", "CritPt v2-Hard"),
+    "hleDiamond": ("HLE Diamond", "Humanity's Last Exam Diamond"),
     "aa3dElo": ("AA-3D", "AA 3D", "AA-3D Elo"),
     "decisionIndex": ("Decision Index", "AA Decision Index"),
     "multilingual": ("Multilingual Index", "AA Multilingual Index",
@@ -1474,6 +1527,11 @@ for _key, _b in BENCHMARKS.items():
     _constituents = API_ONLY_INDEXES.get(_key)
     if _constituents:
         _how = f"aa_benchmark_leaderboard benchmark={_constituents[0]}"
+    elif _b.source_hint == "none":
+        # a metric AA stopped publishing: name the still-published metric for the
+        # same evaluation instead of a call that would return nothing
+        _how = ("aa_benchmark_leaderboard benchmark="
+                f"{_UNPUBLISHED_FALLBACK.get(_key, _key)}")
     elif _lb_reachable:
         _how = f"aa_leaderboard sort={_key}"
     elif _b.unit == "mixed":

@@ -64,6 +64,7 @@ __all__ = [
     "leaderboard",
     "media",
     "model",
+    "model_pool",
     "open_weights_flag",
     "parse_agents",
     "parse_capability_index",
@@ -114,9 +115,16 @@ SOURCE_URLS: dict[str, str] = {
     "home": "/",
     "eval": "/evaluations/{slug}",
     "eval_catalog": "/evaluations",
-    "capability": "/models/capabilities/{slug}",
+    # the six capability indexes moved to /indexes/<slug> (the old
+    # /models/capabilities/<slug> route still answers with a 308 redirect)
+    "capability": "/indexes/{slug}",
+    "capability_legacy": "/models/capabilities/{slug}",
     "sitemap": "/sitemap.xml",
 }
+
+#: routes tried, in order, for a capability index page.  The legacy route is kept
+#: as a fallback for when the redirect is retired.
+CAPABILITY_ROUTES: tuple[str, ...] = ("capability", "capability_legacy")
 
 #: Chart-set slugs whose pages are **not** ``/evaluations/<slug>``.  All these
 #: surfaces ship the same kind of per-model model array as an eval page, so one
@@ -743,9 +751,12 @@ def _adapt_sts(records: list[dict], payload: str) -> list[dict]:
     """``/speech-to-speech/arena`` rows -> one chart-shaped record per model.
 
     The page ships three slices (``overall``, ``agentic``, ``non_agentic``) of the
-    same models.  Only ``overall`` carries the STS index and its components, so the
-    index and components come from that row while each slice's Elo is kept under
-    its own key — one record per model, never three rows for one model.
+    same models.  The STS index comes from the ``overall`` row and each slice's Elo
+    is kept under its own key — one record per model, never three rows for one
+    model.  The quality-component map is **not** guaranteed: live it is present on
+    22 of 30 ``overall`` rows, so it is read from the ``overall`` row when there and
+    otherwise from any slice that publishes it; rows without it simply carry no
+    component values (never a fabricated zero).
     """
     by_slug: dict[str, dict] = {}
     for rec in records:
@@ -762,16 +773,27 @@ def _adapt_sts(records: list[dict], payload: str) -> list[dict]:
             row["sts"] = rec.get("stsQualityIndexV2Score")
             row["stsTaskCompletionRate"] = rec.get("taskCompletionRate")
             row["stsOverallElo"] = rec.get("elo")
-            components = rec.get("stsQualityIndexV2Components")
-            if isinstance(components, dict):
-                for raw, key in _STS_COMPONENTS.items():
-                    entry = components.get(raw)
-                    if isinstance(entry, dict):
-                        row[key] = entry.get("score")
         elif slice_key == "agentic":
             row["stsAgenticElo"] = rec.get("elo")
         elif slice_key == "non_agentic":
             row["stsNonAgenticElo"] = rec.get("elo")
+    # component maps: prefer the overall slice, else the first slice that has one
+    chosen: dict[str, dict] = {}
+    for rec in records:
+        slug = _clean(rec.get("modelKey"))
+        components = rec.get("stsQualityIndexV2Components")
+        if not slug or not isinstance(components, dict):
+            continue
+        if slug not in chosen or (rec.get("sliceKey") or "overall") == "overall":
+            chosen[slug] = components
+    for slug, components in chosen.items():
+        row = by_slug.get(slug)
+        if row is None:
+            continue
+        for raw, key in _STS_COMPONENTS.items():
+            entry = components.get(raw)
+            if isinstance(entry, dict) and _num(entry.get("score")) is not None:
+                row[key] = entry.get("score")
     return list(by_slug.values())
 
 
@@ -1170,6 +1192,39 @@ def leaderboard(refresh: bool = False) -> list[Model]:
     return _leaderboard_rsc(refresh=refresh)
 
 
+def model_pool(refresh: bool = False) -> list[Model]:
+    """Every model AA publishes a page for: active rows plus the rich dataset.
+
+    The leaderboard snapshot tracks the **active** variants only (275 rows, none
+    deprecated), while the ~719-record rich dataset embedded in model pages also
+    carries the deprecated ones (444 on 2026-10-31).  A name query must resolve
+    against the union, otherwise a deprecated slug is unreachable even though its
+    page still renders (audit D3).
+
+    Shared fields take the leaderboard value (the live snapshot); the rich record
+    fills in everything else.  Active rows keep leaderboard order, rich-only rows
+    follow.  Callers that must hide deprecated models filter the resolved result
+    (``include_deprecated=false`` is a presentation choice, never a resolution
+    restriction).
+    """
+    lb = leaderboard(refresh)
+    rich = rich_dataset(refresh)
+    if not rich:
+        return list(lb)
+    overlay = {m.slug: m for m in rich}
+    out: list[Model] = []
+    seen: set[str] = set()
+    for model in lb:
+        extra = overlay.get(model.slug)
+        out.append(normalize.merge(model, extra) if extra is not None else model)
+        seen.add(model.slug)
+    for model in rich:
+        if model.slug and model.slug not in seen:
+            out.append(model)
+            seen.add(model.slug)
+    return out
+
+
 def model(slug: str, refresh: bool = False) -> dict[str, Model]:
     """Chart set embedded in ``/models/<slug>`` as ``{slug: Model}``.
 
@@ -1379,29 +1434,16 @@ def _sort_desc(rows: list[dict], key: str) -> list[dict]:
     )
 
 
-_EVAL_PANEL_RE = re.compile(r'\{"evalSlug"\s*:')
-
-
-def _eval_panels(payload: str) -> list[dict]:
-    """All ``{"evalSlug":..,"models":[..]}`` panel objects in document order.
-
-    ``flight`` has no generic "every nested object with key" helper, so we anchor
-    on the literal object opening and decode it directly.
-    """
-    decoder = json.JSONDecoder()
-    panels: list[dict] = []
-    for match in _EVAL_PANEL_RE.finditer(payload):
-        try:
-            value, _ = decoder.raw_decode(payload, match.start())
-        except ValueError:
-            continue
-        if isinstance(value, dict) and value.get("evalSlug") and value.get("models"):
-            panels.append(value)
-    return panels
-
-
 def parse_home_boards(text: str) -> dict[str, list[dict]]:
-    """speech + eval-panel boards embedded in the homepage payload."""
+    """Speech boards embedded in the homepage payload.
+
+    AA no longer ships ``sttNonStreaming`` / ``sttStreaming`` / ``sts`` panels or
+    ``{"evalSlug": …}`` eval panels on ``/`` (verified live 2026-10-31).  The
+    speech keys are still returned — empty when the page does not carry them — so
+    :func:`home_boards` can replace them with the dedicated speech pages, which are
+    the authoritative source.  The former eval-panel branch was deleted with the
+    payload shape; homepage panels are no longer a data source.
+    """
     payload = flight.payload(text)
     out: dict[str, list[dict]] = {}
     for key, name, metric, desc in (
@@ -1412,29 +1454,6 @@ def parse_home_boards(text: str) -> dict[str, list[dict]]:
         obj = flight.keyed_object(payload, key)
         rows = list(obj.get("models") or []) if isinstance(obj, dict) else []
         out[name] = _sort_desc(rows, metric) if desc else _sort_asc(rows, metric)
-    for panel in _eval_panels(payload):
-        panel_key = f"eval:{panel['evalSlug']}"
-        rows = out.setdefault(panel_key, [])
-        # AA publishes more than one panel for an eval slug (e.g. the Cyber Index
-        # capability panel and a security panel carrying refusalRate /
-        # mitigationStatus). Merge them by model slug — union of fields, first
-        # non-null wins — so no companion scalar is dropped (wave F).
-        index = {r.get("slug"): r for r in rows
-                 if isinstance(r, dict) and r.get("slug")}
-        for row in panel["models"]:
-            if not isinstance(row, dict):
-                rows.append(row)
-                continue
-            slug = row.get("slug")
-            merged = index.get(slug)
-            if merged is None:
-                rows.append(row)
-                if slug:
-                    index[slug] = row
-                continue
-            for field, value in row.items():
-                if merged.get(field) is None and value is not None:
-                    merged[field] = value
     return out
 
 
@@ -1508,6 +1527,15 @@ def _sts_speech_row(rec: dict, slice_key: str) -> dict:
     """One ``/speech-to-speech/arena`` row, in the key space the STS panel uses."""
     components = rec.get("stsQualityIndexV2Components")
     components = components if isinstance(components, dict) else {}
+    extra = {
+        key: _num(entry.get("score"))
+        for key, entry in components.items()
+        if isinstance(entry, dict) and _num(entry.get("score")) is not None
+    }
+    if not extra:
+        # the page omits the component map on some rows; say so instead of
+        # letting an empty dict look like "all components are zero"
+        extra["componentsMissing"] = True
     return {
         "name": _clean(rec.get("name")),
         "slug": _clean(rec.get("modelKey")),
@@ -1524,11 +1552,7 @@ def _sts_speech_row(rec: dict, slice_key: str) -> dict:
         "price_unit": None,
         "open_weights": None,
         "url": None,
-        "extra": {
-            key: _num(entry.get("score"))
-            for key, entry in components.items()
-            if isinstance(entry, dict) and _num(entry.get("score")) is not None
-        },
+        "extra": extra,
     }
 
 
@@ -1538,16 +1562,29 @@ def parse_speech_board(text: str, board: str) -> list[dict]:
     * ``stt`` / ``stt_streaming`` — every row of the page's host-model table
       (``aaWerIndex`` / ``aaWerStreamingIndex``), ranked by word-error rate
       (lower is better).
-    * ``sts`` — the page's ``overall`` slice, one row per model (the ``agentic``
-      and ``non_agentic`` slices are the same models ranked in another context and
-      would otherwise duplicate every row); ranked by the STS index, best first.
+    * ``sts`` — one row per model, preferring the ``overall`` slice (the
+      ``agentic`` and ``non_agentic`` slices are the same models ranked in
+      another context and would otherwise duplicate every row); a model that
+      publishes no ``overall`` row is still listed, with no STS index.  Ranked by
+      the STS index, best first.
     """
     payload = flight.payload(text)
     if board == "sts":
         records = [r for r in _first_dict_array(payload, ("sliceKey",), min_len=2)
                    if isinstance(r, dict)]
-        rows = [_sts_speech_row(r, str(r.get("sliceKey") or "overall"))
-                for r in records if (r.get("sliceKey") or "overall") == "overall"]
+        overall = [r for r in records if (r.get("sliceKey") or "overall") == "overall"]
+        seen = {_clean(r.get("modelKey")) for r in overall}
+        missing = [r for r in records if _clean(r.get("modelKey")) not in seen]
+        # one row per model even when only a non-overall slice exists
+        extra: list[dict] = []
+        extra_seen: set[str] = set()
+        for rec in missing:
+            slug = _clean(rec.get("modelKey"))
+            if slug and slug not in extra_seen:
+                extra.append(rec)
+                extra_seen.add(slug)
+        rows = [_sts_speech_row(r, "overall") for r in overall]
+        rows += [_sts_speech_row(r, "") for r in extra]
         rows.sort(key=lambda r: (r["stsIndex"] is None, -(r["stsIndex"] or 0.0)))
         return rows
     streaming = board == "stt_streaming"
@@ -1602,12 +1639,13 @@ def _full_speech_boards(boards: dict[str, list[dict]]) -> dict[str, list[dict]]:
 
 
 def home_boards(refresh: bool = False) -> dict[str, list[dict]]:
-    """Homepage speech boards and per-eval top panels.
+    """The speech boards, read from their dedicated pages.
 
-    The three speech keys (``stt``, ``stt_streaming``, ``sts``) carry the **full**
-    board from the dedicated page when it can be read, and the homepage's top-N
-    panel otherwise — the panel is the same metric on a shorter list, never a
-    different board.  The ``eval:<slug>`` keys are the homepage's own panels.
+    ``/`` no longer embeds speech panels or ``evalSlug`` panels (verified live
+    2026-10-31), so the three speech keys (``stt``, ``stt_streaming``, ``sts``)
+    carry the **full** board from the dedicated page when it can be read, falling
+    back to a homepage panel only if the page itself still ships one (legacy
+    payloads).  The former homepage eval-panel source is gone with the payload.
     """
     source_url = url(SOURCE_URLS["home"])
     got = fetch.get(source_url, "home", refresh=refresh, min_bytes=100_000)
@@ -1619,7 +1657,7 @@ def home_boards(refresh: bool = False) -> dict[str, list[dict]]:
     boards = _full_speech_boards(parse_home_boards(got.text))
     if not any(boards.values()):
         raise ValueError(
-            f"{source_url}: no speech board or eval panel found in the payload — "
+            f"{source_url}: no speech board found in the payload — "
             f"{_refresh_note(got.path, source_url)}"
         )
     _HOME_MEMO.put(key, boards)
@@ -2561,26 +2599,43 @@ def parse_index_rows(text: str, score_key: str) -> list[dict]:
 
 
 def capability_rows(slug: str, refresh: bool = False) -> list[dict]:
-    """Parsed rows of one ``/models/capabilities/<slug>`` page (memoised)."""
-    path = SOURCE_URLS["capability"].format(slug=slug)
-    source_url = url(path)
-    got = fetch.get(source_url, f"capability_{slug}", refresh=refresh)
-    key = (str(got.path), got.fetched_at)
-    if not refresh:
-        memo = _CAPABILITY_MEMO.get(key)
-        if memo is not _MISS:
-            return memo
-    try:
-        rows = parse_capability_index(got.text)
-    except LookupError as exc:
-        raise _parse_error(exc, got.path, source_url) from exc
-    if not rows:
-        raise ValueError(
-            f"{source_url}: no capability rows carry a score — "
-            f"{_refresh_note(got.path, source_url)}"
-        )
-    _CAPABILITY_MEMO.put(key, rows)
-    return rows
+    """Parsed rows of one capability index page (memoised).
+
+    AA moved the six capability indexes from ``/models/capabilities/<slug>`` to
+    ``/indexes/<slug>``; the old route still answers with a 308 redirect (which
+    ``urllib`` follows).  The canonical ``/indexes/<slug>`` route is tried first
+    and the legacy route is kept as a fallback for when the redirect is retired.
+    """
+    errors: list[Exception] = []
+    for route in CAPABILITY_ROUTES:
+        path = SOURCE_URLS[route].format(slug=slug)
+        source_url = url(path)
+        cache_name = (f"capability_{slug}" if route == "capability"
+                      else f"capability_legacy_{slug}")
+        try:
+            got = fetch.get(source_url, cache_name, refresh=refresh)
+        except AAFetchError as exc:
+            errors.append(exc)
+            continue
+        key = (str(got.path), got.fetched_at)
+        if not refresh:
+            memo = _CAPABILITY_MEMO.get(key)
+            if memo is not _MISS:
+                return memo
+        try:
+            rows = parse_capability_index(got.text)
+        except LookupError as exc:
+            errors.append(_parse_error(exc, got.path, source_url))
+            continue
+        if not rows:
+            errors.append(ValueError(
+                f"{source_url}: no capability rows carry a score — "
+                f"{_refresh_note(got.path, source_url)}"
+            ))
+            continue
+        _CAPABILITY_MEMO.put(key, rows)
+        return rows
+    raise errors[-1]
 
 
 def capability_models(key: str, refresh: bool = False) -> list[Model]:

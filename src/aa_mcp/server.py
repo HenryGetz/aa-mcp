@@ -989,8 +989,40 @@ def _models_state(refresh: bool = False, *,
 
 
 def _models(refresh: bool = False) -> list[Model]:
-    """The leaderboard rows for slug resolution (no rich overlay — see B6)."""
+    """Every model AA publishes, for name/slug resolution (audit D3).
+
+    The leaderboard snapshot tracks the **active** variants only (275 rows, none
+    deprecated), so resolving against it made a deprecated slug unreachable even
+    though its page still renders.  ``loaders.model_pool`` is the union of the
+    active rows and the rich dataset (lead order preserved, rich-only rows
+    appended); ``include_deprecated=false`` is a presentation choice each tool
+    applies *after* resolution.
+    """
+    fn = getattr(loaders, "model_pool", None)
+    if callable(fn):
+        try:
+            rows = list(fn(refresh=refresh) or [])
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("model pool unavailable (%s); resolving against the "
+                        "leaderboard", exc)
+        else:
+            if rows:
+                return rows
     return _models_state(refresh, rich=False)[0]
+
+
+def _include_deprecated_rows(models: Sequence[Model],
+                             refresh: bool = False) -> list[Model]:
+    """``models`` plus the deprecated rows resolution can see (audit D3).
+
+    The merged ranking dataset only carries slugs the active leaderboard also
+    carries, so ``include_deprecated=true`` had nothing to add.  The pool holds the
+    444 rich-only deprecated records; append the ones missing from the dataset
+    (same-slug rows keep the leaderboard/merged value, which wins on ordering).
+    """
+    have = {m.slug for m in models}
+    extra = [m for m in _models(refresh) if m.deprecated and m.slug not in have]
+    return list(models) + extra
 
 
 def _prov_label(rich_used: bool, source_key: str | None = None) -> str:
@@ -1043,6 +1075,15 @@ def _no_rank_text(key: str, label: str) -> str:
             "— read it with aa_model <slug>."
         )
     bench = catalog.BENCHMARKS.get(key)
+    if bench is not None and bench.source_hint == "none":
+        rank = getattr(catalog, "RANKABLES", {}).get(key)
+        how = str(getattr(rank, "how", "") or "")
+        return (
+            f"{label!r}: AA no longer publishes this metric on any free surface, so "
+            "there are no per-model values to rank — the value is never substituted "
+            "from a different metric.\n"
+            + (f"— {how}" if how else "— aa_benchmarks lists the metrics AA does publish")
+        )
     if bench is not None and bench.source_hint == "chart" and not bench.slug:
         return (
             f"{label!r} is published only on individual model pages — AA exposes no "
@@ -1818,6 +1859,8 @@ def _pareto(
     rich = x_key in _OVERLAY_AXES or _rich_needed(
         refresh=refresh, sort_key=score_key, fields=x_key)
     all_models, rich_used = _models_state(refresh, rich=rich)
+    if include_deprecated:
+        all_models = _include_deprecated_rows(all_models, refresh)
     panel_used = False
     if not any(_metric_value(m, score_key) is not None for m in all_models):
         # join the extra source's score onto the model with the same slug so the
@@ -2038,7 +2081,9 @@ def _leaderboard(
 
     all_models, rich_used = _models_state(
         refresh, rich=_rich_needed(refresh=refresh, sort_key=sort_key, fields=fields))
-    tracked = len(_lb_rows(refresh))
+    if include_deprecated:
+        all_models = _include_deprecated_rows(all_models, refresh)
+    tracked = len(all_models) if include_deprecated else len(_lb_rows(refresh))
     # One uniform ranking path: a sort key (or a requested field) whose per-model
     # values live on AA's eval chart set / homepage panel is joined by slug before
     # filtering, exactly like a leaderboard-native column (wave F).
@@ -4356,6 +4401,10 @@ def _benchmark_leaderboard(
                     include_extra = False
 
     if not pairs:
+        if getattr(bench, "source_hint", "") == "none":
+            # AA removed the metric (GDPval's normalized fraction): say so instead
+            # of substituting another metric's value or raising a parse error.
+            return _no_rank_text(key, bench.label)
         raise ValueError(
             f"no data for benchmark {bench.label!r}: not in the leaderboard, "
             "the eval chart set or the homepage panels — try aa_benchmarks for coverage"
@@ -4514,7 +4563,11 @@ def _raw_chart_pairs(slug: str, key: str, models: Sequence[Model], keep,
             continue
         rec = raw.get(m.slug) or {}
         value = rec.get(key)
-        if value is None:
+        if value is None and key == "briefcaseElo":
+            # Only the metric that owns this breakdown may read its Elo.  A
+            # percentage/fraction metric must never be handed an Elo: the old
+            # unconditional fallback rendered ``gdpvalNormalized`` as
+            # 1610.19 × 100 = 161019.0% (audit D1).
             breakdown = rec.get("briefcaseBreakdown")
             if isinstance(breakdown, dict):
                 value = breakdown.get("elo")
@@ -5563,7 +5616,10 @@ def _search(query: str = "", creator: str = "", open_weights: bool | None = None
         found = select.sort_models(models, "intelligence")
     found = select.filter_models(
         found, creator=creator or None, open_weights=open_weights,
-        exclude_deprecated=False,
+        # The default listing is the active field; a *name* query may resolve a
+        # deprecated model, which the Status column labels.  Resolution already
+        # used the merged pool, so this filter is presentation only (audit D3).
+        exclude_deprecated=not query,
     )
     shown = found[:n]
     arena, arena_partial, arena_hits = (
@@ -5571,14 +5627,24 @@ def _search(query: str = "", creator: str = "", open_weights: bool | None = None
         if query else ([], False, 0))
     parts: list[str] = []
     if shown:
+        show_status = any(m.deprecated for m in shown)
         cols = _cols(_SEARCH_COLS, "")
-        rows = [[_fmt(k, select.lookup(m, k)) for k, _ in cols] for m in shown]
+        if show_status:
+            cols += [("status", "Status")]
+        rows = []
+        for m in shown:
+            row = [_fmt(k, select.lookup(m, k)) for k, _ in _SEARCH_COLS]
+            if show_status:
+                row.append("deprecated" if m.deprecated else "active")
+            rows.append(row)
         cache_name = _lb_cache()
         matched = len(found)
         explicit = bool(query or creator or open_weights is not None)
+        active = sum(1 for m in models if not m.deprecated)
+        tracked = (f"{active} active of {len(models)} tracked"
+                   if active < len(models) else f"{len(models)} tracked")
         if explicit:
-            count = (f"{len(rows)} shown of {matched} matching "
-                     f"({len(models)} tracked)")
+            count = f"{len(rows)} shown of {matched} matching ({tracked})"
         else:
             count = f"{len(rows)} of {matched} models"
         note = (f"name match {render.clean(query, None)}" if query

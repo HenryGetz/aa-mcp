@@ -58,6 +58,12 @@ class Panel(NamedTuple):
     deprecated: str              # best-scoring model AA marks deprecated ("" if none)
     legacy_page: bool            # /models/<deprecated> still carries ``currentModel``
     deprecated_active: bool      # ...and the deprecated slug is a live leaderboard row
+    sts: tuple[str, ...]         # top speech-to-speech arena names (board rows)
+    image: tuple[str, ...]       # top text-to-image arena names (board rows)
+    tts: tuple[str, ...]         # top text-to-speech voice names (board rows)
+    stt: tuple[str, ...]         # top speech-to-text names (board rows)
+    search: tuple[str, ...]      # top search-API board names (board rows)
+    no_endpoints: str            # a model AA serves no provider endpoints for ("" if none)
 
     @property
     def models(self) -> tuple[str, ...]:
@@ -73,10 +79,16 @@ class Panel(NamedTuple):
     def summary(self) -> str:
         return (f"panel: leaders={'+'.join(self.leaders)} "
                 f"open_weights={self.open_weights} cheap={self.cheap} "
-                f"ranked={len(self.ranked)} "
+                f"ranked={','.join(self.ranked)} "
                 f"deprecated={self.deprecated or 'none'} "
                 f"(active={'yes' if self.deprecated_active else 'no'}, "
-                f"legacy_page={'yes' if self.legacy_page else 'no'})")
+                f"legacy_page={'yes' if self.legacy_page else 'no'}) "
+                f"sts={'+'.join(self.sts) or 'none'} "
+                f"image={'+'.join(self.image) or 'none'} "
+                f"tts={'+'.join(self.tts) or 'none'} "
+                f"stt={'+'.join(self.stt) or 'none'} "
+                f"search={'+'.join(self.search) or 'none'} "
+                f"no_endpoints={self.no_endpoints or 'none'}")
 
 
 def _deprecated_slug(refresh: bool = False) -> str:
@@ -109,6 +121,50 @@ def _legacy_page(slug: str) -> bool:
     return loaders.parse_legacy_model(got.text) is not None
 
 
+def _names(rows, limit: int) -> tuple[str, ...]:
+    """First ``limit`` distinct display names in board order (best first)."""
+    out: list[str] = []
+    for row in rows:
+        name = row.get("name")
+        if name and name not in out:
+            out.append(name)
+        if len(out) == limit:
+            break
+    return tuple(out)
+
+
+def _board_names(load, key: str, limit: int) -> tuple[str, ...]:
+    """Names from one live board; a board hiccup must not stop the sweep."""
+    try:
+        return _names(load(key), limit)
+    except Exception as exc:
+        print(f"panel: no {key} names ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return ()
+
+
+def _no_endpoint_slug(refresh: bool = False) -> str:
+    """A leaderboard model whose provider page carries no usable endpoint rows.
+
+    ``aa_providers`` explains that absence instead of erroring, so the sweep needs
+    a live example. Models are absent from the 509-row provider board; probe only
+    a few of those so a model AA merely forgot to list cannot slow the run down.
+    """
+    try:
+        served = {e.model_slug for e in loaders.provider_board(refresh=refresh)}
+        rows = loaders.leaderboard(refresh=refresh)
+    except Exception as exc:
+        print(f"panel: no endpoint-less model ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+        return ""
+    candidates = [m.slug for m in rows if m.slug and m.slug not in served]
+    for slug in candidates[:5]:
+        try:
+            loaders.provider_endpoints(slug)
+        except Exception:
+            return slug
+    return candidates[0] if candidates else ""
+
+
 def live_panel(refresh: bool = False) -> Panel:
     """Derive the model panel from the live data layer (once per run)."""
     rows = loaders.leaderboard(refresh=refresh)
@@ -125,27 +181,25 @@ def live_panel(refresh: bool = False) -> Panel:
     deprecated = _deprecated_slug(refresh)
     return Panel(leaders, open_weights, cheap, ranked,
                  scored[0].name if scored else "", deprecated, _legacy_page(deprecated),
-                 deprecated in {m.slug for m in rows})
+                 deprecated in {m.slug for m in rows},
+                 _board_names(loaders.speech_board, "sts", 2),
+                 _board_names(loaders.media, "text_to_image", 4),
+                 _board_names(loaders.media, "text_to_speech", 4),
+                 _board_names(loaders.speech_board, "stt", 4),
+                 _board_names(loaders.agents, "search_api", 2),
+                 _no_endpoint_slug(refresh))
 
 
 def skippable(panel: Panel) -> dict[tuple[str, str], str]:
     """Cases reported as ``SKIP`` + a note instead of failing the run.
 
-    The legacy model page is the one shape the live site may simply stop serving
-    (AA's current pages embed a chart set); when it is gone — or when nothing can
-    reach it — the coverage is unavailable rather than broken, and the note says
-    which.
+    Nothing is skippable now: ``aa_model`` resolves deprecated slugs through
+    ``loaders.model_pool`` (audit D3), so the deprecated-model case is a real
+    assertion (see ``_CONTENT_CHECKS``).  The hook stays so a future live-shape
+    absence can be declared without changing the runner; ``panel`` is accepted so
+    the call site stays unchanged.
     """
-    if not panel.deprecated or panel.deprecated_active:
-        return {}
-    why = (
-        f"{panel.deprecated} is deprecated and aa_model resolves names against the "
-        "active leaderboard rows only, so no tool reaches its page"
-        if panel.legacy_page else
-        f"/models/{panel.deprecated} carries no legacy currentModel object (the page "
-        "has a chart set), so there is no legacy page to parse"
-    )
-    return {("aa_model", json.dumps({"query": panel.deprecated})): why}
+    return {}
 
 
 def cases(panel: Panel) -> list[tuple[str, dict]]:
@@ -230,12 +284,10 @@ def cases(panel: Panel) -> list[tuple[str, dict]]:
             out.append(("aa_model", {"query": slug, "sections": section}))
     out.append(("aa_model", {"query": panel.fuzzy}))                # name -> slug
     if panel.deprecated:
-        # the legacy page (``currentModel``, no embedded chart set); SKIPped with a
-        # note when the live site no longer serves that shape — see ``skippable``.
+        # deprecated slugs resolve through the merged model pool now (audit D3):
+        # the digest must render the deprecated marker, search must find and label
+        # the row, and the leaderboard lists it only with include_deprecated=true.
         out.append(("aa_model", {"query": panel.deprecated}))
-        # the deprecated path, deliberately: a deprecated slug is not a live resolver
-        # hit, and asking for it by name (even with include_deprecated=true) explains
-        # itself rather than ranking a ghost as if it were active.
         out.append(("aa_search", {"query": panel.deprecated, "top": 3}))
         out.append(("aa_leaderboard", {"name": panel.deprecated,
                                        "include_deprecated": True, "top": 2}))
@@ -259,28 +311,24 @@ def cases(panel: Panel) -> list[tuple[str, dict]]:
         ("aa_compare", {"queries": cmp3,
                         "metrics": "intelligence,cost_per_task,cyberIndex,gpqa,tps"}),
         # Wave E: arena-board models resolve and compare (E3)
-        ("aa_compare", {"queries": ["Grok Voice 3.0", "GPT-Live-1 (Astra, medium)"]}),
-        ("aa_compare", {"queries": ["speech_to_speech", "Grok Voice 3.0",
-                                    "GPT-Live-1 (Astra, medium)"]}),
-        ("aa_compare", {"queries": ["text_to_image", "GPT Image 2.5 Sunburst (max)",
-                                    "GPT Image 2.5 Flare (max)"], "metrics": "all"}),
+        ("aa_compare", {"queries": ["%STS0%", "%STS1%"]}),
+        ("aa_compare", {"queries": ["speech_to_speech", "%STS0%", "%STS1%"]}),
+        ("aa_compare", {"queries": ["text_to_image", "%IMG0%", "%IMG1%"],
+                        "metrics": "all"}),
         # F1: a metric the board does not publish falls back to the native metric(s)
-        ("aa_compare", {"queries": ["Grok Voice 3.0", "GPT-Live-1 (Astra, medium)"],
+        ("aa_compare", {"queries": ["%STS0%", "%STS1%"],
                         "metrics": "elo,ci,price,release"}),
         # the Elo/CI/price path on a media board (ambiguous names -> shared board)
-        ("aa_compare", {"queries": ["GPT Image 2.5 Sunburst (max)", "Nano Banana 2.1"]}),
-        ("aa_compare", {"queries": ["GPT Image 2.5 Sunburst (max)", "Nano Banana 2.1"],
+        ("aa_compare", {"queries": ["%IMG0%", "%IMG3%"]}),
+        ("aa_compare", {"queries": ["%IMG0%", "%IMG3%"],
                         "metrics": "elo,ci,price,release"}),
-        # Wave E: the user's 4-model URL exercises the scaled missing-metric footer (E4)
-        ("aa_compare", {"queries": ["mimo-v2-6-pro", "deepseek-v4-1-flash",
-                                    "gpt-6-luna-xhigh", "muse-wonder-full"],
+        # Wave E: a 4-model URL exercises the scaled missing-metric footer (E4)
+        ("aa_compare", {"queries": list(panel.ranked[:4]),
                         "metrics": "all", "view": "diff"}),
         # Wave G: compact=false adds the Slug row (compact=true omits it)
-        ("aa_compare", {"queries": ["mimo-v2-6-pro", "deepseek-v4-1-flash",
-                                    "gpt-6-luna-xhigh", "muse-wonder-full"],
+        ("aa_compare", {"queries": list(panel.ranked[:4]),
                         "metrics": "all", "compact": False}),
-        ("aa_compare", {"queries": ["mimo-v2-6-pro", "deepseek-v4-1-flash",
-                                    "gpt-6-luna-xhigh", "muse-wonder-full"]}),
+        ("aa_compare", {"queries": list(panel.ranked[:4])}),
         # Wave G: one metric never means two numbers — the ttft alias, the key and
         # metrics=all all resolve to the same (model-page) value
         ("aa_compare", {"queries": list(panel.leaders),
@@ -300,7 +348,7 @@ def cases(panel: Panel) -> list[tuple[str, dict]]:
         ("aa_compare", {"queries": [panel.leaders[0], panel.open_weights],
                         "metrics": "intel/$,coding/$", "compact": False}),
         # documented error paths (listed in EXPECTED_FAILURES): never a broken table
-        ("aa_compare", {"queries": ["Grok Voice 3.0", "claude-opus-5-5"]}),
+        ("aa_compare", {"queries": ["%STS0%", "%M0%"]}),
         # YAML / JSON spec round-trip (the emitted `spec:` block is re-runnable)
         ("aa_compare", {"spec": f"models: [{', '.join(cmp3)}]\n"
                                 "metrics: all\nview: diff\n"}),
@@ -336,15 +384,15 @@ def cases(panel: Panel) -> list[tuple[str, dict]]:
 
     # --- boards as their own namespace: TTS voices, STT hosts, search APIs -----
     out += [
-        ("aa_compare", {"queries": ["Eleven v4 Turbo", "Sonic 3.6"],
+        ("aa_compare", {"queries": ["%TTS0%", "%TTS3%"],
                         "metrics": "ttsPronunciationPassRate,ttsQualityElo"}),
-        ("aa_compare", {"queries": ["Scribe v2", "MAI-Transcribe-2"],
+        ("aa_compare", {"queries": ["%STT0%", "%STT2%"],
                         "metrics": "sttEarnings22Wer"}),
-        ("aa_compare", {"queries": ["Perplexity Search", "Octen Search"],
+        ("aa_compare", {"queries": ["%SEARCH0%", "%SEARCH1%"],
                         "metrics": "searchQualityIndex,searchCostPerQuery"}),
-        ("aa_search", {"query": "Eleven v4 Turbo"}),
+        ("aa_search", {"query": "%TTS0%"}),
         # a language model and a board row are refused with an explanation
-        ("aa_compare", {"queries": ["claude-opus-5-5", "Eleven v4 Turbo"]}),
+        ("aa_compare", {"queries": ["%M0%", "%TTS0%"]}),
     ]
 
     # --- benchmarks: the rankable search index ------------------------------
@@ -367,8 +415,8 @@ def cases(panel: Panel) -> list[tuple[str, dict]]:
     out.append(("aa_pareto", {"x": "nonsense", "top": 2}))
     out.append(("aa_benchmarks", {"domain": "nonsense"}))
     out.append(("aa_benchmarks", {"query": "zzzqqq"}))
-    out.append(("aa_compare", {"queries": ["claude-opus-5-5"], "metrics": "all"}))
-    out.append(("aa_compare", {"queries": ["claude-opus-5-5", "gpt-6-luna"],
+    out.append(("aa_compare", {"queries": ["%M0%"], "metrics": "all"}))
+    out.append(("aa_compare", {"queries": ["%M0%", "%M1%"],
                                "view": "sparkline"}))
 
     # --- benchmarks ---------------------------------------------------------
@@ -393,6 +441,10 @@ def cases(panel: Panel) -> list[tuple[str, dict]]:
         # container benchmarks return an honest one-liner, never a TypeError (E2)
         ("aa_benchmark_leaderboard", {"benchmark": "aa3dBreakdown"}),
         ("aa_benchmark_leaderboard", {"benchmark": "harveyLabBreakdown"}),
+        # GDPval v5.0 semantics (audit D1): the normalized fraction is withdrawn;
+        # the Elo is the published value and must never render as a percentage
+        ("aa_benchmark_leaderboard", {"benchmark": "gdpval", "top": 3}),
+        ("aa_benchmark_leaderboard", {"benchmark": "gdpvalNormalized", "top": 3}),
     ]
 
     # --- providers ----------------------------------------------------------
@@ -413,9 +465,13 @@ def cases(panel: Panel) -> list[tuple[str, dict]]:
         # Wave G: identity fields resolve from the endpoint record (never blank)
         ("aa_providers", {"model": panel.open_weights, "top": 3,
                           "fields": "model,slug,host,creator,price_in"}),
+    ]
+    if panel.no_endpoints:
         # Wave G: a model AA lists no endpoints for is explained, not errored
-        ("aa_providers", {"model": "muse-wonder-full", "fields": "model,price_in"}),
-        ("aa_providers", {"model": "kimi-k3", "sort": "nope", "top": 2}),  # expected fail
+        out.append(("aa_providers", {"model": panel.no_endpoints,
+                                     "fields": "model,price_in"}))
+    out += [
+        ("aa_providers", {"model": panel.ranked[0], "sort": "nope", "top": 2}),  # expected fail
     ]
 
     # --- media: every board -------------------------------------------------
@@ -447,7 +503,7 @@ def cases(panel: Panel) -> list[tuple[str, dict]]:
         out.append(("aa_search", {"query": query, "top": 2}))
     out.append(("aa_search", {"creator": "meta", "open_weights": True, "top": 2}))
     # Wave E: arena/media models are searchable too (E3)
-    out.append(("aa_search", {"query": "Grok Voice 3.0"}))
+    out.append(("aa_search", {"query": "%STS0%"}))
     # arena matches use the same all-token rule as the language-model path:
     # a genuine AND match ("grok voice") vs a labelled partial ("gpt 6 luna high")
     out.append(("aa_search", {"query": "grok voice"}))
@@ -468,14 +524,15 @@ def cases(panel: Panel) -> list[tuple[str, dict]]:
     # --- raw: every kind ----------------------------------------------------
     for kind in ("leaderboard", "model", "providers", "providers_board", "media",
                  "agents", "home", "eval", "catalog"):
-        out.append(("aa_raw", {"kind": kind, "top": 1, "query": "claude-opus-5-5"
+        out.append(("aa_raw", {"kind": kind, "top": 1, "query": "%M0%"
                                if kind in ("model", "providers", "eval") else ""}))
     # the eval happy path (kind=eval rejects a *model* slug, see EXPECTED_FAILURES)
     out.append(("aa_raw", {"kind": "eval", "top": 1, "query": "gpqa-diamond"}))
     # F4: the sitemap-union makes a card-omitted eval page (the Cyber Index) valid
     out.append(("aa_raw", {"kind": "eval", "top": 1,
                            "query": "artificial-analysis-cyber-index"}))
-    return out
+    slots = _slots(panel)
+    return [(tool, _expand_obj(args, slots)) for tool, args in out]
 
 
 #: failures this sweep EXPECTS on a live scrape source (documented, not regressions).
@@ -501,6 +558,13 @@ EXPECTED_FAILURES: dict[tuple[str, str], str] = {
         "AA publishes no model-level Agentic Index on any public page (paid data API "
         "only) — the error names the free constituents to rank instead "
         "(terminalBench40, tau2, tauBanking, automationBenchPartialScore)",
+    ("aa_leaderboard", '{"sort": "cyberRefusalRate", "top": 2}'):
+        "AA no longer publishes per-model Cyber Index refusal rates on any free "
+        "surface — the homepage eval panels that carried them are gone — so the "
+        "leaderboard reports the metric as absent instead of ranking active models",
+    ("aa_leaderboard", '{"sort": "cyberMitigationStatus", "top": 2}'):
+        "same as cyberRefusalRate: no free per-model Cyber Index mitigation-status "
+        "source remains after the homepage panels were removed",
     ("aa_benchmark_leaderboard", '{"benchmark": "hleDiamond", "top": 2}'):
         "HLE Diamond has no values in the leaderboard, the eval chart "
         "set or the homepage panels — '+' reported as 'no data for benchmark'",
@@ -510,10 +574,10 @@ EXPECTED_FAILURES: dict[tuple[str, str], str] = {
     ("aa_leaderboard", '{"sort": "nonsense_sort", "top": 2}'):
         "an unknown sort token lists the closest accepted metric names instead of "
         "dead-ending (argument vocabulary, round 6)",
-    ("aa_providers", '{"model": "kimi-k3", "sort": "nope", "top": 2}'):
+    ("aa_providers", '{"model": "%M0%", "sort": "nope", "top": 2}'):
         "an unknown provider sort lists the closest accepted sort keys and the "
         "alias list",
-    ("aa_raw", '{"kind": "eval", "query": "claude-opus-5-5", "top": 1}'):
+    ("aa_raw", '{"kind": "eval", "query": "%M0%", "top": 1}'):
         "aa_raw kind=eval validates the slug: a model slug is rejected with "
         "'kind=eval expects an evaluation slug (e.g. gpqa-diamond)' instead of "
         "fetching /evaluations/<model-slug> and 404ing",
@@ -527,14 +591,14 @@ EXPECTED_FAILURES: dict[tuple[str, str], str] = {
     ("aa_benchmarks", '{"query": "zzzqqq"}'):
         "aa_benchmarks answers a zero-hit search with the closest labels instead of "
         "an empty table",
-    ("aa_compare", '{"metrics": "all", "queries": ["claude-opus-5-5"]}'):
+    ("aa_compare", '{"metrics": "all", "queries": ["%M0%"]}'):
         "aa_compare needs 2-12 models; one model is rejected with the accepted range",
-    ("aa_compare", '{"queries": ["claude-opus-5-5", "gpt-6-luna"], "view": "sparkline"}'):
+    ("aa_compare", '{"queries": ["%M0%", "%M1%"], "view": "sparkline"}'):
         "aa_compare rejects an unknown view with the valid list (table, diff)",
-    ("aa_compare", '{"queries": ["Grok Voice 3.0", "claude-opus-5-5"]}'):
+    ("aa_compare", '{"queries": ["%STS0%", "%M0%"]}'):
         "mixing a language model and an arena-board entry is refused with an "
         "explanation instead of a broken table (E3)",
-    ("aa_compare", '{"queries": ["claude-opus-5-5", "Eleven v4 Turbo"]}'):
+    ("aa_compare", '{"queries": ["%M0%", "%TTS0%"]}'):
         "mixing a language model and a board row (a TTS voice) is refused with the "
         "same explanation, naming the board it belongs to (round-2 follow-up)",
     ("aa_media", '{"board": "text_to_image", "category": "nope", "top": 2}'):
@@ -591,12 +655,25 @@ _CONTENT_CHECKS.update({
     ("aa_agents", '{"board": "chatbots", "top": 2}'):
         (("feature score", "out of 6"), ("%",)),
     # board rows resolve by name and compare on the board's own columns
-    ("aa_compare", '{"metrics": "ttsPronunciationPassRate,ttsQualityElo", "queries": ["Eleven v4 Turbo", "Sonic 3.6"]}'):
+    ("aa_compare", '{"metrics": "ttsPronunciationPassRate,ttsQualityElo", "queries": ["%TTS0%", "%TTS3%"]}'):
         (("board rows are their own namespace", "tts quality elo"), ()),
-    ("aa_compare", '{"metrics": "sttEarnings22Wer", "queries": ["Scribe v2", "MAI-Transcribe-2"]}'):
+    ("aa_compare", '{"metrics": "sttEarnings22Wer", "queries": ["%STT0%", "%STT2%"]}'):
         (("board rows are their own namespace", "earnings22"), ()),
-    ("aa_search", '{"query": "Eleven v4 Turbo"}'):
+    ("aa_search", '{"query": "%TTS0%"}'):
         (("tts",), ()),
+    # the vanished Cyber Index companions degrade honestly: name the absent data
+    # and never pretend a key or the removed JSON API can supply it
+    ("aa_leaderboard", '{"sort": "cyberRefusalRate", "top": 2}'):
+        (("no per-model values",), ("api key", "aa_api_key", "json api", "env")),
+    ("aa_leaderboard", '{"sort": "cyberMitigationStatus", "top": 2}'):
+        (("no per-model values",), ("api key", "aa_api_key", "json api", "env")),
+    # GDPval semantics: the Elo is the published value; the retired normalized
+    # fraction is explained, never rendered as a percentage (audit D1)
+    ("aa_benchmark_leaderboard", '{"benchmark": "gdpval", "top": 3}'):
+        (("elo",), ("%",)),
+    ("aa_benchmark_leaderboard", '{"benchmark": "gdpvalNormalized", "top": 3}'):
+        (("no longer publishes", "no per-model values", "benchmark=gdpval"),
+         ("%", "api key", "aa_api_key", "json api", "env")),
 })
 
 
@@ -605,15 +682,58 @@ def _case_key(r: dict) -> tuple[str, str]:
     return (r["tool"], json.dumps(args, sort_keys=True))
 
 
+def _slots(panel: Panel) -> dict[str, str]:
+    """Placeholder -> live value, so expectation tables stay panel-independent.
+
+    ``cases`` emits ``%M0%``/``%STS0%``-style markers; both the executed args and
+    the expectation/content tables are expanded through the same map, so a stale
+    hardcoded slug cannot desynchronise them.
+    """
+    slots = {f"M{i}": slug for i, slug in enumerate(panel.ranked)}
+    for prefix, names in (("STS", panel.sts), ("IMG", panel.image),
+                          ("TTS", panel.tts), ("STT", panel.stt),
+                          ("SEARCH", panel.search)):
+        for i, name in enumerate(names):
+            slots[f"{prefix}{i}"] = name
+    slots["NOENDPOINTS"] = panel.no_endpoints
+    return slots
+
+
+def _expand_arg(text: str, slots: dict[str, str]) -> str:
+    for key, value in slots.items():
+        text = text.replace(f"%{key}%", value)
+    return text
+
+
+def _expand_obj(value, slots: dict[str, str]):
+    """Recursively expand placeholders in a case's argument object."""
+    if isinstance(value, str):
+        return _expand_arg(value, slots)
+    if isinstance(value, dict):
+        return {k: _expand_obj(v, slots) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_expand_obj(v, slots) for v in value]
+    return value
+
+
+def _expand(mapping, panel: Panel):
+    """Expand every placeholder in a ``{(tool, args-json): value}`` table."""
+    slots = _slots(panel)
+    return {(tool, _expand_arg(args, slots)): value
+            for (tool, args), value in mapping.items()}
+
+
 def _result_text(result) -> str:
     return "\n".join(getattr(b, "text", "") or "" for b in (result.content or []))
 
 
-def _content_violations(results: list[dict]) -> list[str]:
+def _content_violations(results: list[dict],
+                        checks: dict[tuple[str, str], tuple[tuple[str, ...], tuple[str, ...]]],
+                        ) -> list[str]:
     """Cases whose reply text breaks the paid-only content contract."""
     by_key = {_case_key(r): r for r in results}
     out: list[str] = []
-    for key, (need, forbid) in _CONTENT_CHECKS.items():
+    for key, (need, forbid) in checks.items():
         label = f"{key[0]} {key[1]}"
         r = by_key.get(key)
         if r is None:
@@ -674,12 +794,19 @@ def main() -> int:
     panel = live_panel()
     results = asyncio.run(run(extra, panel))
     skips = skippable(panel)
+    expected_map = _expand(EXPECTED_FAILURES, panel)
+    checks = _expand(_CONTENT_CHECKS, panel)
+    if panel.deprecated:
+        # deprecated slugs resolve through the merged model pool now (audit D3):
+        # the digest must render the marker, so this is an assertion, not a SKIP
+        checks[("aa_model", json.dumps({"query": panel.deprecated}))] = (
+            ("deprecated",), ())
     failures = [r for r in results if r["error"]]
-    expected = [r for r in failures if _case_key(r) in EXPECTED_FAILURES]
+    expected = [r for r in failures if _case_key(r) in expected_map]
     skipped = [r for r in failures if _case_key(r) in skips]
     unexpected = [r for r in failures
-                  if _case_key(r) not in EXPECTED_FAILURES and _case_key(r) not in skips]
-    violations = _content_violations(results)
+                  if _case_key(r) not in expected_map and _case_key(r) not in skips]
+    violations = _content_violations(results, checks)
     slow = sorted([r for r in results if r["ms"] >= a.slow_ms], key=lambda r: -r["ms"])
 
     if a.json:
@@ -693,7 +820,7 @@ def main() -> int:
                                        for r in skipped],
                            "expected_failures": [
                                {"tool": r["tool"], "args": r["args"],
-                                "why": EXPECTED_FAILURES[_case_key(r)]}
+                                "why": expected_map[_case_key(r)]}
                                for r in expected]}.items()
                           if k != "results"} |
                          {"results": [{k: r[k] for k in r if k != "text"} for r in results]},
@@ -707,7 +834,7 @@ def main() -> int:
               f"≈{tokens} tokens total (avg {tokens // max(1, len(results))})")
         for r in expected:
             print(f"EXPECTED FAIL {r['tool']} {json.dumps(r['args'])[:80]}\n"
-                  f"     why: {EXPECTED_FAILURES[_case_key(r)]}")
+                  f"     why: {expected_map[_case_key(r)]}")
         for r in unexpected:
             print(f"FAIL {r['tool']} {json.dumps(r['args'])[:90]}\n     {r['text'][:220]}")
         for r in skipped:

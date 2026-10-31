@@ -175,6 +175,44 @@ _LEADER_EVAL_KEYS = (
     "apexAgents", "itbenchSre", "mmmuPro",
 )
 
+#: AA's leaderboard ``scores`` map is keyed by **evaluation slug**.  This table is
+#: derived from :data:`aa_mcp.catalog.BENCHMARKS` (slug -> key, first registration
+#: wins) so a newly catalogued benchmark is reachable as soon as its slug is set;
+#: only genuinely ambiguous or renamed slugs need an entry here.  Values are
+#: already in the units :attr:`Model.evals` stores (0-1 fractions, raw Elo), so no
+#: rescaling is applied.
+_LEADERBOARD_SCORE_KEYS: dict[str, str] = {
+    # AA names this key "normalized" but ships GDPval **Elo** in it: the 0-1
+    # fraction is no longer published anywhere, so the value must land on the Elo
+    # metric — never on ``gdpvalNormalized`` (which would then be rendered ×100).
+    "gdpval-aa-normalized": "gdpval",
+    "aa-briefcase": "briefcaseElo",
+    # The four AA-Omniscience columns share the ``omniscience`` eval page as their
+    # slug, so the catalog-derived map above can only resolve "omniscience" (the
+    # index).  The scores map keys the other two by their own slug — and
+    # ``omniscience-non-hallucination`` is AA's published complement of the
+    # hallucination rate (``1 - omniscienceHallucinationRate``, verified live:
+    # gemini-4-carbon 1 - 0.11421725239616613 = 0.8857827476038339 on both the
+    # leaderboard and its model page).  A hallucination rate must never land on
+    # the non-hallucination key, and vice versa.
+    "omniscience-accuracy": "omniscienceAccuracy",
+    "omniscience-non-hallucination": "omniscienceNonHallucination",
+    "healthbench-professional": "healthbenchProfessional",
+    # the critpt-v2 page's chart set carries both halves under their own keys
+    "critpt-v2": "critptAgentic",
+    "critpt-v2-hard": "critptAgenticHard",
+}
+
+
+def _leaderboard_score_map() -> dict[str, str]:
+    """``scores`` payload slug -> canonical eval key (see the table above)."""
+    mapping: dict[str, str] = {}
+    for bench in catalog.BENCHMARKS.values():
+        if bench.slug:
+            mapping.setdefault(bench.slug, bench.key)
+    mapping.update(_LEADERBOARD_SCORE_KEYS)
+    return mapping
+
 _CHART_EVAL_KEYS = (
     "omniscienceAccuracy", "omniscienceHallucinationRate", "mlcrOverall",
     "mlcrAccuracy", "mlcrCompleteness", "mlcrConciseness",
@@ -195,6 +233,9 @@ _CHART_EVAL_KEYS = (
     # 2026-10-16: flat scalars on the eval-page chart record (no map to walk).
     "itbenchAvgTurnsPerTask", "enterpriseOpsGymAvgConversationTurns",
     "medianCanonicalAnswerOutputSpeed",
+    # 2026-10-31 (Intelligence Index v5.0): newly published eval-page chart fields.
+    "healthbench", "healthbenchProfessional", "code2videoElo",
+    "critptAgentic", "critptAgenticHard", "frontierCode20",
     # 2026-10-16: the speech / TTS / search boards' per-model metric columns
     # (adapted into chart-shaped records by ``loaders._CHART_ADAPTERS``).
     "sttWerIndex", "sttWordErrorRate", "sttEarnings22Wer", "sttVoxpopuliWer",
@@ -266,6 +307,9 @@ _BREAKDOWN_KEYS = (
     "gdpPdfBreakdown", "automationBenchBreakdown", "opennessBreakdown",
     "omniscienceBreakdown", "terminalBenchSciencePassRateByDomain",
     "enterpriseOpsGymSuccessRateByDomain", "canonicalEvalTokenCounts",
+    # v5.0 eval pages: HealthBench rubric breakdowns and the HLE Diamond split
+    "healthbenchBreakdown", "healthbenchProfessionalBreakdown",
+    "hleDiamondScoreByPartition", "code2videoBreakdown",
 )
 
 # Payload key spellings that differ from the canonical catalog key.
@@ -321,6 +365,18 @@ def from_leaderboard(rec: dict) -> Model:
     slug = rec.get("slug") or ""
     name = rec.get("name") or slug
     creator, creator_slug = _creator(rec)
+    evals = _evals(rec, _LEADER_EVAL_KEYS)
+    # AA v5.0 ships per-eval values as one ``scores`` map keyed by eval slug
+    # (the old flat keys are gone).  Legacy payloads still carry the flat keys,
+    # so the two paths are unioned with the flat key winning on a collision.
+    scores = rec.get("scores")
+    if isinstance(scores, dict):
+        score_keys = _leaderboard_score_map()
+        for raw_key, raw_value in scores.items():
+            key = score_keys.get(str(raw_key))
+            value = _num(raw_value)
+            if key is not None and value is not None:
+                evals.setdefault(key, value)
     return Model(
         slug=slug,
         name=name,
@@ -346,7 +402,7 @@ def from_leaderboard(rec: dict) -> Model:
         intelligence=_num(rec.get("intelligenceIndex")),
         estimated=bool(rec.get("intelligenceIndexIsEstimated")),
         indices={"omniscience": _num(rec.get("omniscience"))},
-        evals=_evals(rec, _LEADER_EVAL_KEYS),
+        evals=evals,
         pricing=_pricing(rec),
         speed={
             "tps": _num(rec.get("medianOutputTokensPerSecond")),

@@ -120,13 +120,9 @@ def test_home_boards_counts_and_order() -> None:
     assert len(boards["stt"]) == 15
     assert len(boards["stt_streaming"]) == 28
     assert len(boards["sts"]) == 15
-    assert set(boards) >= {
-        "eval:artificial-analysis-cyber-index",
-        "eval:cwe-bench-aa",
-        "eval:deepsecbench-aa",
-        "eval:cybergym-e2e-aa",
-    }
-    assert all(len(boards[k]) == 20 for k in boards if k.startswith("eval:"))
+    # the homepage eval panels are gone from the live payload; a legacy payload
+    # still carrying them must not resurrect the deleted branch
+    assert not [k for k in boards if k.startswith("eval:")]
 
     wer = [m["werIndex"] for m in boards["stt"]]
     assert wer == sorted(wer)
@@ -134,16 +130,15 @@ def test_home_boards_counts_and_order() -> None:
     assert sts == sorted(sts, reverse=True)
 
 
-def test_home_boards_merge_panel_variants_by_model_slug() -> None:
-    """AA ships two Cyber Index panels; both field sets must survive the merge."""
-    boards = loaders.parse_home_boards(_text("home.rsc"))
-    rows = boards["eval:artificial-analysis-cyber-index"]
-    assert len(rows) == 20
-    # every row keeps the capability score and gains the security companions
-    assert all(r.get("score") is not None for r in rows)
-    assert any(r.get("refusalRate") is not None for r in rows)
-    assert any(r.get("mitigationStatus") for r in rows)
-    assert len({r["slug"] for r in rows}) == len(rows)  # merged, never duplicated
+def test_home_boards_ignore_the_removed_eval_panels() -> None:
+    """Live `/` no longer ships ``evalSlug`` panels; they are not a source."""
+    paste = (
+        '1:{"evalSlug":"artificial-analysis-cyber-index","models":'
+        '[{"slug":"x","score":1}]}\n'
+    )
+    boards = loaders.parse_home_boards(paste)
+    assert set(boards) == {"stt", "stt_streaming", "sts"}
+    assert all(rows == [] for rows in boards.values())
 
 
 # --------------------------------------------------------------------------- #
@@ -502,7 +497,7 @@ def test_index_models_joins_a_capability_page_by_slug(
 ) -> None:
     _patch_fetch(monkeypatch, {"capability_legal": "capability_legal.rsc"})
     models, source, published = loaders.index_models("capabilities.legal")
-    assert source == "/models/capabilities/legal"
+    assert source == "/indexes/legal"
     assert (len(models), published) == (26, 26)
     assert "claude-opus-5-5" in {m.slug for m in models}
 
@@ -1651,3 +1646,127 @@ def test_sts_chart_set_merges_the_slices():
     assert row.evals["stsBigBenchAudio"] is not None
     assert row.evals["stsAgenticElo"] is not None
     assert row.evals["stsNonAgenticElo"] is not None
+
+
+# --------------------------------------------------------------------------- #
+# v5.0 shapes: the leaderboard ``scores`` map, TTS null performance, STS partial
+# --------------------------------------------------------------------------- #
+
+
+def test_leaderboard_scores_map_reaches_the_rows() -> None:
+    """No rich overlay: the 25-row capture must carry every scores-map value."""
+    models = loaders.parse_leaderboard(_text("leaderboard_scores_v5.rsc"))
+    assert len(models) == 25
+    m = next(x for x in models if x.slug == "gemini-4-carbon")
+    assert m.evals["gpqa"] == pytest.approx(0.9393939393939394)
+    assert m.evals["hle"] == pytest.approx(0.527)
+    assert m.evals["scicode"] == pytest.approx(0.5417)
+    assert m.evals["terminalBench40"] == pytest.approx(0.4949)
+    assert m.evals["gdpval"] == pytest.approx(1498.47)
+    assert m.evals["briefcaseElo"] == pytest.approx(1461.69)
+    assert m.evals["hleDiamond"] == pytest.approx(0.679)
+    assert m.evals["healthbench"] == pytest.approx(0.5698718859725104)
+    assert m.evals["critptAgenticHard"] == pytest.approx(0.63)
+    assert m.evals["frontierCode20"] == pytest.approx(0.464359595959596)
+    assert m.evals["code2videoElo"] == pytest.approx(1535.57)
+    assert "gdpvalNormalized" not in m.evals
+    assert m.release_date == "2025-09-01" and m.creator_slug == "google"
+
+
+def test_leaderboard_loader_carries_scores_without_the_rich_overlay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a unique cache path keeps the process-global leaderboard memo from serving
+    # another test's 700-row capture
+    text = _text("leaderboard_scores_v5.rsc")
+
+    def fake_get(url: str, name: str, **kwargs):
+        return fetch.Fetched(text=text, path=Path("/fake-cache/v5-leaderboard"),
+                             fetched_at=1_700_000_123.0, cached=False, stale=False)
+
+    monkeypatch.setattr(loaders.fetch, "get", fake_get)
+    models = loaders.leaderboard()
+    m = next(x for x in models if x.slug == "gemini-4-carbon")
+    assert m.evals["gpqa"] == pytest.approx(0.9393939393939394)
+    assert m.evals["gdpval"] == pytest.approx(1498.47)
+
+
+def test_tts_null_performance_keeps_the_row() -> None:
+    models = loaders.parse_chart(_text("tts_null_perf.rsc"))
+    assert [m.slug for m in models] == ["alpha", "beta"]
+    alpha, beta = models
+    assert alpha.evals["ttsQualityElo"] == pytest.approx(1200.0)
+    # no perf data: the keys are absent, never a fabricated 0 / crash
+    assert "ttsCharactersPerSecond" not in alpha.evals
+    assert "ttsGenerationTime" not in alpha.evals
+    assert alpha.evals["ttsPronunciationPassRate"] == pytest.approx(0.9)
+    assert beta.evals["ttsCharactersPerSecond"] == pytest.approx(123.4)
+    assert beta.evals["ttsGenerationTime"] == pytest.approx(0.25)
+
+
+def test_sts_partial_components_and_missing_overall() -> None:
+    models = {m.slug: m for m in loaders.parse_chart(_text("speech_sts_partial.rsc"))}
+    assert models["alpha"].evals["sts"] == pytest.approx(87.1)
+    assert models["alpha"].evals["stsBigBenchAudio"] == pytest.approx(80.0)
+    # the map is absent on this overall row: no component values, never zeros
+    assert "stsBigBenchAudio" not in models["beta"].evals
+    assert "stsTauVoice" not in models["beta"].evals
+    # a model with only an agentic slice is still rendered, with its Elo
+    assert models["gamma"].evals.get("sts") is None
+    assert models["gamma"].evals["stsAgenticElo"] == pytest.approx(950.0)
+
+    rows = {r["slug"]: r for r in
+            loaders.parse_speech_board(_text("speech_sts_partial.rsc"), "sts")}
+    assert set(rows) == {"alpha", "beta", "gamma"}
+    assert rows["beta"]["extra"] == {"componentsMissing": True}
+    assert rows["gamma"]["stsIndex"] is None
+
+
+def test_v5_eval_page_fields_are_parsed() -> None:
+    model = loaders.parse_chart(_text("eval_healthbench.rsc"))[0]
+    assert model.evals["healthbench"] == pytest.approx(0.5698718859725104)
+    assert model.evals["healthbenchProfessional"] == pytest.approx(0.5988078080045365)
+    assert model.evals["code2videoElo"] == pytest.approx(1535.57)
+    assert model.evals["critptAgentic"] == pytest.approx(0.777142857142857)
+    assert model.evals["frontierCode20"] == pytest.approx(0.464359595959596)
+    assert model.breakdowns["healthbenchBreakdown"] == {"rubricPassRate": 0.61}
+
+
+def test_capability_rows_falls_back_to_the_legacy_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    def fake_get(url: str, name: str, **kwargs):
+        calls.append((url, name))
+        if name == "capability_legal":
+            raise fetch.AAFetchError("404", url=url)
+        return fetch.Fetched(text=_text("capability_legal.rsc"),
+                             path=Path("/fake/legacy"), fetched_at=1.0,
+                             cached=False, stale=False)
+
+    monkeypatch.setattr(loaders.fetch, "get", fake_get)
+    rows = loaders.capability_rows("legal")
+    assert len(rows) == 26
+    assert calls[0] == ("https://artificialanalysis.ai/indexes/legal", "capability_legal")
+    assert calls[1] == ("https://artificialanalysis.ai/models/capabilities/legal",
+                        "capability_legacy_legal")
+
+
+def test_model_pool_includes_rich_only_deprecated_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from aa_mcp import normalize
+
+    lb = [normalize.from_leaderboard({"slug": "active", "intelligenceIndex": 50.0})]
+    rich = [
+        normalize.from_chart({"slug": "active", "name": "Active",
+                              "deprecated": False, "intelligenceIndex": 50.0}),
+        normalize.from_chart({"slug": "old-model", "name": "Old Model",
+                              "deprecated": True, "intelligenceIndex": 30.0}),
+    ]
+    monkeypatch.setattr(loaders, "leaderboard", lambda refresh=False: lb)
+    monkeypatch.setattr(loaders, "rich_dataset", lambda refresh=False: rich)
+    pool = loaders.model_pool()
+    assert [m.slug for m in pool] == ["active", "old-model"]
+    assert pool[1].deprecated is True
