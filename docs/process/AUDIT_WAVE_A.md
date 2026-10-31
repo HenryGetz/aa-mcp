@@ -45,10 +45,11 @@ mentions the cache or `refresh=true` (A22/A25/A26).
   (refetch once, then parse the fresh body). A payload whose stored URL differs from the
   requested URL must never be used. Keep this cheap: one small JSON per name.
 - Validate plausibility after parsing, before returning data: `Model.intelligence` within
-  [-100, 100], `cost_per_task` ≥ 0, `context_tokens` > 0 when present, and at least 50% of
-  records carrying `intelligence` for the leaderboard/rich datasets. On failure raise
-  `AAFetchError`-style error naming the cache file and suggesting `refresh=true`
-  (do not silently drop the offending record).
+  [-100, 100], `cost_per_task` ≥ 0, `context_tokens` > 0 when present, and a floor on
+  scored records for the leaderboard/rich datasets (shipped as an absolute floor of 25 —
+  a 50% share rejected AA's legitimately partial Intelligence Index v5.0 payloads). On
+  failure raise `AAFetchError`-style error naming the cache file and suggesting
+  `refresh=true` (do not silently drop the offending record).
 - Every parse failure must mention the cache path and `refresh=true` in the message.
 
 ## A4 (MEDIUM, perf/social) — single-flight per cache name

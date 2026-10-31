@@ -1029,13 +1029,66 @@ def test_implausible_leaderboard_values_are_rejected(monkeypatch, field, value) 
     assert "refresh=true" in str(ei.value)
 
 
+def _synthetic_models(total: int, scored: int) -> list:
+    """Synthetic models: ``scored`` rows carry an index, the rest do not."""
+    records = [
+        {"slug": f"m{i}", "name": f"M{i}",
+         "intelligenceIndex": 40.0 if i < scored else None}
+        for i in range(total)
+    ]
+    return loaders.parse_leaderboard("0:" + json.dumps(records))
+
+
+def test_partially_scored_payload_passes_the_gate() -> None:
+    """AA's v5.0 rollout left 86/275 rows scored; that is legitimate, not corrupt."""
+    models = _synthetic_models(275, 86)
+    assert sum(1 for m in models if m.intelligence is not None) == 86
+    loaders._validate(models, path=Path("/fake-cache/leaderboard.rsc"), url="u",
+                      min_scored_models=loaders._MIN_SCORED_MODELS)
+
+
+def test_partially_scored_leaderboard_cache_is_served(monkeypatch) -> None:
+    records = [{"slug": f"m{i}", "name": f"M{i}",
+                "intelligenceIndex": 40.0 if i < 30 else None} for i in range(275)]
+    _cache_fetch(monkeypatch, "0:" + json.dumps(records), "leaderboard.rsc")
+    # the fake cache reuses one (path, fetched_at) key for every test
+    monkeypatch.setattr(loaders, "_LEADERBOARD_MEMO", None)
+    models = loaders.leaderboard()
+    assert len(models) == 275
+    assert sum(1 for m in models if m.intelligence is not None) == 30
+
+
 def test_mostly_unscored_leaderboard_cache_is_rejected(monkeypatch) -> None:
     records = [{"slug": f"m{i}", "name": f"M{i}",
                 "intelligenceIndex": 40.0 if i == 0 else None} for i in range(10)]
-    _cache_fetch(monkeypatch, "0:" + json.dumps(records), "leaderboard.rsc")
+    path = _cache_fetch(monkeypatch, "0:" + json.dumps(records), "leaderboard.rsc")
+    monkeypatch.setattr(loaders, "_LEADERBOARD_MEMO", None)
     with pytest.raises(fetch.AAFetchError) as ei:
         loaders.leaderboard()
-    assert "intelligence" in str(ei.value) and "refresh=true" in str(ei.value)
+    message = str(ei.value)
+    assert "1/10" in message and str(loaders._MIN_SCORED_MODELS) in message
+    # a legitimately partial payload is not repaired by refetching it
+    assert "refresh=true" not in message
+    assert ei.value.path == path
+
+
+def test_zero_scored_payload_is_rejected(monkeypatch) -> None:
+    records = [{"slug": f"m{i}", "name": f"M{i}", "intelligenceIndex": None}
+               for i in range(40)]
+    _cache_fetch(monkeypatch, "0:" + json.dumps(records), "leaderboard.rsc")
+    monkeypatch.setattr(loaders, "_LEADERBOARD_MEMO", None)
+    with pytest.raises(fetch.AAFetchError) as ei:
+        loaders.leaderboard()
+    assert "0/40" in str(ei.value)
+
+
+def test_implausible_record_is_rejected_even_with_enough_coverage() -> None:
+    models = _synthetic_models(275, 86)
+    models[0].cost_per_task = -1.0
+    with pytest.raises(fetch.AAFetchError) as ei:
+        loaders._validate(models, path=Path("/fake-cache/leaderboard.rsc"), url="u",
+                          min_scored_models=loaders._MIN_SCORED_MODELS)
+    assert "cost_per_task" in str(ei.value)
 
 
 def _rich_fixture_records():

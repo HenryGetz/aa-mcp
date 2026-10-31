@@ -361,8 +361,13 @@ def _cost_per_task(perf: dict | None) -> float | None:
 
 #: Intelligence Index sanity band: values outside it come from a corrupt entry.
 _INTELLIGENCE_RANGE = (-100.0, 100.0)
-#: minimum share of records that must carry an intelligence score.
-_MIN_SCORED = 0.5
+#: Minimum number of records that must carry an intelligence score.
+#: An absolute floor, not a share: AA legitimately publishes rows before their
+#: aggregate index exists (during the Intelligence Index v5.0 roll-out only 86
+#: of 275 leaderboard rows were scored), so a ratio would reject a healthy
+#: payload as it grows. A truncated or corrupt payload still scores a handful
+#: at most.
+_MIN_SCORED_MODELS = 25
 
 
 def _refresh_note(path, url: str) -> str:
@@ -393,12 +398,15 @@ def _implausible(model: Model) -> str | None:
 
 
 def _validate(
-    models: Sequence[Model], *, path, url: str, min_scored: float = 0.0
+    models: Sequence[Model], *, path, url: str, min_scored_models: int = 0
 ) -> None:
     """Reject implausible records instead of serving them (cache = untrusted).
 
     A single edited field in a cached payload used to make the leaderboard report
-    Intel 999.0 / $0.01 as #1 with no warning (audit A32).
+    Intel 999.0 / $0.01 as #1 with no warning (audit A32). ``min_scored_models``
+    additionally requires an absolute number of scored records, which catches an
+    empty/truncated payload without penalising AA for publishing rows whose
+    aggregate index does not exist yet.
     """
     for model in models:
         bad = _implausible(model)
@@ -409,12 +417,14 @@ def _validate(
                 url=url,
                 path=path,
             )
-    if min_scored and models:
+    if min_scored_models and models:
         scored = sum(1 for m in models if m.intelligence is not None)
-        if scored < min_scored * len(models):
+        if scored < min_scored_models:
             raise AAFetchError(
                 f"{path}: only {scored}/{len(models)} records carry an intelligence "
-                "score; " + _refresh_note(path, url),
+                f"score, below the floor of {min_scored_models} scored records for a "
+                "usable dataset — the payload looks empty, truncated or corrupt "
+                f"rather than merely partially scored ({url})",
                 url=url,
                 path=path,
             )
@@ -1069,8 +1079,10 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
 
     Offline returns whatever is cached (or ``[]``) without touching the network.
     A cached dataset whose records are implausible (out-of-range index, negative
-    cost, a majority without a score) raises :class:`~aa_mcp.fetch.AAFetchError`
-    naming the cache file instead of being served (audit A32).
+    cost, fewer than :data:`_MIN_SCORED_MODELS` scored models) raises
+    :class:`~aa_mcp.fetch.AAFetchError` naming the cache file instead of being
+    served (audit A32). Partial index coverage is not an error: AA publishes rows
+    before their aggregate index exists.
     """
     global _RICH_MEMO
     path = _rich_cache_path()
@@ -1084,7 +1096,7 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
         else []
     )
     if models:
-        _validate(models, path=path, url=_rich_source_url(), min_scored=_MIN_SCORED)
+        _validate(models, path=path, url=_rich_source_url(), min_scored_models=_MIN_SCORED_MODELS)
     if models and not refresh:
         age = rich_age()
         if _offline() or age is None or age <= _rich_ttl():
@@ -1118,7 +1130,7 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
             models = [normalize.from_chart(r) for r in extracted]
         except (TypeError, ValueError):  # pragma: no cover - normalize is total for dicts
             continue
-        _validate(models, path=got.path, url=source_url, min_scored=_MIN_SCORED)
+        _validate(models, path=got.path, url=source_url, min_scored_models=_MIN_SCORED_MODELS)
         try:
             _write_json_atomic(path, extracted)
             _write_json_atomic(_rich_seed_path(), {"slug": slug, "ts": time.time()})
@@ -1148,7 +1160,7 @@ def _leaderboard_rsc(refresh: bool = False) -> list[Model]:
         models = parse_leaderboard(got.text)
     except LookupError as exc:
         raise _parse_error(exc, got.path, source_url) from exc
-    _validate(models, path=got.path, url=source_url, min_scored=_MIN_SCORED)
+    _validate(models, path=got.path, url=source_url, min_scored_models=_MIN_SCORED_MODELS)
     _LEADERBOARD_MEMO = (key, models)
     return models
 
