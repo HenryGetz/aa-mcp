@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
@@ -2700,3 +2701,33 @@ def test_benchmark_leaderboard_ranks_the_decision_index(monkeypatch):
     assert "AA Decision Index" in out
     assert out.index("Alpha") < out.index("Beta")
     assert "80.0" in out
+
+
+def test_server_main_entrypoint_guard(monkeypatch, capsys):
+    """Entrypoint guard: no-arg runs stdio, --help exits 0, unexpected args exit 2."""
+    # 1. No args -> runs server
+    ran = []
+    monkeypatch.setattr(server.srv, "run", lambda transport: ran.append(transport))
+    monkeypatch.setattr(sys, "argv", ["aa-mcp"])
+    server.main()
+    assert ran == ["stdio"]
+
+    # 2. --help -> stdout usage and exit 0
+    monkeypatch.setattr(sys, "argv", ["aa-mcp", "--help"])
+    with pytest.raises(SystemExit) as exc_info:
+        server.main()
+    assert exc_info.value.code == 0
+    out, err = capsys.readouterr()
+    assert "usage: aa-mcp" in out
+    assert "aa-mcp-cli" in out
+    assert err == ""
+
+    # 3. Stray args (e.g. call) -> stderr hint with aa-mcp-cli and exit 2
+    monkeypatch.setattr(sys, "argv", ["aa-mcp", "call", "aa_leaderboard", "{}"])
+    with pytest.raises(SystemExit) as exc_info:
+        server.main()
+    assert exc_info.value.code == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert "aa-mcp-cli" in err
+    assert "stdio MCP server" in err

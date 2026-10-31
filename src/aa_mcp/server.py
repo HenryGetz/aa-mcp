@@ -6292,6 +6292,24 @@ def compare_models(models: str) -> str:
 
 def main() -> None:
     """Console-script entry point: serve MCP over stdio (stdout = protocol only)."""
+    if sys.argv[1:]:
+        if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+            sys.stdout.write(
+                "usage: aa-mcp [-h]\n\n"
+                "Keyless MCP server for artificialanalysis.ai over stdio.\n\n"
+                "Options:\n"
+                "  -h, --help    Show this help message and exit.\n\n"
+                "For ad-hoc CLI calls without an MCP client, use aa-mcp-cli:\n"
+                "  aa-mcp-cli list\n"
+                "  aa-mcp-cli call <tool> '<json>'\n"
+            )
+            sys.exit(0)
+        sys.stderr.write(
+            "aa-mcp is the stdio MCP server; for ad-hoc calls use "
+            "aa-mcp-cli call <tool> '<json>' (aa-mcp-cli list for the tool list)\n"
+        )
+        sys.exit(2)
+
     level = (os.environ.get("AA_LOG_LEVEL") or "WARNING").upper()
     logging.basicConfig(
         level=getattr(logging, level, logging.WARNING),
