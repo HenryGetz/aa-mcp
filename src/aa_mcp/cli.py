@@ -2,11 +2,13 @@
 
 A skill-only or shell-only agent cannot speak MCP, so it cannot reach the tools.
 This module is a dispatch shim over the *same* functions those tools call: the
-``@srv.tool``-decorated functions in :mod:`aa_mcp.server` are ordinary callables
-(``_tool`` only wraps them with ``functools.wraps`` to convert failures into
-``ToolError`` text and to bound the reply), and every resource/prompt function is
-an ordinary zero-or-n-arg callable too. So there is no second parser, cache,
-formatter or dependency here — one data layer, two front doors.
+functions registered with :mod:`aa_mcp.server`'s decorators are ordinary
+callables (``_tool`` only wraps them with ``functools.wraps`` to convert failures
+into ``ToolError`` text and to bound the reply), and every resource/prompt
+function is an ordinary zero-or-n-arg callable too. So there is no second parser,
+cache, formatter or dependency here — one data layer, two front doors. The MCP
+SDK is imported only for ``schema``, which needs the SDK's own JSON-schema
+derivation; every other subcommand runs without it (a ~3.6 s saving per call).
 
 Usage (``python -m aa_mcp.cli`` is identical to the ``aa-mcp-cli`` script)::
 
@@ -45,8 +47,6 @@ import os
 import sys
 from typing import Any
 
-from mcp.server.mcpserver.exceptions import ToolError
-
 from aa_mcp import server
 
 _ENV_HELP = (
@@ -63,22 +63,35 @@ _ENV_HELP = (
 
 # --------------------------------------------------------------------------- #
 # the registries (the same records ``tools/list``, ``resources/list`` and
-# ``prompts/list`` serve — read straight off the ``MCPServer`` that owns them)
+# ``prompts/list`` serve). ``call``/``list``/``read``/``prompts``/``prompt`` read
+# the plain records the module keeps for its decorators, so they never import the
+# MCP SDK; only ``schema`` needs the SDK's own JSON-schema derivation, and it
+# says so by building the server.
 # --------------------------------------------------------------------------- #
 
 def _tools() -> dict[str, Any]:
-    """The registered tools keyed by name; ``Tool.fn`` is the callable itself."""
+    """The registered tools keyed by name; ``Tool.fn`` is the callable itself.
+
+    This is the SDK's view — the wire ``inputSchema`` lives here — so it builds
+    the ``MCPServer``. Use :func:`_tool_fns` for anything that only needs to call
+    a tool.
+    """
     return {tool.name: tool for tool in server.srv._tool_manager.list_tools()}
 
 
-def _resources() -> dict[str, Any]:
-    """The registered resources keyed by URI; ``FunctionResource.fn`` returns the text."""
-    return {str(res.uri): res for res in server.srv._resource_manager.list_resources()}
+def _tool_fns() -> dict[str, server.Registration]:
+    """The tool functions keyed by name, in registration order (no SDK import)."""
+    return server.tool_functions()
 
 
-def _prompts() -> dict[str, Any]:
-    """The registered prompts keyed by name; ``Prompt.fn`` returns the rendered text."""
-    return {prompt.name: prompt for prompt in server.srv._prompt_manager.list_prompts()}
+def _resources() -> dict[str, server.Registration]:
+    """The registered resources keyed by URI (no SDK import)."""
+    return server.resource_functions()
+
+
+def _prompts() -> dict[str, server.Registration]:
+    """The registered prompts keyed by name (no SDK import)."""
+    return server.prompt_functions()
 
 
 def _names(registry: dict[str, Any]) -> str:
@@ -112,11 +125,11 @@ def _parse_args(raw: str) -> dict[str, Any] | None:
 
 def cmd_list() -> int:
     """Name + one-line description + parameter names for every tool, compact."""
-    for tool in _tools().values():
-        lines = (tool.description or "").strip().splitlines()
+    for name, spec in _tool_fns().items():
+        lines = (spec.description or "").strip().splitlines()
         summary = lines[0] if lines else ""
-        params = sorted((tool.parameters or {}).get("properties", {}))
-        print(f"{tool.name}: {summary}")
+        params = sorted(spec.param_names())
+        print(f"{name}: {summary}")
         print(f"    params: {', '.join(params)}")
     return 0
 
@@ -137,7 +150,7 @@ def cmd_schema(names: list[str]) -> int:
 
 def cmd_call(name: str, raw: str) -> int:
     """Call one tool with a JSON object and print its reply verbatim."""
-    tools = _tools()
+    tools = _tool_fns()
     tool = tools.get(name)
     if tool is None:
         return _fail(f"unknown tool: {name}\n— available: {_names(tools)}", 2)
@@ -146,7 +159,7 @@ def cmd_call(name: str, raw: str) -> int:
         return 2
     try:
         text = tool.fn(**args)
-    except ToolError as exc:
+    except server.ToolError as exc:
         return _fail(str(exc), 1)
     print(text)
     return 0

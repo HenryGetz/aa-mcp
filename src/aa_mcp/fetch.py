@@ -29,7 +29,6 @@ import re
 import threading
 import time
 import urllib.error
-import urllib.request
 import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -387,6 +386,11 @@ def _download(
     timeout: float,
 ) -> str:
     """Fetch ``url`` once (no retry) and return the decoded body text."""
+    # Imported here, not at module scope: a warm-cache or offline call never
+    # needs it, and `urllib.request` drags in http.client, ssl, socket and email
+    # (~70 ms) on every CLI/MCP start.
+    import urllib.request
+
     headers = {
         "User-Agent": _UA,
         "Accept": "*/*",

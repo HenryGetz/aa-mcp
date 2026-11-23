@@ -347,7 +347,7 @@ def test_headers_defaults_and_overrides(env, monkeypatch):
         captured["headers"] = {k.lower(): v for k, v in req.header_items()}
         return _FakeResp(b"custom-body")
 
-    monkeypatch.setattr(fetch.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
     f = fetch.get(
         "https://artificialanalysis.ai/leaderboards/models",
@@ -370,7 +370,7 @@ def test_headers_rsc_default_present(env, monkeypatch):
         captured["headers"] = {k.lower(): v for k, v in req.header_items()}
         return _FakeResp(b"rsc-body")
 
-    monkeypatch.setattr(fetch.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     fetch.get("https://artificialanalysis.ai/leaderboards/models", "lb_headers")
     assert captured["headers"]["rsc"] == "1"
 
@@ -412,7 +412,7 @@ def test_unsafe_names_refused_by_cache_age(env):
 
 
 def test_safe_names_are_accepted(env, monkeypatch):
-    monkeypatch.setattr(fetch.urllib.request, "urlopen",
+    monkeypatch.setattr("urllib.request.urlopen",
                         lambda req, timeout=None: _FakeResp(b"ok"))
     for name in ("leaderboard", "model_claude-opus-5-5", "eval_mlcr-aa",
                  "providers_model_flat", "media_text_to_speech", "a" * 120,

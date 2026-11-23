@@ -18,10 +18,11 @@ import subprocess
 import sys
 
 import pytest
-from mcp.server.mcpserver.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError as McpToolError
 
 from aa_mcp import cli, reference, server
 from aa_mcp.normalize import Model
+from aa_mcp.server import ToolError
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
@@ -132,6 +133,12 @@ def test_call_does_not_leak_a_traceback_on_a_tool_error(fake, capsys):
     with pytest.raises(ToolError) as excinfo:
         server.aa_model(query="no-such-model-anywhere")
     message = str(excinfo.value)
+
+    # The MCP boundary re-raises it as the SDK's ToolError with the same text
+    # (the SDK prefixes its own "Error executing tool <name>: " on the wire).
+    with pytest.raises(McpToolError) as mcp_exc:
+        asyncio.run(server.srv.call_tool("aa_model", {"query": "no-such-model-anywhere"}))
+    assert str(mcp_exc.value) == f"Error executing tool aa_model: {message}"
 
     assert cli.main(["call", "aa_model", '{"query":"no-such-model-anywhere"}']) == 1
     captured = capsys.readouterr()
@@ -259,3 +266,23 @@ def test_python_dash_m_reports_errors_on_stderr_only():
     assert proc.returncode == 2
     assert proc.stdout == ""
     assert "unknown tool: aa_nope" in proc.stderr
+
+
+# --------------------------------------------------------------------------- #
+# cold start (import cost is paid by every CLI call, so it is a feature)
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("module", ["aa_mcp.cli", "aa_mcp.server"])
+def test_cli_and_tool_paths_do_not_import_the_mcp_sdk(module):
+    """`import mcp` costs ~3.6 s (client + HTTP stack + protocol types).
+
+    The tool bodies and the CLI dispatch on plain functions, so neither may pull
+    it in; only ``build_server()``, which a real session needs, does.
+    """
+    code = (f"import sys, {module}; "
+            "print(sorted(m for m in ('mcp', 'pydantic', 'urllib.request') "
+            "if m in sys.modules))")
+    proc = subprocess.run([sys.executable, "-c", code],
+                          cwd=REPO, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "[]"

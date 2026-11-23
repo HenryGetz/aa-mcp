@@ -21,6 +21,7 @@ The installed SDK is `mcp` 2.x: `from mcp.server.mcpserver import MCPServer`
 (`FastMCP` no longer exists; do not import `mcp.server.fastmcp`). Verified surface:
 
 ```python
+# inside build_server() — the only place the SDK is imported
 srv = MCPServer(name="aa-mcp", version=__version__, instructions="...")
 
 @srv.tool(name="aa_leaderboard", title="...")   # description defaults to the docstring
@@ -32,8 +33,17 @@ def _r() -> str: ...
 @srv.prompt("best_model_for_task")
 def _p(task: str) -> str: ...
 
-def main() -> None: srv.run("stdio")
+def main() -> None: build_server().run("stdio")
 ```
+
+**Import-cost note (2026-11-23).** `import mcp` costs ~3.6 s (client, HTTP server
+stack, generated protocol types), which a CLI call cannot pay. So `server.py`
+registers through a plain local `registry` (the decorators return the function
+unchanged) and `build_server()` replays those registrations onto `MCPServer` —
+it is the only place `mcp` is imported. `server.srv` resolves lazily (module
+`__getattr__`) for code that wants the built app. Tool failures raise
+`aa_mcp.server.ToolError`; `build_server()` wraps each tool so it arrives at the
+client as the SDK's `ToolError` (`is_error` content with the message intact).
 
 - Input schema derives from the signature + type hints + docstring (Google-style
   `Args:` sections become parameter descriptions).
@@ -80,7 +90,7 @@ src/aa_mcp/
   select.py               # filter / sort / fuzzy resolve / pareto / value
   render.py               # markdown table + header rendering
   loaders.py              # per-source page loaders (the only network users)
-  server.py               # MCPServer app: tools, resources, prompts, main()
+  server.py               # tool/resource/prompt registry + build_server() + main()
 tests/
   fixtures/               # real captured payloads (offline tests)
   test_*.py

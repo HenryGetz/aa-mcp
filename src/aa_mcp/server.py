@@ -5,6 +5,9 @@ This is the integration point: it wires the frozen modules (:mod:`fetch`,
 into the twelve agent-facing tools and renders every answer as
 compact markdown. Nothing here talks to the network at import time; data is
 only loaded inside tool calls, and stdout carries nothing but the MCP protocol.
+The MCP SDK itself is imported by :func:`build_server` alone (~3.6 s of client,
+HTTP stack and generated protocol types), so the tool functions, the CLI shim
+and the tests import this module in well under a second.
 """
 
 from __future__ import annotations
@@ -23,9 +26,6 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
-
-from mcp.server.mcpserver import MCPServer
-from mcp.server.mcpserver.exceptions import ToolError
 
 from . import (
     __version__,
@@ -704,8 +704,20 @@ class _InfoAnswer(ValueError):
     """
 
 
+class ToolError(Exception):
+    """An anticipated tool failure whose own text the caller must see.
+
+    The MCP SDK hides the message of an uncaught exception behind a generic
+    "Error executing tool ..." wrapper, so every expected failure is raised as
+    this type instead. It is a plain exception — not the SDK's — because the CLI
+    path (:mod:`aa_mcp.cli`) imports this module on every call and must not pay
+    the SDK's ~3.6 s import for a happy-path reply; :func:`build_server` mirrors
+    it onto ``mcp``'s ``ToolError`` at the single MCP boundary.
+    """
+
+
 def _tool(fn):
-    """Deliver actionable error text to the client as an MCP ``ToolError``.
+    """Deliver actionable error text to the client as a :class:`ToolError`.
 
     ``mcp`` 2.x hides the message of an uncaught exception behind a generic
     "Error executing tool ..." wrapper, so every expected failure is re-raised
@@ -6981,21 +6993,91 @@ def _fit_json(head: str, payload: Any) -> str:
 # app
 # --------------------------------------------------------------------------- #
 
-srv = MCPServer(
-    name="aa-mcp",
-    version=__version__,
-    instructions=(
-        "Live Artificial Analysis benchmark data (artificialanalysis.ai): model "
-        "intelligence/price/speed/context leaderboards, per-model digests, "
-        "benchmark rankings, provider endpoints, media and agent arenas. Resolve "
-        "uncertain names with aa_search first, then use aa_leaderboard / aa_model / "
-        "aa_compare. All output is token-efficient markdown; unknown names return "
-        "actionable candidates."
-    ),
+_INSTRUCTIONS = (
+    "Live Artificial Analysis benchmark data (artificialanalysis.ai): model "
+    "intelligence/price/speed/context leaderboards, per-model digests, "
+    "benchmark rankings, provider endpoints, media and agent arenas. Resolve "
+    "uncertain names with aa_search first, then use aa_leaderboard / aa_model / "
+    "aa_compare. All output is token-efficient markdown; unknown names return "
+    "actionable candidates."
 )
 
+#: tool options are stored verbatim so :func:`build_server` can replay them.
+_TOOLS: list[tuple[dict[str, Any], Callable[..., Any]]] = []
+#: ``(positional args, options, function)`` per resource, in registration order.
+_RESOURCES: list[tuple[tuple[Any, ...], dict[str, Any], Callable[..., Any]]] = []
+#: ``(options, function)`` per prompt, in registration order.
+_PROMPTS: list[tuple[dict[str, Any], Callable[..., Any]]] = []
 
-@srv.tool(name="aa_leaderboard", title="Model leaderboard", structured_output=False)
+
+@dataclasses.dataclass(frozen=True)
+class Registration:
+    """One registered tool/resource/prompt as the CLI needs it — no MCP objects.
+
+    ``description`` is the tool/prompt docstring (what the wire and ``list``
+    show); ``name`` is the tool/prompt name, or the resource URI.
+    """
+
+    name: str
+    description: str
+    fn: Callable[..., Any]
+
+    def param_names(self) -> list[str]:
+        """The parameter names — the keys of the wire ``inputSchema``."""
+        return list(inspect.signature(self.fn).parameters)
+
+
+class _Registry:
+    """Records registrations; :func:`build_server` replays them onto the SDK.
+
+    Importing ``mcp`` costs ~3.6 s (the client, HTTP server stack and generated
+    protocol types), so it is deferred to the one place that needs it — a real
+    MCP session — while the CLI and the tool bodies keep working on these plain
+    records. The decorators return the function unchanged.
+    """
+
+    def tool(self, **options: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def register(fn: Callable[..., Any]) -> Callable[..., Any]:
+            _TOOLS.append((options, fn))
+            return fn
+        return register
+
+    def resource(self, *args: Any, **options: Any
+                 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def register(fn: Callable[..., Any]) -> Callable[..., Any]:
+            _RESOURCES.append((args, options, fn))
+            return fn
+        return register
+
+    def prompt(self, **options: Any) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        def register(fn: Callable[..., Any]) -> Callable[..., Any]:
+            _PROMPTS.append((options, fn))
+            return fn
+        return register
+
+
+registry = _Registry()
+
+
+def tool_functions() -> dict[str, Registration]:
+    """The registered tools keyed by name, in registration order (SDK-free)."""
+    return {options["name"]: Registration(options["name"], fn.__doc__ or "", fn)
+            for options, fn in _TOOLS}
+
+
+def resource_functions() -> dict[str, Registration]:
+    """The registered resources keyed by URI, in registration order (SDK-free)."""
+    return {str(args[0]): Registration(str(args[0]), options.get("description", ""), fn)
+            for args, options, fn in _RESOURCES}
+
+
+def prompt_functions() -> dict[str, Registration]:
+    """The registered prompts keyed by name, in registration order (SDK-free)."""
+    return {options["name"]: Registration(options["name"], options.get("description", ""), fn)
+            for options, fn in _PROMPTS}
+
+
+@registry.tool(name="aa_leaderboard", title="Model leaderboard", structured_output=False)
 @_tool
 def aa_leaderboard(
     mode: str = "rank",
@@ -7038,7 +7120,7 @@ def aa_leaderboard(
     )
 
 
-@srv.tool(name="aa_model", title="Model digest", structured_output=False)
+@registry.tool(name="aa_model", title="Model digest", structured_output=False)
 @_tool
 def aa_model(query: str, sections: str | list[str] = "", refresh: bool = False) -> str:
     """One model's full digest: specs, indices, benchmarks, pricing and speed.
@@ -7051,8 +7133,8 @@ def aa_model(query: str, sections: str | list[str] = "", refresh: bool = False) 
     return _model(query, sections=sections, refresh=refresh)
 
 
-@srv.tool(name="aa_pareto", title="Pareto trade-off frontier",
-          structured_output=False)
+@registry.tool(name="aa_pareto", title="Pareto trade-off frontier",
+               structured_output=False)
 @_tool
 def aa_pareto(score: str = "intelligence", x: str = "cost_per_task", top: int = 15,
               creator: str = "", open_weights: bool | None = None,
@@ -7076,7 +7158,7 @@ def aa_pareto(score: str = "intelligence", x: str = "cost_per_task", top: int = 
     )
 
 
-@srv.tool(name="aa_compare", title="Compare models", structured_output=False)
+@registry.tool(name="aa_compare", title="Compare models", structured_output=False)
 @_tool
 def aa_compare(queries: list[str] = [],  # noqa: B006 - the MCP schema wants a list default
                metrics: str | list[str] = "",
@@ -7095,8 +7177,8 @@ def aa_compare(queries: list[str] = [],  # noqa: B006 - the MCP schema wants a l
                     spec=spec, refresh=refresh)
 
 
-@srv.tool(name="aa_benchmarks", title="Benchmark & metric search index",
-          structured_output=False)
+@registry.tool(name="aa_benchmarks", title="Benchmark & metric search index",
+               structured_output=False)
 @_tool
 def aa_benchmarks(query: str = "", domain: str = "", tag: str = "",
                   verbose: bool = False) -> str:
@@ -7112,8 +7194,8 @@ def aa_benchmarks(query: str = "", domain: str = "", tag: str = "",
     return _benchmarks(query=query, domain=domain, tag=tag, verbose=verbose)
 
 
-@srv.tool(name="aa_benchmark_leaderboard", title="Benchmark leaderboard",
-          structured_output=False)
+@registry.tool(name="aa_benchmark_leaderboard", title="Benchmark leaderboard",
+               structured_output=False)
 @_tool
 def aa_benchmark_leaderboard(
     benchmark: str,
@@ -7144,7 +7226,7 @@ def aa_benchmark_leaderboard(
     )
 
 
-@srv.tool(name="aa_providers", title="Provider endpoints", structured_output=False)
+@registry.tool(name="aa_providers", title="Provider endpoints", structured_output=False)
 @_tool
 def aa_providers(model: str = "", host: str = "", top: int = 15,
                  sort: str = "cost_per_task", fields: str | list[str] = "",
@@ -7164,7 +7246,7 @@ def aa_providers(model: str = "", host: str = "", top: int = 15,
                       refresh=refresh)
 
 
-@srv.tool(name="aa_media", title="Media leaderboards", structured_output=False)
+@registry.tool(name="aa_media", title="Media leaderboards", structured_output=False)
 @_tool
 def aa_media(board: str, top: int = 15, fields: str | list[str] = "",
              open_weights: bool | None = None, category: str = "",
@@ -7186,7 +7268,7 @@ def aa_media(board: str, top: int = 15, fields: str | list[str] = "",
                   refresh=refresh)
 
 
-@srv.tool(name="aa_agents", title="Agent leaderboards", structured_output=False)
+@registry.tool(name="aa_agents", title="Agent leaderboards", structured_output=False)
 @_tool
 def aa_agents(board: str = "coding_agents", top: int = 5, refresh: bool = False) -> str:
     """AA agent leaderboards: coding agents, chatbots and search APIs.
@@ -7199,7 +7281,7 @@ def aa_agents(board: str = "coding_agents", top: int = 5, refresh: bool = False)
     return _agents(board=board, top=top, refresh=refresh)
 
 
-@srv.tool(name="aa_search", title="Find a model slug", structured_output=False)
+@registry.tool(name="aa_search", title="Find a model slug", structured_output=False)
 @_tool
 def aa_search(query: str = "", creator: str = "", open_weights: bool | None = None,
               top: int = 15, refresh: bool = False) -> str:
@@ -7214,7 +7296,7 @@ def aa_search(query: str = "", creator: str = "", open_weights: bool | None = No
                    top=top, refresh=refresh)
 
 
-@srv.tool(name="aa_reference", title="Reference & provenance", structured_output=False)
+@registry.tool(name="aa_reference", title="Reference & provenance", structured_output=False)
 @_tool
 def aa_reference(topic: str = "overview") -> str:
     """Static reference text: tool routing, metric/eval definitions, provenance.
@@ -7226,7 +7308,7 @@ def aa_reference(topic: str = "overview") -> str:
     return _reference(topic=topic)
 
 
-@srv.tool(name="aa_raw", title="Raw JSON escape hatch", structured_output=False)
+@registry.tool(name="aa_raw", title="Raw JSON escape hatch", structured_output=False)
 @_tool
 def aa_raw(kind: str, query: str = "", fields: str | list[str] = "", top: int = 1,
            refresh: bool = False) -> str:
@@ -7244,16 +7326,16 @@ def aa_raw(kind: str, query: str = "", fields: str | list[str] = "", top: int = 
 # --------------------------------------------------------------------------- #
 
 
-@srv.resource("aa://reference/metrics", name="Metric & benchmark definitions",
-              mime_type="text/markdown",
-              description="Metric/eval definitions and methodology notes.")
+@registry.resource("aa://reference/metrics", name="Metric & benchmark definitions",
+                   mime_type="text/markdown",
+                   description="Metric/eval definitions and methodology notes.")
 def _r_metrics() -> str:
     keys = ("indexes", "benchmarks", "pricing", "speed")
     return "\n\n".join(f"## {k}\n\n{reference.TOPICS[k]}" for k in keys)
 
 
-@srv.resource("aa://benchmarks", name="Benchmark catalog", mime_type="application/json",
-              description="The full benchmark registry as JSON.")
+@registry.resource("aa://benchmarks", name="Benchmark catalog", mime_type="application/json",
+                   description="The full benchmark registry as JSON.")
 def _r_benchmarks() -> str:
     data = [_to_plain(b) for b in catalog.BENCHMARKS.values()]
     return json.dumps(data, indent=1, default=str)
@@ -7274,31 +7356,31 @@ def _rankables_yaml() -> str:
     return "\n".join(lines) + "\n"
 
 
-@srv.resource("aa://rankables", name="Rankable index", mime_type="application/json",
-              description="Every rankable thing (benchmarks, indexes, derived metrics, "
-                          "arenas) with its how-to-query hint, as JSON.")
+@registry.resource("aa://rankables", name="Rankable index", mime_type="application/json",
+                   description="Every rankable thing (benchmarks, indexes, derived metrics, "
+                                "arenas) with its how-to-query hint, as JSON.")
 def _r_rankables() -> str:
     return json.dumps([_to_plain(r) for r in _rankable_list()], indent=1, default=str)
 
 
-@srv.resource("aa://rankables.yaml", name="Rankable index (YAML)",
-              mime_type="application/yaml",
-              description="The same rankable index as YAML (aa_benchmarks domain/tag "
-                          "search covers the same data).")
+@registry.resource("aa://rankables.yaml", name="Rankable index (YAML)",
+                   mime_type="application/yaml",
+                   description="The same rankable index as YAML (aa_benchmarks domain/tag "
+                                "search covers the same data).")
 def _r_rankables_yaml() -> str:
     return _rankables_yaml()
 
 
-@srv.resource("aa://comparisons/spec", name="Comparison spec template",
-              mime_type="application/yaml",
-              description="A YAML template for aa_compare's spec= argument "
-                          "(models/metrics/view/compact/filters).")
+@registry.resource("aa://comparisons/spec", name="Comparison spec template",
+                   mime_type="application/yaml",
+                   description="A YAML template for aa_compare's spec= argument "
+                                "(models/metrics/view/compact/filters).")
 def _r_compare_spec() -> str:
     return _COMPARE_SPEC_TEMPLATE
 
 
-@srv.resource("aa://sources", name="Data sources & cache", mime_type="text/markdown",
-              description="URLs, cache paths, TTLs, offline mode and recovery.")
+@registry.resource("aa://sources", name="Data sources & cache", mime_type="text/markdown",
+                   description="URLs, cache paths, TTLs, offline mode and recovery.")
 def _r_sources() -> str:
     return reference.TOPICS["sources"]
 
@@ -7309,9 +7391,9 @@ def _register_topic_resource(topic: str) -> None:
 
     _res.__name__ = f"_r_topic_{topic}"
     _res.__doc__ = f"aa_reference topic={topic}"
-    srv.resource(f"aa://reference/{topic}", name=f"reference: {topic}",
-                 mime_type="text/markdown",
-                 description=f"Static reference text for the {topic} topic.")(_res)
+    registry.resource(f"aa://reference/{topic}", name=f"reference: {topic}",
+                      mime_type="text/markdown",
+                      description=f"Static reference text for the {topic} topic.")(_res)
 
 
 # every ``reference.TOPICS`` entry gets one resource, from the same source as
@@ -7325,8 +7407,8 @@ for _topic in reference.TOPICS:
 # --------------------------------------------------------------------------- #
 
 
-@srv.prompt(name="best_model_for_task",
-            description="Pick the best model for a task and budget.")
+@registry.prompt(name="best_model_for_task",
+                 description="Pick the best model for a task and budget.")
 def best_model_for_task(task: str, budget: str = "", open_weights: str = "") -> str:
     """Recommend the best model for a task, with alternates and the cost knee."""
     lines = [
@@ -7359,7 +7441,7 @@ def best_model_for_task(task: str, budget: str = "", open_weights: str = "") -> 
     return "\n".join(lines)
 
 
-@srv.prompt(name="compare_models", description="Compare specific models side by side.")
+@registry.prompt(name="compare_models", description="Compare specific models side by side.")
 def compare_models(models: str) -> str:
     """Compare the named models, adding provider detail when price matters."""
     return "\n".join([
@@ -7378,6 +7460,59 @@ def compare_models(models: str) -> str:
         ("5. Report a compact comparison table plus a one-line verdict and the key "
          "trade-off. Do not recompute cost_per_task."),
     ])
+
+
+# --------------------------------------------------------------------------- #
+# MCP application (built only when a session actually needs it)
+# --------------------------------------------------------------------------- #
+
+
+def build_server() -> Any:
+    """Build the ``MCPServer`` from the registry — the only ``mcp`` import.
+
+    Every registration is replayed exactly as it was written, through a thin
+    wrapper that mirrors :class:`ToolError` onto the SDK's own ``ToolError`` so
+    the anticipated-failure text still reaches the client as ``is_error`` content
+    instead of the SDK's generic "Error executing tool" crash message.
+    ``functools.wraps`` keeps the signature/docstring, so ``inputSchema`` and the
+    ``tools/list`` payload are byte-identical to registering the functions
+    directly.
+    """
+    from mcp.server.mcpserver import MCPServer
+    from mcp.server.mcpserver.exceptions import ToolError as McpToolError
+
+    def translate(fn: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return fn(*args, **kwargs)
+            except ToolError as exc:
+                raise McpToolError(str(exc)) from None
+        return wrapper
+
+    built = MCPServer(name="aa-mcp", version=__version__, instructions=_INSTRUCTIONS)
+    for options, fn in _TOOLS:
+        built.tool(**options)(translate(fn))
+    for args, options, fn in _RESOURCES:
+        built.resource(*args, **options)(fn)
+    for options, fn in _PROMPTS:
+        built.prompt(**options)(fn)
+    return built
+
+
+def __getattr__(name: str) -> Any:
+    """``server.srv`` on first access, so a plain import never loads the SDK."""
+    if name == "srv":
+        return _server()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _server() -> Any:
+    """The process's single ``MCPServer``, built on first use and cached."""
+    built = globals().get("srv")
+    if built is None:
+        built = globals()["srv"] = build_server()
+    return built
 
 
 # --------------------------------------------------------------------------- #
@@ -7411,7 +7546,7 @@ def main() -> None:
         stream=sys.stderr,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    srv.run("stdio")
+    _server().run("stdio")
 
 
 if __name__ == "__main__":

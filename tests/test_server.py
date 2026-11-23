@@ -13,10 +13,10 @@ import json
 import sys
 
 import pytest
-from mcp.server.mcpserver.exceptions import ToolError
 
 from aa_mcp import catalog, loaders, server
 from aa_mcp.normalize import Model
+from aa_mcp.server import ToolError
 
 # --------------------------------------------------------------------------- #
 # fixtures
