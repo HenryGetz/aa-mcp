@@ -803,6 +803,9 @@ def from_chart(rec: dict, *, primary_metric: str = "",
     briefcase_elo = _briefcase_elo(rec)
     if briefcase_elo is not None:
         evals["briefcaseElo"] = briefcase_elo
+    non_hallucination = evals.get("omniscienceNonHallucination")
+    if non_hallucination is not None:
+        evals.setdefault("omniscienceHallucinationRate", 1.0 - non_hallucination)
 
     indices = {"omniscience": _num(rec.get("omniscience"))}
     openness = rec.get("openness")

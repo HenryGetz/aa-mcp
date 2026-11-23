@@ -1861,3 +1861,79 @@ def test_personalitybench_chart_set_carries_all_eight_indexes() -> None:
     }
     assert all(len([k for k in mm.evals if k.startswith("personality.")]) == 8
                for mm in models)
+
+
+# --------------------------------------------------------------------------- #
+# variant-slug page fallback (round 8 live audit)
+# --------------------------------------------------------------------------- #
+
+def test_page_slug_candidates_strip_variant_qualifiers():
+    assert loaders._page_slug_candidates("gemma-4-31b-reasoning") == [
+        "gemma-4-31b-reasoning", "gemma-4-31b"]
+    assert loaders._page_slug_candidates("claude-high") == [
+        "claude-high", "claude"]
+    assert loaders._page_slug_candidates("model-2") == ["model-2", "model"]
+    assert loaders._page_slug_candidates("plain") == ["plain"]
+
+
+def test_model_page_falls_back_from_variant_to_base_slug(monkeypatch):
+    import types
+
+    got = types.SimpleNamespace(
+        text=(FIXTURES / "model_page_chart.rsc").read_text(),
+        path=Path("model_step-5.rsc"), fetched_at=0.0)
+    seen = []
+
+    def fake_get(url, name, **kwargs):
+        seen.append(name)
+        if name == "model_step-5-reasoning":
+            raise fetch.AAFetchError("404 https://artificialanalysis.ai/models/step-5-reasoning")
+        return got
+
+    monkeypatch.setattr(loaders.fetch, "get", fake_get)
+    out = loaders.model("step-5-reasoning")
+    assert seen == ["model_step-5-reasoning", "model_step-5"]
+    assert out["step-5"].slug == "step-5"
+    assert out["step-5-reasoning"] is out["step-5"]
+
+
+def test_unknown_model_slug_still_raises_its_own_404(monkeypatch):
+    def fake_get(url, name, **kwargs):
+        raise fetch.AAFetchError(f"404 https://artificialanalysis.ai/models/{name}")
+
+    monkeypatch.setattr(loaders.fetch, "get", fake_get)
+    with pytest.raises(fetch.AAFetchError, match="truly-unknown"):
+        loaders.model("truly-unknown")
+
+
+def test_provider_board_row_maps_flat_published_fields():
+    """Board rows nest the release slug and ship cost/speed as flat scalars."""
+    rec = {
+        "model": {"release": {"slug": "gemini-4-carbon"},
+                  "name": "Gemini 4 Carbon"},
+        "pricing": {"costPerTask": 7.76},
+        "performance": {"outputSpeed": 84.6, "timeToFirstToken": 1.2},
+    }
+    endpoint = loaders._endpoint(rec, "providers_board")
+    assert endpoint.model_slug == "gemini-4-carbon"
+    assert endpoint.cost_per_task == pytest.approx(7.76)
+    assert endpoint.tps == pytest.approx(84.6)
+    assert endpoint.ttft == pytest.approx(1.2)
+
+
+def test_deprecated_releases_become_resolvable_models(monkeypatch):
+    import types
+
+    monkeypatch.setattr(loaders.fetch, "get", lambda *a, **k: types.SimpleNamespace(
+        text="payload", path=Path("leaderboard.rsc"), fetched_at=0.0))
+    monkeypatch.setattr(loaders.flight, "payload", lambda text: text)
+    monkeypatch.setattr(loaders, "_release_index", lambda payload: {
+        "live-model": {"releaseDate": "2026-02-01", "deprecated": False},
+        "retired-model": {"releaseDate": "2025-01-01", "deprecated": True,
+                          "creator": {"name": "Lab", "slug": "lab"}},
+    })
+    monkeypatch.setattr(loaders, "leaderboard", lambda refresh=False: [])
+    monkeypatch.setattr(loaders, "rich_dataset", lambda refresh=False: [])
+    pool = loaders.model_pool()
+    assert [m.slug for m in pool] == ["retired-model"]
+    assert pool[0].deprecated and pool[0].creator == "Lab"

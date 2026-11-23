@@ -2086,6 +2086,17 @@ def _pareto(
         released_after=released_after or None,
         exclude_deprecated=not include_deprecated,
     )
+    modality_known: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    if vision is not None:
+        modality_known = _modality_map(models or all_models, refresh)
+        _apply_modality(models, modality_known)
+        if vision is True:
+            models = [m for m in models
+                      if "image" in _modality_in(modality_known, m.slug)]
+        else:
+            models = [m for m in models
+                      if _modality_in(modality_known, m.slug)
+                      and "image" not in _modality_in(modality_known, m.slug)]
     where = _filter_desc(
         creator=creator, name=name, open_weights=open_weights, reasoning=reasoning,
         min_intelligence=min_intelligence, max_cost_per_task=max_cost_per_task,
@@ -2335,6 +2346,23 @@ def _leaderboard(
         released_after=released_after or None,
         exclude_deprecated=not include_deprecated,
     )
+    modality_known: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    wants_modality = any(
+        _norm_alias(name) in ("modalities", "modality", "modalitiesin",
+                              "modalitiesout", "modin", "modout", "inputmodalities",
+                              "outputmodalities")
+        or _is_wildcard_field(name)
+        for name in _split(fields))
+    if vision is not None or wants_modality:
+        modality_known = _modality_map(models or all_models, refresh)
+        _apply_modality(models, modality_known)
+        if vision is True:
+            models = [m for m in models
+                      if "image" in _modality_in(modality_known, m.slug)]
+        elif vision is False:
+            models = [m for m in models
+                      if _modality_in(modality_known, m.slug)
+                      and "image" not in _modality_in(modality_known, m.slug)]
     where = _filter_desc(
         creator=creator, name=name, open_weights=open_weights, reasoning=reasoning,
         min_intelligence=min_intelligence, max_cost_per_task=max_cost_per_task,
@@ -4588,6 +4616,7 @@ def _benchmark_leaderboard(
     open_weights: bool | None = None,
     min_intelligence: float | None = None,
     include_estimates: bool = True,
+    include_deprecated: bool = True,
     refresh: bool = False,
 ) -> str:
     try:
@@ -6399,6 +6428,7 @@ def aa_benchmark_leaderboard(
     open_weights: bool | None = None,
     min_intelligence: float | None = None,
     include_estimates: bool = True,
+    include_deprecated: bool = True,
     refresh: bool = False,
 ) -> str:
     """Rank models on one benchmark, stating the source and coverage honestly.
@@ -6414,7 +6444,8 @@ def aa_benchmark_leaderboard(
     return _benchmark_leaderboard(
         benchmark, top=top, fields=fields, creator=creator,
         open_weights=open_weights, min_intelligence=min_intelligence,
-        include_estimates=include_estimates, refresh=refresh,
+        include_estimates=include_estimates,
+        include_deprecated=include_deprecated, refresh=refresh,
     )
 
 
