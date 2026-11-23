@@ -691,11 +691,12 @@ def test_compare_metric_list_argument_is_accepted(fake):
 
 def test_compare_without_any_metric_value_explains_itself(fake, monkeypatch):
     bare = _model("bare", "Bare Model", release_date=None, context_tokens=None)
+    bare2 = _model("bare2", "Bare Two", release_date=None, context_tokens=None)
     monkeypatch.setattr(server, "_models_state",
-                        lambda refresh=False, rich=True: ([bare], rich))
-    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: [bare])
+                        lambda refresh=False, rich=True: ([bare, bare2], rich))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: [bare, bare2])
     with pytest.raises(ValueError) as exc:
-        server._compare(["bare", "bare"], metrics="all")
+        server._compare(["bare", "bare2"], metrics="all")
     assert "no metric rows" in str(exc.value)
 
 
@@ -1949,6 +1950,46 @@ def test_media_category_is_rejected_on_a_speech_panel(fake):
     assert "not available" in str(exc.value)
 
 
+def test_media_board_aliases_resolve_to_the_canonical_board(fake):
+    rows = [{"name": "Ideogram 4.0", "elo": 1200.0, "creator": "Lab"}]
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(server, "_load", lambda name, fn, *a, **k: rows)
+        plain = server.aa_media(board="text_to_image", top=1)
+        alias = server.aa_media(board="image", top=1)
+    assert alias == plain
+    assert "Ideogram 4.0" in alias
+
+
+def test_media_board_alias_typo_names_the_closest_boards(fake):
+    with pytest.raises(ValueError) as exc:
+        server._media("text_to_imag")
+    assert "closest" in str(exc.value) and "text_to_image" in str(exc.value)
+
+
+def test_media_sort_price_labels_published_zero_and_unknown(fake, monkeypatch):
+    rows = [
+        {"name": "Priced", "elo": 1100.0, "price": 2.5},
+        {"name": "Free", "elo": 1050.0, "price": 0.0},
+        {"name": "Unknown", "elo": 1000.0},
+    ]
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: rows)
+    out = server.aa_media(board="text_to_image", sort="price", top=5)
+    assert out.index("Free") < out.index("Priced") < out.index("Unknown")
+    assert "published $0.00" in out
+    capped = server.aa_media(board="text_to_image", sort="price", max_price=1.0,
+                            top=5)
+    assert "Free" in capped and "Priced" not in capped
+    assert "max_price" in capped
+
+
+def test_media_rank_survives_explicit_fields(fake, monkeypatch):
+    rows = [{"name": "M1", "elo": 1200.0}, {"name": "M2", "elo": 1100.0}]
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: rows)
+    out = server.aa_media(board="text_to_image", fields="name,elo", top=2)
+    assert "| Rank |" in out
+    assert "| 1 |" in out and "| 2 |" in out
+
+
 def test_search_answers_a_task_word_aa_does_not_measure(fake, monkeypatch):
     """A task word is answered with the closest AA measures, never a dead end (G8)."""
     monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [])
@@ -2215,16 +2256,13 @@ def test_paid_only_indexes_explain_themselves_without_a_key(monkeypatch, fake):
     """``sort=coding``/``sort=agentic``: honest text, no key talk, free alternatives."""
     for key, constituent in (("coding", "scicode"),
                              ("agentic", "terminalBench40")):
-        with pytest.raises(ToolError) as exc:
-            server.aa_leaderboard(sort=key, top=3)
-        text = str(exc.value)
+        text = server.aa_leaderboard(sort=key, top=3)
         assert "paid data API" in text
         assert "no public page carries a per-model value" in text
         assert constituent in text
         assert "AA_API_KEY" not in text and "JSON API" not in text and "env" not in text
-        with pytest.raises(ToolError) as exc2:
-            server.aa_benchmark_leaderboard(benchmark=key)
-        assert "paid data API" in str(exc2.value)
+        text2 = server.aa_benchmark_leaderboard(benchmark=key)
+        assert "paid data API" in text2
 
 
 def test_no_hint_for_a_paid_only_index_claims_a_leaderboard_path():

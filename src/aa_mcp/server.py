@@ -568,6 +568,20 @@ def _close(query: str, pool: Iterable[str], n: int = 5) -> list[str]:
     return hits
 
 
+def _close_names(name: str, pool: Iterable[str], n: int = 3) -> list[str]:
+    """Tight "did you mean" list for an invalid field/sort name (no reference dump).
+
+    A loose cutoff turns ``nonsense`` into five unrelated column names; the error
+    must instead name a handful of plausible keys inline and stop.
+    """
+    pool = list(dict.fromkeys(pool))
+    hits = difflib.get_close_matches(name, pool, n=n, cutoff=0.55)
+    if not hits:
+        low = str(name).lower()
+        hits = [p for p in pool if low and low in p.lower()][:n]
+    return hits
+
+
 #: normalized spellings that catalog.py does not carry (the capability-index
 #: vocabulary lives in ``catalog._CAPABILITY_ALIASES``; these are the remaining
 #: loose phrasings, kept so an agent's own wording resolves)
@@ -597,10 +611,11 @@ def _metric_key(name: str, what: str = "metric") -> str:
     if extra is not None:
         return extra
     pool = list(catalog.METRICS) + list(catalog.FIELD_ALIASES) + list(_EXTRA_ALIASES)
-    near = ", ".join(_close(name, pool))
+    near = ", ".join(_close_names(name, pool)) or "none"
+    examples = "intelligence, cost_per_task, price_out, tps, ttft, context_tokens"
     raise ValueError(
         f"unknown {what} {_q(name)} — closest: {near}\n"
-        "— aa_reference topic=fields lists every accepted name"
+        f"— {what}s accept metric/benchmark keys (e.g. {examples})"
     )
 
 
@@ -633,11 +648,28 @@ def _lower_is_better(key: str) -> bool:
 
 
 def _ambiguous_text(exc: select.AmbiguousError) -> str:
-    rows = [[m.name, _txt(m.creator), m.slug] for m in exc.candidates[:8]]
-    table = render.table(["Model", "Creator", "Slug"], rows)
+    """Candidate table for an ambiguous query, with a variant discriminator.
+
+    Several variants of one release can share a slug (or a bare slug can select
+    one of them while its *name* is unique), so "re-run with the slug" is a loop:
+    the table prints the variant beside the slug and the hint names the Model
+    value that actually resolves.
+    """
+    candidates = list(exc.candidates[:8])
+    slugs = [m.slug for m in candidates]
+    duplicates = len(set(slugs)) != len(slugs)
+    example = candidates[0].name if candidates else "GPT-6.2 Astra (Max)"
+    if duplicates:
+        rows = [[m.name, _txt(m.creator), _variant_label(m) or "-", m.slug]
+                for m in candidates]
+        table = render.table(["Model", "Creator", "Variant", "Slug"], rows)
+    else:
+        rows = [[m.name, _txt(m.creator), m.slug] for m in candidates]
+        table = render.table(["Model", "Creator", "Slug"], rows)
     return (
         f"{exc}\n{table}\n"
-        "— re-run with the exact slug from the Slug column (aa_search resolves names)"
+        f"— re-run with the full Model value, e.g. `{_safe_text(example, 60)}` "
+        "— a bare slug can name several variants"
     )
 
 
@@ -665,6 +697,16 @@ def _fetch_text(exc: AAFetchError) -> str:
     return text
 
 
+class _InfoAnswer(ValueError):
+    """A complete informational answer — delivered as the reply, not an error.
+
+    Exit-code rule (also documented in the CLI help): a call that *answers* the
+    question with "AA publishes this only through its paid API" / "AA no longer
+    publishes this" is a success (exit 0); only a genuine input error or data the
+    caller must act on is non-zero.
+    """
+
+
 def _tool(fn):
     """Deliver actionable error text to the client as an MCP ``ToolError``.
 
@@ -683,6 +725,8 @@ def _tool(fn):
             raise ToolError(str(exc)) from exc
         try:
             return _bounded(fn(*args, **kwargs))
+        except _InfoAnswer as exc:
+            return _bounded(str(exc))
         except ToolError:
             raise
         except AAFetchError as exc:
@@ -1298,6 +1342,26 @@ def _no_rank_text(key: str, label: str) -> str:
     )
 
 
+def _informational_no_rank(key: str) -> bool:
+    """Whether "no ranking exists" is a complete answer (exit 0) for ``key``.
+
+    A composite AA sells only through its paid API, or a metric AA stopped
+    publishing, is answered in full — there is nothing the caller can re-run.
+    A deprecated-only metric with a free live alternative is actionable, so it
+    stays an error (non-zero).
+    """
+    if key in getattr(catalog, "API_ONLY_INDEXES", {}):
+        return True
+    bench = catalog.BENCHMARKS.get(key)
+    return bench is not None and getattr(bench, "source_hint", "") == "none"
+
+
+def _no_rank_error(key: str, label: str) -> Exception:
+    """The right exception for a metric with no ranking: info reply or error."""
+    text = _no_rank_text(key, label)
+    return _InfoAnswer(text) if _informational_no_rank(key) else ValueError(text)
+
+
 def _breakdown_text(key: str, label: str) -> str:
     """Honest one-liner for a ``unit == "mixed"`` container benchmark.
 
@@ -1331,12 +1395,46 @@ def _breakdown_text(key: str, label: str) -> str:
     )
 
 
+def _deprecated_match(query: str) -> Model | None:
+    """A deprecated release whose slug/name exactly matches ``query``, if any.
+
+    Resolution normally sees the full pool (which includes deprecated releases),
+    so this fires when a caller restricted the pool — ``aa_compare`` resolves
+    against the *active* rows — and the name is a real release rather than a typo.
+    """
+    q = _norm_alias(query)
+    if not q:
+        return None
+    fn = getattr(loaders, "deprecated_releases", None)
+    if not callable(fn):
+        return None
+    try:
+        releases = list(fn() or [])
+    except Exception:  # pragma: no cover - resolution must never fail on the hint
+        return None
+    for m in releases:
+        if q in {_norm_alias(m.slug), _norm_alias(m.name),
+                 _norm_alias(m.short_name)}:
+            return m
+    return None
+
+
 def _resolve_slug(query: str, models: Sequence[Model]) -> Model:
     try:
         return select.resolve(models, query)
     except select.AmbiguousError:
         raise
     except LookupError:
+        deprecated = _deprecated_match(query)
+        if deprecated is not None:
+            target = (f" → superseded by {deprecated.deprecated_to}"
+                      if deprecated.deprecated_to else "")
+            raise ValueError(
+                f"known model, deprecated — {deprecated.name} is not in the "
+                f"active pool; page /models/{deprecated.slug}{target}\n"
+                "— aa_model <slug> still reads its page; ranked surfaces hide it "
+                "unless include_deprecated=true"
+            ) from None
         near = select.search(models, query, limit=5)
         slugs = ", ".join(m.slug for m in near) or "none"
         raise ValueError(
@@ -2112,7 +2210,7 @@ def _pareto(
     x_of: Callable[[Model], float | None] = functools.partial(_axis_value, key=x_key)
 
     if not any(score_of(m) is not None for m in models):
-        raise ValueError(_no_rank_text(score_key, score_label))
+        raise _no_rank_error(score_key, score_label)
     if not any(x_of(m) is not None for m in models):
         raise ValueError(_axis_missing_text(x_key, x_label))
 
@@ -2421,7 +2519,7 @@ def _leaderboard(
         if (not include_deprecated
                 and any(select.lookup(m, sort_key) is not None for m in all_models)):
             raise ValueError(_deprecated_only_text(sort_key, label))
-        raise ValueError(_no_rank_text(sort_key, label))
+        raise _no_rank_error(sort_key, label)
 
     footnotes: list[str] = _missing_notes(all_models, [
         ("intelligence", "intelligence", min_intelligence is not None),
@@ -3021,6 +3119,11 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
 
     blocks = [head, _model_facts(model)]
     name_notes = _name_notes(query, base, models)
+    if base.deprecated:
+        target = f" → {base.deprecated_to}" if base.deprecated_to else ""
+        name_notes.append(
+            f"known deprecated release{target} — it is not in the active pool, so "
+            f"ranked tools hide it (page /models/{base.slug})")
     if name_notes:
         blocks.append(render.note(name_notes))
     if "indexes" in chosen:
@@ -4131,15 +4234,28 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
     resolved_pairs: list[tuple[str, Model]] = []
     arena_groups: list[list[_ArenaEntry]] = []
     arena_partial = False
-    for raw in names:
+    seen_inputs: dict[str, int] = {}
+    for index, raw in enumerate(names):
         name_board, name = _arena_split_board(raw)
         board = name_board or board_hint or None
         try:
             resolved = _resolve_slug(name, pool)
+            if resolved.slug in seen_inputs:
+                first = seen_inputs[resolved.slug]
+                raise ValueError(
+                    f"queries[{index}] duplicates queries[{first}] — both "
+                    f"resolve to {resolved.slug} ({resolved.name}); compare "
+                    "distinct models")
+            seen_inputs[resolved.slug] = index
             picked.append(resolved)
             resolved_pairs.append((raw, resolved))
             continue
         except ValueError as exc:
+            if "duplicates queries[" in str(exc):
+                raise
+            # an exact deprecated release is a real model, never a fuzzy arena hit
+            if _deprecated_match(name) is not None:
+                raise
             lm_error = exc
         cands, partial = _arena_candidates(name, board)
         if cands:
@@ -4152,9 +4268,15 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
                 f"check the name on it with aa_media board={board}"
             )
         if pool is all_models:
-            raise lm_error
+            raise ValueError(f"queries[{index}] {_q(raw)}: {lm_error}") from None
         # an exact name is never dropped because a filter excluded it
         resolved = _resolve_slug(name, all_models)
+        if resolved.slug in seen_inputs:
+            first = seen_inputs[resolved.slug]
+            raise ValueError(
+                f"queries[{index}] duplicates queries[{first}] — both resolve to "
+                f"{resolved.slug} ({resolved.name}); compare distinct models")
+        seen_inputs[resolved.slug] = index
         picked.append(resolved)
         resolved_pairs.append((raw, resolved))
 
@@ -4688,7 +4810,7 @@ def _benchmark_leaderboard(
         # their own 26-row chart sets, and AA publishes Coding/Agentic nowhere free.
         pairs = scored(lb)
         if not pairs:
-            raise ValueError(_no_rank_text(key, bench.label))
+            raise _no_rank_error(key, bench.label)
         origin = " + ".join(part for part in (index_source, "rich dataset") if part)
         source_note = f"{bench.label} · {origin} — not a full leaderboard"
     else:
@@ -5254,30 +5376,67 @@ _SPEECH_ALIASES = {
     "realtime_voice": "speech_to_speech",
     "realtime_sts": "speech_to_speech",
 }
-_MEDIA_COLS = [("rank", "Rank"), ("name", "Model"), ("creator", "Creator"),
-               ("elo", "Elo"), ("appearances", "Appearances"),
-               ("price", "Price"), ("release_date", "Release")]
+#: short board names an agent types first (the audit: `board=image` failed)
+_MEDIA_BOARD_ALIASES = {
+    "image": "text_to_image",
+    "image_gen": "text_to_image",
+    "image_generation": "text_to_image",
+    "video": "text_to_video",
+    "text2video": "text_to_video",
+    "t2v": "text_to_video",
+    "image2video": "image_to_video",
+    "i2v": "image_to_video",
+    "tts": "text_to_speech",
+    "stt": "speech_to_text",
+    "asr": "speech_to_text",
+    "speech": "speech_to_text",
+}
+#: media row field -> column label
 _MEDIA_FIELDS = {
     "rank": "Rank", "name": "Model", "model": "Model", "creator": "Creator",
     "elo": "Elo", "ci": "95% CI", "ci_lower": "CI low", "ci_upper": "CI high",
     "appearances": "Appearances", "price": "Price", "price_unit": "Price unit",
     "release": "Release", "release_date": "Release", "open_weights": "Open",
-    "url": "URL",
+    "url": "URL", "wer": "WER%", "wer_index": "WER%", "host": "Host",
+    "sts": "STS", "sts_index": "STS", "speed": "Speed",
 }
-_MEDIA_CANON = {"model": "name", "release": "release_date"}
+_MEDIA_CANON = {"model": "name", "release": "release_date", "wer": "werIndex",
+                "wer_index": "werIndex", "sts": "stsIndex",
+                "sts_index": "stsIndex", "host": "hostName", "speed": "speed"}
+#: the order `fields=all` renders (every column the surface can fill)
+_MEDIA_FIELD_ORDER = [
+    "rank", "name", "creator", "hostName", "elo", "ci", "ci_lower", "ci_upper",
+    "stsIndex", "werIndex", "appearances", "speed", "price", "price_unit",
+    "release_date", "open_weights", "url",
+]
+
+
+
+_MEDIA_LABELS = {
+    "rank": "Rank", "name": "Model", "creator": "Creator", "elo": "Elo",
+    "ci": "95% CI", "ci_lower": "CI low", "ci_upper": "CI high",
+    "appearances": "Appearances", "price": "Price", "price_unit": "Price unit",
+    "release_date": "Release", "open_weights": "Open", "url": "URL",
+    "werIndex": "WER%", "hostName": "Host", "stsIndex": "STS", "speed": "Speed",
+}
 
 
 def _media_cols(fields: Any, unknown: list[str] | None = None) -> list[tuple[str, str]]:
     """Media fields are row keys (``elo``/``ci``/``name``), not model metrics.
 
-    The ``Model`` identity column is always rendered first so a requested table
-    is never an anonymous list of numbers. A field the board does not have is
-    appended to ``unknown`` (when given) and ignored, so a long ``fields=`` list
-    renders what resolves instead of aborting the call (G6).
+    The identity column (``Model``) and ``Rank`` are always rendered, so a
+    requested table is never anonymous and a ranking always keeps its rank
+    (``fields=model,elo,price`` used to drop Rank silently). A wildcard
+    (``all``/``*``) selects every catalogued column. A field the board does not
+    have is appended to ``unknown`` (when given) and ignored, so a long
+    ``fields=`` list renders what resolves instead of aborting the call (G6).
     """
+    names = _split(fields)
+    if any(_is_wildcard_field(n) for n in names):
+        return [(key, _MEDIA_LABELS[key]) for key in _MEDIA_FIELD_ORDER]
     out: list[tuple[str, str]] = []
     keys: set[str] = set()
-    for raw in _split(fields):
+    for raw in names:
         name = re.sub(r"[\s-]+", "_", raw.strip().lower())
         if name not in _MEDIA_FIELDS:
             if unknown is not None:
@@ -5290,9 +5449,11 @@ def _media_cols(fields: Any, unknown: list[str] | None = None) -> list[tuple[str
         if key in keys:
             continue
         keys.add(key)
-        out.append((key, _MEDIA_FIELDS[name]))
+        out.append((key, _MEDIA_LABELS.get(key, _MEDIA_FIELDS[name])))
     if "name" not in keys:
         out.insert(0, ("name", "Model"))
+    if "rank" not in keys:
+        out.insert(0, ("rank", "Rank"))
     return out
 
 
@@ -5328,7 +5489,8 @@ def _media_cell(row: dict, key: str) -> str:
     if key == "price":
         if row.get("price") is None:
             return "-"
-        return f"${row['price']:,.2f}{row.get('price_unit') or ''}"
+        value = f"${row['price']:,.2f}{row.get('price_unit') or ''}"
+        return f"{value}*" if row["price"] == 0 else value
     if key == "rank":
         return _txt(row.get("rank"))
     if key == "appearances":
@@ -5345,19 +5507,104 @@ def _media_cell(row: dict, key: str) -> str:
         if low is None and high is None:
             return "-"
         return f"{_elo_int(low)}–{_elo_int(high)}"
+    if key == "werIndex":
+        return render.pct(row.get("werIndex"))
+    if key == "stsIndex":
+        return render.num(row.get("stsIndex"), 1)
+    if key == "speed":
+        extra = row.get("extra") or {}
+        return render.num(extra.get("medianSpeedFactor"), 1)
     if key == "release_date":
         return _txt(row.get("release_date"))
     return _txt(row.get(key))
 
 
+_MEDIA_SORT_ALIASES = {
+    "elo": "elo", "rank": "rank", "price": "price", "cost": "price",
+    "cheapest": "price", "appearances": "appearances", "release": "release_date",
+    "released": "release_date", "date": "release_date", "wer": "werIndex",
+    "wer%": "werIndex", "sts": "stsIndex", "tps": "speed",
+    "tokens_per_second": "speed", "tokenspersecond": "speed", "speed": "speed",
+}
+#: True = lowest first
+_MEDIA_SORT_ASC = {"price": True, "rank": True, "werIndex": True}
+_MEDIA_SORT_LABELS = {
+    "elo": "Elo", "rank": "rank", "price": "price", "appearances": "appearances",
+    "release_date": "release", "werIndex": "WER", "stsIndex": "STS index",
+    "speed": "speed",
+}
+
+
+def _media_sort_token(text: Any) -> str:
+    return re.sub(r"[\s-]+", "_", str(text).strip().lower())
+
+
+def _media_sort_value(row: dict, key: str) -> float | str | None:
+    value = ((row.get("extra") or {}).get("medianSpeedFactor")
+             if key == "speed" else row.get(key))
+    if isinstance(value, bool) or value is None:
+        return None
+    if key == "release_date":
+        return str(value)
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def _media_sort_rows(rows: list[dict], sort: str, allowed: Sequence[str]
+                     ) -> tuple[list[dict], str, bool]:
+    """Apply ``sort=``; returns ``(rows, key, ascending)``.
+
+    Unknown/absent fields raise with the board's own valid keys, so an agent gets
+    a usable sort name inline instead of a reference lookup.
+    """
+    token = _media_sort_token(sort)
+    if not token:
+        return rows, "", False
+    key = _MEDIA_SORT_ALIASES.get(token, token)
+    if key not in allowed:
+        nearest = ", ".join(_close(sort, list(allowed), n=3)) or "none"
+        raise ValueError(
+            f"unknown sort {_q(sort)} — valid: {', '.join(allowed)} "
+            f"(closest: {nearest})")
+    ascending = _MEDIA_SORT_ASC.get(key, False)
+    present = [r for r in rows if _media_sort_value(r, key) is not None]
+    absent = [r for r in rows if _media_sort_value(r, key) is None]
+    present.sort(key=lambda r: _media_sort_value(r, key), reverse=not ascending)
+    return present + absent, key, ascending
+
+
+def _speech_panel_rows(speech: str, raw_rows: Sequence[dict]) -> list[dict]:
+    """Normalize a homepage speech panel to the media row shape."""
+    out: list[dict] = []
+    for r in raw_rows:
+        row = {
+            "rank": None, "name": r.get("name"),
+            "creator": r.get("creatorName"), "hostName": r.get("hostName"),
+            "price": r.get("price"), "price_unit": r.get("price_unit"),
+            "release_date": r.get("release_date"),
+            "open_weights": _row_open_weights(r), "url": r.get("url"),
+            "appearances": r.get("appearances"), "extra": r.get("extra") or {},
+        }
+        if speech == "sts":
+            row.update(elo=r.get("elo"), ci_lower=r.get("ci_lower"),
+                       ci_upper=r.get("ci_upper"), stsIndex=r.get("stsIndex"))
+        else:
+            row["werIndex"] = r.get("werIndex")
+        out.append(row)
+    return out
+
+
 def _media(board: str, top: int = 15, fields: str = "", open_weights: bool | None = None,
-           refresh: bool = False, category: str = "") -> str:
+           category: str = "", sort: str = "", max_price: float | None = None,
+           refresh: bool = False) -> str:
     n = top if isinstance(top, int) and top > 0 else 15
     key_name = _norm_board(board)
     key_name = _SPEECH_ALIASES.get(key_name, key_name)
+    key_name = _MEDIA_BOARD_ALIASES.get(key_name, key_name)
     category = str(category or "").strip()
+    sort = str(sort or "").strip()
 
-    if key_name in _SPEECH_BOARDS:
+    speech = _SPEECH_BOARDS.get(key_name)
+    if speech is not None:
         if category:
             raise ValueError(
                 f"category= is not available for the {key_name} homepage panel — AA "
@@ -5365,74 +5612,159 @@ def _media(board: str, top: int = 15, fields: str = "", open_weights: bool | Non
                 "board that has categories (e.g. text_to_image, "
                 "text_to_speech_controlled)"
             )
-        speech = _SPEECH_BOARDS[key_name]
-        canonical = key_name
-        rows = _home_rows(refresh).get(speech) or []
+        raw = _home_rows(refresh).get(speech) or []
         if open_weights is not None:
-            flagged = [r for r in rows if _row_open_weights(r) is not None]
+            flagged = [r for r in raw if _row_open_weights(r) is not None]
             if not flagged:
-                return (f"# the {canonical} homepage panel carries no open-weights flag "
-                        f"({len(rows)} rows) — drop open_weights, or use a model board "
+                return (f"# the {key_name} homepage panel carries no open-weights flag "
+                        f"({len(raw)} rows) — drop open_weights, or use a model board "
                         "where the flag exists")
-            rows = [r for r in flagged if _row_open_weights(r) == open_weights]
-        if not rows:
-            return f"# no rows for speech board {canonical} in the homepage payload"
-        if speech == "sts":
-            cols = [("rank", "Rank"), ("name", "Model"), ("hostName", "Host"),
-                    ("stsIndex", "STS")]
-            table_rows = [[str(i), _txt(r.get("name")), _txt(r.get("hostName")),
-                           render.num(r.get("stsIndex"), 1)]
-                          for i, r in enumerate(rows[:n], 1)]
-        else:
-            cols = [("rank", "Rank"), ("name", "Model"), ("creatorName", "Creator"),
-                    ("werIndex", "WER%")]
-            table_rows = [[str(i), _txt(r.get("name")), _txt(r.get("creatorName")),
-                           render.pct(r.get("werIndex"))]
-                          for i, r in enumerate(rows[:n], 1)]
-        note = (f"{canonical} · speech, WER lower is better" if speech != "sts"
-                else f"{canonical} · speech, STS index")
-        head = _header(count=f"{len(table_rows)} of {len(rows)} rows", note=note,
-                       name="home")
-        return _table_block(head, [lbl for _, lbl in cols], table_rows)
+            raw = [r for r in flagged if _row_open_weights(r) == open_weights]
+        if not raw:
+            return f"# no rows for speech board {key_name} in the homepage payload"
+        rows = _speech_panel_rows(speech, raw)
+        elo_board = speech == "sts"
+        allowed = (["werIndex", "price", "release_date", "speed"]
+                   if not elo_board else
+                   ["elo", "rank", "price", "appearances", "release_date",
+                    "stsIndex"])
+        board_note = ("speech, WER lower is better" if not elo_board
+                      else "speech arena, STS index and Elo")
+        native_default = "werIndex" if not elo_board else "elo"
+        cache_name = "home"
+    else:
+        if key_name not in loaders.MEDIA_BOARDS:
+            valid = sorted(loaders.MEDIA_BOARDS) + sorted(_SPEECH_BOARDS)
+            nearest = ", ".join(_close(board, valid + list(_MEDIA_BOARD_ALIASES), n=3))
+            raise ValueError(
+                f"unknown media board {_q(board)} — closest: {nearest or 'none'}\n"
+                f"— valid: {', '.join(valid)} (aliases: image, video, t2v, i2v, "
+                "tts, stt, speech)"
+            )
+        try:
+            rows = _load(f"media_{key_name}", loaders.media, key_name,
+                         refresh=refresh, category=category)
+        except ValueError as exc:
+            # an unknown category is a bad argument, not a broken payload: drop
+            # the loader's cache-file suffix so the error only names the slugs
+            msg = str(exc)
+            marker = " — the payload cached at "
+            if "unknown category" in msg and marker in msg:
+                raise ValueError(msg.split(marker, 1)[0]) from None
+            raise
+        if open_weights is not None:
+            rows = [r for r in rows if r.get("open_weights") == open_weights]
+        elo_board = True
+        allowed = ["elo", "rank", "price", "appearances", "release_date"]
+        if any(_media_sort_value(r, "speed") is not None for r in rows):
+            allowed.append("speed")
+        board_note = ("human-preference Elo · board-relative, not comparable "
+                      "across boards")
+        native_default = "elo"
+        cache_name = f"media_{key_name}"
 
-    if key_name not in loaders.MEDIA_BOARDS:
-        valid = sorted(loaders.MEDIA_BOARDS) + sorted(_SPEECH_BOARDS)
-        raise ValueError(
-            f"unknown media board {_q(board)} — valid: {', '.join(valid)} "
-            "(hyphens/spaces/case are ignored, e.g. text-to-image == text_to_image; "
-            "realtime-voice == speech_to_speech)"
-        )
-    try:
-        rows = _load(f"media_{key_name}", loaders.media, key_name,
-                     refresh=refresh, category=category)
-    except ValueError as exc:
-        # an unknown category is a bad argument, not a broken payload: drop the
-        # loader's cache-file suffix so the error only names the published slugs
-        msg = str(exc)
-        marker = " — the payload cached at "
-        if "unknown category" in msg and marker in msg:
-            raise ValueError(msg.split(marker, 1)[0]) from None
-        raise
-    if open_weights is not None:
-        rows = [r for r in rows if r.get("open_weights") == open_weights]
     if not rows:
         return (f"# no rows on media board {_q(board)}"
                 + (f" category={category}" if category else "")
                 + f" (open_weights={open_weights}) — drop one filter")
 
+    notes: list[str] = []
+    if max_price is not None:
+        cap = float(max_price)
+        excluded = sum(1 for r in rows
+                       if not isinstance(r.get("price"), (int, float))
+                       or isinstance(r.get("price"), bool))
+        rows = [r for r in rows
+                if isinstance(r.get("price"), (int, float))
+                and not isinstance(r.get("price"), bool) and r["price"] <= cap]
+        if not rows:
+            return (f"# no rows on media board {_q(board)} with price <= "
+                    f"${cap:,.2f}"
+                    + (f" ({excluded} rows publish no price)" if excluded else "")
+                    + " — raise max_price or drop it")
+        notes.append(f"max_price=${cap:,.2f} (the board's own price unit)"
+                     + (f"; {excluded} rows with no published price excluded"
+                        if excluded else ""))
+
+    rows, sort_key, ascending = _media_sort_rows(rows, sort, allowed)
+    if not sort:
+        if not elo_board:
+            rows.sort(key=lambda r: (_media_sort_value(r, "werIndex") is None,
+                                     _media_sort_value(r, "werIndex") or 0.0))
+        elif speech == "sts":
+            rows.sort(key=lambda r: (_media_sort_value(r, "elo") is None,
+                                     _media_sort_value(r, "elo") or 0.0),
+                      reverse=True)
+    if not rows:
+        return f"# no rows on media board {_q(board)} — drop one filter"
+
+    explicit = bool(fields or open_weights is not None or max_price is not None
+                    or (sort_key and sort_key != native_default))
+    want_ci = elo_board and n <= 10
     unknown: list[str] = []
-    cols = _media_cols(fields, unknown) if fields else list(_MEDIA_COLS)
-    table_rows = [[_media_cell(r, k) for k, _ in cols] for r in rows[:n]]
-    explicit = bool(fields or open_weights is not None)
-    count = (f"{len(table_rows)} shown of {len(rows)} matching" if explicit
-             else f"{len(table_rows)} of {len(rows)} {key_name}")
-    note = "human-preference Elo (ask fields=ci_lower,ci_upper,ci for the 95% CI)"
+    price_view = sort_key == "price" and not fields
+    if price_view:
+        cols = [("name", "Model"), ("price", "Price")]
+    elif fields:
+        cols = _media_cols(fields, unknown)
+    elif elo_board:
+        if speech == "sts":
+            cols = [("rank", "Rank"), ("name", "Model"), ("hostName", "Host"),
+                    ("stsIndex", "STS"), ("elo", "Elo"), ("price", "Price"),
+                    ("release_date", "Release")]
+            if want_ci:
+                cols.insert(5, ("ci", "95% CI"))
+        else:
+            cols = [("rank", "Rank"), ("name", "Model"), ("creator", "Creator"),
+                    ("elo", "Elo"), ("price", "Price"), ("release_date", "Release")]
+            if want_ci:
+                cols.insert(4, ("ci", "95% CI"))
+    else:
+        cols = [("rank", "Rank"), ("name", "Model"), ("creator", "Creator"),
+                ("werIndex", "WER%")]
+        if sort_key == "price" or max_price is not None:
+            cols.append(("price", "Price"))
+    if (fields and sort_key == "price"
+            and not any(k == "price" for k, _ in cols)):
+        cols.append(("price", "Price"))
+
+    shown = rows[:n]
+    view_rows: list[dict] = []
+    for i, row in enumerate(shown, 1):
+        view = dict(row)
+        if (sort_key and sort_key != native_default) or view.get("rank") is None:
+            view["rank"] = i
+        view_rows.append(view)
+    table_rows = [[_media_cell(r, k) for k, _ in cols] for r in view_rows]
+
+    price_shown = any(k == "price" for k, _ in cols)
+    free = sum(1 for r in rows if r.get("price") == 0) if price_shown else 0
+    priced_unknown = (sum(1 for r in rows if r.get("price") is None)
+                      if price_shown else 0)
+    count = (f"{len(shown)} shown of {len(rows)} matching" if explicit
+             else f"{len(shown)} of {len(rows)} {key_name}")
+    if price_view:
+        count = f"{len(shown)} of {len(rows)} {key_name} · cheapest first"
+    if price_shown:
+        if free:
+            count += f" · {free} at $0.00*"
+        if priced_unknown:
+            count += f" · {priced_unknown} price -"
+    note = "" if price_view else board_note
+    if sort_key and not price_view:
+        note = (f"sorted by {_MEDIA_SORT_LABELS.get(sort_key, sort_key)} "
+                f"({'lowest' if ascending else 'highest'} first) · {note}")
+    elif not elo_board and not price_view:
+        note = board_note
+    if elo_board and not want_ci and not fields and not price_view:
+        note += " · fields=ci for the 95% CI"
     if category:
         note = f"category={category} · {note}"
-    head = _header(count=count, note=note, name=f"media_{key_name}")
-    body = _table_block(head, [lbl for _, lbl in cols], table_rows, trim=_fields_trim(fields),
-                        identity=_identity_labels(cols))
-    notes: list[str] = []
+    head = _header(count=count, note=note, name=cache_name)
+    body = _table_block(head, [lbl for _, lbl in cols], table_rows,
+                        trim=_fields_trim(fields), identity=_identity_labels(cols))
+    if free:
+        notes.append("* published $0.00 (not unknown)")
     if category:
         notes.append(
             f"category={category}: AA's own per-category sub-board of {key_name} "
@@ -5450,6 +5782,13 @@ def _media(board: str, top: int = 15, fields: str = "", open_weights: bool | Non
 
 _AGENT_COLS = [("rank", "Rank"), ("agent", "Agent"), ("model", "Model"),
                ("creator", "Creator"), ("score", "Score"), ("cost_per_task", "$/Task")]
+#: short board names an agent types first (the audit: `board=coding` failed)
+_AGENT_BOARD_ALIASES = {
+    "coding": "coding_agents", "codingagents": "coding_agents",
+    "coding_agent": "coding_agents", "agents": "coding_agents",
+    "chat": "chatbots", "chatbot": "chatbots", "chatbot_arena": "chatbots",
+    "search": "search_api", "searchapi": "search_api", "search_apis": "search_api",
+}
 
 
 def _no_ref(value: Any) -> str:
@@ -5458,9 +5797,18 @@ def _no_ref(value: Any) -> str:
     return "-" if text.startswith("$") and ":props:" in text else text
 
 
-def _agents(board: str = "coding_agents", top: int = 15, refresh: bool = False) -> str:
-    n = top if isinstance(top, int) and top > 0 else 15
+def _agents(board: str = "coding_agents", top: int = 5, refresh: bool = False) -> str:
+    n = top if isinstance(top, int) and top > 0 else 5
     board_key = _norm_board(board)
+    board_key = _AGENT_BOARD_ALIASES.get(board_key, board_key)
+    if board_key not in loaders.AGENT_BOARDS:
+        nearest = ", ".join(_close(board, sorted(loaders.AGENT_BOARDS)
+                                   + list(_AGENT_BOARD_ALIASES), n=3)) or "none"
+        raise ValueError(
+            f"unknown agents board {_q(board)} — closest: {nearest}\n"
+            f"— valid: {', '.join(sorted(loaders.AGENT_BOARDS))} "
+            "(aliases: coding, chat, search)"
+        )
     rows = _load(f"agents_{board_key}", loaders.agents,
                  board_key, refresh=refresh)
     shown = rows[:n]
@@ -5482,11 +5830,34 @@ def _agents(board: str = "coding_agents", top: int = 15, refresh: bool = False) 
         score_label, score_text = "Feature Score", _feature_score
     else:
         score_label, score_text = "Score", render.pct
-    cols = [(key, score_label if key == "score" else label)
-            for key, label in _AGENT_COLS]
+
+    if board_key == "chatbots":
+        # the board's own plan columns: monthly price and tier. Drop the filler
+        # Model/Creator columns so the price answer fits one tight table.
+        cols = [("rank", "Rank"), ("agent", "Agent"),
+                ("score", score_label), ("price_monthly", "$/mo"),
+                ("tier", "Tier")]
+    else:
+        cols = [(key, score_label if key == "score" else label)
+                for key, label in _AGENT_COLS]
+
+    def _monthly(row: dict) -> str:
+        value = row.get("priceMonthly")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "-"
+        return f"${value:,.2f}/mo" if value else "$0.00/mo*"
 
     table_rows = []
     for row in shown:
+        if board_key == "chatbots":
+            table_rows.append([
+                _no_ref(row.get("rank")),
+                _no_ref(row.get("agent") or row.get("name")),
+                score_text(row.get("score")),
+                _monthly(row),
+                _no_ref(row.get("tier")),
+            ])
+            continue
         table_rows.append([
             _no_ref(row.get("rank")),
             _no_ref(row.get("agent") or row.get("name")),
@@ -5499,7 +5870,7 @@ def _agents(board: str = "coding_agents", top: int = 15, refresh: bool = False) 
         note = ("Artificial Analysis Coding Agent Index (DeepSWE v1.1 + "
                 "Terminal-Bench 4.0 + SWE-Atlas-QnA) · agents, not models")
     elif board_key == "chatbots":
-        note = "chatbots · Feature Score out of 6, higher is better"
+        note = "chatbots · Feature Score out of 6 · agents, not models"
     else:
         note = board_key
     head = _header(count=f"{len(shown)} of {len(rows)} rows", note=note,
@@ -5512,8 +5883,8 @@ def _agents(board: str = "coding_agents", top: int = 15, refresh: bool = False) 
     elif board_key == "chatbots":
         body += ("\n— Feature Score is AA's absolute score out of 6 (Inputs, Media "
                  "Gen, Tools, Memory, MCP, Connectors — 1 point each), not a "
-                 "percentage; AA's board also carries each plan's monthly price and "
-                 "tier")
+                 "percentage; $/mo is the plan's published monthly price, tier is "
+                 "AA's plan tier ('-' = not published)")
     return body
 
 
@@ -6138,10 +6509,35 @@ def _provider_board_matches(rows: Sequence[Any], query: str) -> list[Any]:
     return out
 
 
+_RAW_UNITS = {
+    "model": "price_* = $/1M tokens · cost_per_task = $ · scores = fraction 0..1 "
+             "or Elo · tps = tok/s · ttft = s",
+    "leaderboard": "price_* = $/1M tokens · cost_per_task = $ · scores = fraction "
+                   "0..1 or Elo · tps = tok/s · ttft = s",
+    "providers": "price_* = $/1M tokens · cost_per_task = $ · tps = tok/s · "
+                 "ttft = s",
+    "providers_board": "price_* = $/1M tokens · cost_per_task = $ · tps = tok/s · "
+                       "ttft = s",
+    "media": "price = the row's own price_unit (per image/min/1M chars) · score "
+             "= Elo or index as labeled",
+    "agents": "score = the board's own scale · cost_per_task = $ · priceMonthly "
+              "= the plan's $/month",
+    "home": "price = the panel's own price_unit · score = percentage/index/Elo "
+            "as labeled",
+    "eval": "scores = fraction 0..1 or Elo as labeled",
+    "catalog": "no numeric values — catalog metadata only",
+}
+
+
 def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
          refresh: bool = False) -> str:
     if kind not in _RAW_KINDS:
         raise ValueError(f"unknown kind {_q(kind)} — valid: {', '.join(_RAW_KINDS)}")
+    if kind in ("model", "providers") and not str(query).strip():
+        raise ValueError(
+            f"kind={kind} needs a model — pass query=<name or slug> "
+            "(aa_search resolves a name to a slug)"
+        )
     n = min(max(top if isinstance(top, int) else 1, 1), 5)
     cap_note = ""
     head = ""
@@ -6225,6 +6621,7 @@ def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
                        name=cache_name)
     elif cache_name:
         head += f"\n- cache: `{cache_name}`"
+    head += f"\n- units: {_RAW_UNITS.get(kind, 'as labeled')}"
     return _fit_json(head, payload)
 
 
@@ -6327,10 +6724,8 @@ def aa_leaderboard(
     mode=rank | value (intelligence per $/task) | frontier (Pareto curve with its
     knee, same as aa_pareto). sort=<metric alias or benchmark key>; fields=<comma
     list> for exact columns; max_price_in/max_price_out cap $/1M input/output
-    tokens; vision=true keeps models whose modality is known to include image and
-    states the coverage (unknown rows are excluded, never treated as "no vision").
-    refresh=true bypasses the cache. Resolve uncertain names with aa_search first.
-    The header labels coverage and ties.
+    tokens. refresh=true bypasses the cache. Resolve uncertain names with
+    aa_search first. The header labels coverage and ties.
     """
     return _leaderboard(
         mode=mode, sort=sort, fields=fields, top=top, creator=creator, name=name,
@@ -6473,29 +6868,33 @@ def aa_providers(model: str = "", host: str = "", top: int = 15,
 @_tool
 def aa_media(board: str, top: int = 15, fields: str | list[str] = "",
              open_weights: bool | None = None, category: str = "",
+             sort: str = "", max_price: float | None = None,
              refresh: bool = False) -> str:
     """Human-preference arenas: image, video, speech, music (Elo + 95% CI).
 
     board= text_to_image | image_editing | text_to_video | image_to_video |
     video_editing | text_to_speech[_controlled] | music_instrumental |
-    music_with_vocals | speech_to_text[_streaming] | speech_to_speech (alias
-    realtime_voice); aa_benchmarks lists the rest. category= ranks one
-    per-category sub-board instead of the overall board. fields= adds the 95% CI
-    (ci) and url. A board entry is not a language model: board metrics are not
-    cross-comparable and carry no Intelligence cost or speed.
+    music_with_vocals | speech_to_text[_streaming] | speech_to_speech (aliases:
+    image, video, t2v, i2v, tts, stt, speech, realtime_voice). category= ranks a
+    sub-board. sort= elo | price | appearances | release | rank (+ wer/sts on
+    speech). max_price= caps the board's price unit; `$0.00` is published zero,
+    `-` unknown. Elo is board-relative. fields= selects columns; fields=all
+    renders every catalogued column. A board entry is not a language model.
     """
     return _media(board, top=top, fields=fields, open_weights=open_weights,
-                  category=category, refresh=refresh)
+                  category=category, sort=sort, max_price=max_price,
+                  refresh=refresh)
 
 
 @srv.tool(name="aa_agents", title="Agent leaderboards", structured_output=False)
 @_tool
-def aa_agents(board: str = "coding_agents", top: int = 15, refresh: bool = False) -> str:
+def aa_agents(board: str = "coding_agents", top: int = 5, refresh: bool = False) -> str:
     """AA agent leaderboards: coding agents, chatbots and search APIs.
 
-    board= coding_agents (default) | chatbots | search_api; top= rows (default
-    15); refresh=true bypasses the cache. An agent row is not a language model,
-    so it carries no Intelligence cost or speed.
+    board= coding_agents (default) | chatbots | search_api (aliases: coding,
+    chat, search); top= rows (default 5). Chatbot rows render the plan's monthly
+    price and tier. An agent row is not a language model, so it carries no
+    Intelligence cost or speed.
     """
     return _agents(board=board, top=top, refresh=refresh)
 
@@ -6531,12 +6930,11 @@ def aa_reference(topic: str = "overview") -> str:
 @_tool
 def aa_raw(kind: str, query: str = "", fields: str | list[str] = "", top: int = 1,
            refresh: bool = False) -> str:
-    """Raw JSON escape hatch (token-expensive — prefer the table tools).
+    """Raw JSON escape hatch.
 
     kind= model | leaderboard | providers | providers_board | media | agents |
     home | eval | catalog. query= slug/board/eval for the kind. fields= top-level
-    keys to keep (ignored for kind=model); top= records, capped at 5 (default 1);
-    refresh=true bypasses the cache.
+    keys to keep (ignored for kind=model); top= records (default 1, capped at 5).
     """
     return _raw(kind, query=query, fields=fields, top=top, refresh=refresh)
 

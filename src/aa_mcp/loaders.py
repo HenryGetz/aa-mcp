@@ -1232,7 +1232,8 @@ def rich_dataset(refresh: bool = False) -> list[Model]:
         _RICH_MEMO = (str(path), models)
         return models
 
-    log.warning("rich dataset not found in %d probe(s)", _RICH_PROBES)
+    # rich data is gone from the site; this is diagnostic noise, not actionable
+    log.debug("rich dataset not found in %d probe(s)", _RICH_PROBES)
     _RICH_MEMO = (str(path), [])
     return []
 

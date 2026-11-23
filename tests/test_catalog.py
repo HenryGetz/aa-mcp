@@ -6,7 +6,7 @@ import pathlib
 
 import pytest
 
-from aa_mcp import catalog
+from aa_mcp import catalog, reference
 
 FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
@@ -902,3 +902,13 @@ def test_decision_index_benchmark_carries_its_eval_slug():
     assert bench.slug == "artificial-analysis-decision-index"
     assert bench.source_hint == "chart"
     assert catalog.benchmark("artificial-analysis-decision-index") is bench
+
+
+def test_reference_documents_coverage_without_stale_row_counts():
+    """P3-3: reference must not assert live row/coverage counts that drift."""
+    text = "\n".join(reference.TOPICS.values())
+    for stale in ("275", "measured 2026-10-31", "36 rows", "90 rows x 7",
+                  "86/89", "~81 of"):
+        assert stale not in text, stale
+    assert "the tool header states it" in reference.TOPICS["benchmarks"]
+    assert "the tool header states the live count" in reference.TOPICS["pricing"]

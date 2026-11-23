@@ -21,8 +21,11 @@ Usage (``python -m aa_mcp.cli`` is identical to the ``aa-mcp-cli`` script)::
 ``call`` prints exactly the text the MCP tool returns (byte-identical), so a
 skill can hand an agent these commands and the agent parses the same markdown it
 would have got over MCP. stdout carries only that payload; every diagnostic goes
-to stderr. Exit status: 0 ok, 1 the tool reported an error (its message is on
-stderr, no traceback), 2 bad usage (unknown tool/resource, malformed JSON).
+to stderr. Exit status: 0 ok — a complete answer, including informational replies
+like "AA publishes this composite only through its paid API" (there is nothing to
+retry); 1 the tool reported an input error or unavailable data the caller must act
+on (its message is on stderr, no traceback); 2 bad usage (unknown
+tool/resource, malformed JSON).
 
 Arguments are the tool's own JSON object, exactly as an MCP client would send it;
 validation is the tool's (``_tool``), not a second JSON-schema pass, so an
@@ -50,7 +53,11 @@ _ENV_HELP = (
     "Environment is read by the same data layer the MCP server uses: AA_CACHE_DIR "
     "(default ~/.cache/aa-mcp), AA_CACHE_TTL seconds, AA_OFFLINE=1 (cache only, no "
     "network), AA_RICH_TTL, AA_MAX_BYTES, AA_BASE_URL, AA_LOG_LEVEL. stdout carries "
-    "only the reply; diagnostics go to stderr."
+    "only the reply; diagnostics go to stderr.\n"
+    "Exit status: 0 = a complete answer, including informational replies such as "
+    "'AA publishes this only through its paid API' or 'AA no longer publishes this "
+    "metric'; 1 = a genuine input error or unavailable data the caller must act on; "
+    "2 = bad usage (unknown tool, malformed JSON)."
 )
 
 
