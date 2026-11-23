@@ -48,7 +48,9 @@ runs**, old and new alternating, so both sides saw the same noise).
 ## What remains
 
 A real MCP session (`aa-mcp`, which is what the lazy-tool proxy respawns per
-call) still pays **~3.6 s of `mcp` import before the handshake**, because:
+call) still pays the whole `mcp` import before the handshake — **~3.6 s on the
+loaded box these numbers came from, ~2.0 s when it is idle** (the CLI's own
+0.2–0.3 s disappears under it) — because:
 
 - importing any `mcp.*` submodule runs `mcp/__init__.py`, which imports the
   client (`mcp.client.session*`, `httpx2`, `http.cookiejar`);
@@ -57,5 +59,8 @@ call) still pays **~3.6 s of `mcp` import before the handshake**, because:
 - `mcp_types` builds its pydantic protocol models at import (1.55 s).
 
 None of that is ours to defer: the SDK does not offer a stdio-only entry point.
+That is also why a lazy-tool `invoke_proxy_tool` round-trip measures 2.3–4.7 s
+across loads before and after this change — the per-invoke server respawn is
+pure SDK import, so the win there is zero until the proxy holds a session open.
 The only remaining lever for the proxy path is to stop respawning the server per
 call (a long-lived session), which is a client-side decision, not a server one.
