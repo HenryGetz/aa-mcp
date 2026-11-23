@@ -661,7 +661,7 @@ def parse_leaderboard(text: str) -> list[Model]:
     # owns the bare release slug (the model pages publish it that way), so this
     # corrects the suffix-only derivation used when the sibling is missing.
     if index:
-        for rec, model in zip(dicts, models):
+        for rec, model in zip(dicts, models, strict=True):
             slug = _released_slug(rec, index)
             if slug:
                 model.slug = slug
