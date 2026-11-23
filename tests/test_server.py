@@ -2820,6 +2820,55 @@ def test_raw_providers_board_honours_query_and_top(fake, monkeypatch):
         server._raw("providers_board", query="not-a-model")
 
 
+def test_raw_providers_board_cap_note_describes_returned_rows(fake, monkeypatch):
+    """The header states the rows actually returned; a cap is only claimed when
+    the cap (not the request) truncated the match set (review round 2, item 1)."""
+    import dataclasses
+
+    def endpoint(slug: str, name: str):
+        kwargs = {f.name: None for f in dataclasses.fields(loaders.Endpoint)}
+        kwargs.update(model_slug=slug, model_name=name, host="h",
+                      function_calling=False, json_mode=False,
+                      source="providers_board")
+        return loaders.Endpoint(**kwargs)
+
+    rows = [endpoint(f"model-{i}", f"Model {i}") for i in range(30)]
+    monkeypatch.setattr(server, "_load", lambda *a, **k: rows)
+
+    small = server._raw("providers_board", top=10)
+    assert "top 10 of 30 matching" in small
+    assert "cap" not in small.splitlines()[0]
+
+    capped = server._raw("providers_board", top=500)
+    assert "top 25 of 30 matching (cap 25; 500 requested)" in capped
+    assert capped.count('"model_slug"') == 25
+
+
+def test_model_without_specs_states_the_gap(fake, monkeypatch):
+    """A deprecated release with null ``contextWindowTokens`` must not render an
+    empty specs block silently (review round 2, item 2)."""
+    bare = _model("gpt-4o", "gpt-4o", context_tokens=None, deprecated=True,
+                  deprecated_to="gpt-4o-chatgpt-03-25")
+    monkeypatch.setattr(server, "_models", lambda refresh=False: [bare])
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: ([bare], rich))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: [bare])
+    monkeypatch.setattr(server, "_load", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_prompt_speed", lambda slug: None)
+
+    specs = server.aa_model(query="gpt-4o", sections="specs")
+    assert "no specs published (context unknown)" in specs
+
+    full = server.aa_model(query="gpt-4o")
+    assert "no specs published (context unknown)" in full
+    assert "## Benchmarks\nno benchmark scores published" in full
+    assert "## Pricing\nno pricing recorded" in full
+    assert "## Speed\nno speed measurements recorded" in full
+
+    cost = server.aa_model(query="gpt-4o", sections="cost")
+    assert "## Cost per task\nno per-task cost breakdown published" in cost
+
+
 def test_benchmark_leaderboard_marks_and_optionally_hides_deprecated(monkeypatch):
     dep = _model("old-model", "Old Model", deprecated=True, evals={"gpqa": 0.9})
     act = _model("new-model", "New Model", evals={"gpqa": 0.5})

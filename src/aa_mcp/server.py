@@ -3236,6 +3236,12 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
         blocks.append(render.note(name_notes))
     if variant_note:
         blocks.append(render.note([variant_note]))
+    if "identity" in chosen and not any(
+            v is not None for v in (model.context_tokens, model.params_b,
+                                    model.active_params_b)):
+        blocks.append(render.note([
+            "no specs published (context unknown) — AA's page carries no "
+            "context window or parameter count for this release"]))
     if "indexes" in chosen:
         blocks.append("## Indices\n" + _model_indices(model))
         caps = _model_capabilities(model, refresh)
@@ -3243,8 +3249,8 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
             blocks.append("## Capability indexes\n" + caps)
     if "benchmarks" in chosen:
         table = _model_benchmarks(model, refresh)
-        if table:
-            blocks.append("## Benchmarks\n" + table)
+        blocks.append("## Benchmarks\n"
+                      + (table or "no benchmark scores published for this model"))
     if "pricing" in chosen:
         blocks.append("## Pricing\n" + _model_pricing(model))
     if "speed" in chosen:
@@ -3261,8 +3267,8 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
         blocks.append(speed_block)
     if "cost" in chosen:
         cost = _model_cost(model)
-        if cost:
-            blocks.append("## Cost per task\n" + cost)
+        blocks.append("## Cost per task\n"
+                      + (cost or "no per-task cost breakdown published for this model"))
     if "openness" in chosen:
         blocks.append("## Openness\n" + _model_openness(model))
     if "modalities" in chosen:
@@ -6869,9 +6875,12 @@ def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
                     "\n— resolve the model name with aa_search first")
             label = f" · {render.clean(query, None)}"
         cap = 25
-        n = min(max(top if isinstance(top, int) else 1, 1), cap)
-        if top > cap:
-            cap_note = f" (cap {cap}; {top} requested)"
+        wanted = max(top if isinstance(top, int) else 1, 1)
+        n = min(wanted, cap)
+        # the note describes what actually happened: only claim a cap when it
+        # truncated the match set, and state the rows that were returned
+        cap_note = (f" (cap {cap}; {wanted} requested)"
+                    if wanted > cap and len(matched) > cap else "")
         payload = [_project(_to_plain(e), keys) for e in matched[:n]]
         head = (f"# raw providers_board{label} · top {len(payload)} of "
                 f"{len(matched)} matching{cap_note}")
