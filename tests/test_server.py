@@ -1774,13 +1774,15 @@ def test_compare_notes_a_cost_that_rounds_to_zero(monkeypatch):
             _model("paid", "Paid Model", cost_per_task=0.5)]
     _patch_dual_source(monkeypatch, rows, rows)
     out = server._compare(["free", "paid"], metrics="cost_per_task", compact=False)
-    assert "$0.00 = measured under $0.005/task" in out
+    assert "$0.00 = published $0.00/task" in out
+    assert "raw value 0, not unknown" in out
     assert "open-weights models" in out
 
 
 def test_zero_cost_note_ignores_a_value_that_displays_further_precision():
     assert server._zero_cost_note("cache_read", [("m", 0.0036, True)]) == ""
-    assert "under $0.005" in server._zero_cost_note("cost_per_task", [("m", 0.0, False)])
+    assert "raw value 0, not unknown" in server._zero_cost_note(
+        "cost_per_task", [("m", 0.0, False)])
 
 
 def test_tie_note_names_the_secondary_ordering(fake):
@@ -2930,3 +2932,159 @@ def test_truly_gone_fields_are_documented_as_needing_the_rich_overlay():
             continue
         # documented in the sweep's EXPECTED bucket with the live reason
         assert f'"{key}"' in script and "rich-dataset" in script
+
+
+# --------------------------------------------------------------------------- #
+# round-2 trust fixes: variant provenance, provider families, page-only fields
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("slug,label,tps,ttft", [
+    ("gpt-6-luna", "Max", 109.7, 56.6),
+    ("gpt-6-luna-high", "High", 100.3, 10.6),
+    ("gpt-6-luna-low", "Low", 93.4, 2.5),
+])
+def test_model_variant_uses_its_leaderboard_row(monkeypatch, slug, label, tps, ttft):
+    """A variant digest never shows the page's default-variant numbers.
+
+    The page for ``/models/gpt-6-luna-high`` redirects to the release page; its
+    record is whichever variant AA renders there (here Max). The leaderboard row
+    owns the variant's numerics, so the digest must print those.
+    """
+    row = _model(slug, f"GPT-6 Luna ({label})",
+                 speed={"tps": tps, "ttft": ttft},
+                 pricing={"price_in": 0.10, "price_out": 0.50},
+                 intelligence=20.0, cost_per_task=0.07, context_tokens=1_000_000)
+    page = _model("gpt-6-luna", "GPT-6 Luna (Max)",
+                  speed={"tps": 109.7, "ttft": 56.6},
+                  pricing={"price_in": 9.0, "price_out": 99.0},
+                  intelligence=27.9, cost_per_task=0.15)
+    monkeypatch.setattr(server, "_models", lambda refresh=False: [row])
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: [row])
+    monkeypatch.setattr(server, "_load",
+                        lambda name, fn, *a, **k: {slug: page})
+    out = server._model(slug, sections="identity,pricing,speed")
+    assert f"tok/s | {tps}" in out
+    assert f"TTFT | {ttft}s" in out
+    assert "$9.00" not in out and "99.0" not in out
+    assert f"GPT-6 Luna ({label})" in out.splitlines()[0]
+
+
+def test_model_labels_page_level_values_of_the_default_variant(monkeypatch):
+    """A page record for a *different* variant is labelled, not silently merged."""
+    row = _model("nova-2-0-lite-low", "Nova 2.0 Lite (Low)",
+                 speed={"tps": 144.2, "ttft": 10.75})
+    page = _model("nova-2-0-lite", "Nova 2.0 Lite (Non-reasoning)",
+                  speed={"tps": 115.8, "ttft": 1.8})
+    monkeypatch.setattr(server, "_models", lambda refresh=False: [row])
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: [row])
+    monkeypatch.setattr(server, "_load",
+                        lambda name, fn, *a, **k: {row.slug: page})
+    out = server._model(row.slug, sections="identity,speed")
+    assert out.splitlines()[0].startswith("# Nova 2.0 Lite (Low)")
+    assert "tok/s | 144.2" in out and "10.8s" in out
+    assert "page-level, default variant (Nova 2.0 Lite (Non-reasoning))" in out
+
+
+def test_providers_model_aggregates_the_release_family(monkeypatch):
+    """``model=`` must surface a cheaper sibling, and honour ``host=``."""
+    root = _model("gem-4", "Gem 4 (High)", intelligence=60.0)
+    medium = _model("gem-4-medium", "Gem 4 (Medium)", intelligence=50.0)
+    low = _model("gem-4-low", "Gem 4 (Low)", intelligence=40.0)
+    pool = [root, medium, low]
+
+    page = [_endpoint("gem-4", "Google", cost_per_task=7.76, tps=63.2)]
+    board = [
+        _endpoint("gem-4", "Google", model_name="Gem 4 (medium)",
+                  cost_per_task=6.59, tps=72.4),
+        _endpoint("gem-4", "Google", model_name="Gem 4 (high)",
+                  cost_per_task=7.76, tps=63.2),
+        _endpoint("gem-4", "Amazon", model_name="Gem 4 (low)",
+                  cost_per_task=7.19, tps=54.8),
+    ]
+
+    def fake_load(name, fn, *a, **k):
+        return page if name.startswith("providers_gem-4") else board
+
+    monkeypatch.setattr(server, "_models", lambda refresh=False: pool)
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: pool)
+    monkeypatch.setattr(server, "_load", fake_load)
+    out = server._providers(model="gem-4")
+    assert "3 of 3 endpoints" in out
+    assert "| Variant |" in out
+    assert "Medium" in out and "$6.59" in out      # the cheaper sibling is shown
+    assert "release family included" in out
+    # cheapest first, so Medium leads
+    assert out.splitlines()[3].find("Medium") != -1
+
+    only_google = server._providers(model="gem-4", host="Google")
+    assert "2 of 2 endpoints" in only_google and "Amazon" not in only_google
+    none = server._providers(model="gem-4", host="Nowhere")
+    assert "match host~Nowhere" in none
+
+
+def test_leaderboard_page_only_field_warning_says_where_it_lives(fake, monkeypatch):
+    out = server._leaderboard(fields="name,params_b,license", top=2)
+    assert "live on the model page, not the leaderboard" in out
+    assert "aa_model query=<slug> sections=specs" in out
+
+    with pytest.raises(ValueError, match="sections=specs"):
+        server._leaderboard(sort="params_b", top=2)
+
+
+def test_raw_leaderboard_states_its_cap(fake, monkeypatch):
+    rows = [_model(f"m{i}", f"Model {i}", intelligence=float(i)) for i in range(30)]
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: rows)
+    out = server._raw("leaderboard", top=500)
+    assert "top 25 of 30 (cap 25; 500 requested)" in out
+
+
+def test_compare_duplicate_query_hint_points_at_aa_search(fake, monkeypatch):
+    with pytest.raises(ValueError) as exc:
+        server._compare(["alpha", "alpha"])
+    text = str(exc.value)
+    assert "duplicates queries[0]" in text
+    assert "aa_search" in text and "full variant name" in text
+
+
+def test_benchmark_leaderboard_states_known_deprecation_coverage(monkeypatch):
+    """No row carries a status -> no Depr column and no false claim."""
+    act = _model("new-model", "New Model", evals={"gpqa": 0.5})
+    for name in ("_lb_rows", "_rich_models"):
+        monkeypatch.setattr(server, name, lambda refresh=False: [])
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: ([act], rich))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
+
+    out = server._benchmark_leaderboard(
+        "gpqa", top=5, fields="name,gpqa,deprecated")
+    assert "deprecation status" in out and "not the same as none deprecated" in out
+    assert "| Depr. |" not in out
+    assert "column is omitted" in out
+
+
+def test_compare_all_hides_metrics_with_no_data(monkeypatch):
+    """A row that renders ``-`` for every compared model is dropped and counted."""
+    alpha = _model("alpha", "Alpha", evals={"gpqa": 0.5})
+    beta = _model("beta", "Beta", evals={"gpqa": 0.4})
+    monkeypatch.setattr(server, "_models", lambda refresh=False: [alpha, beta])
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: [alpha, beta])
+    monkeypatch.setattr(server, "_rich_models", lambda refresh=False: [alpha, beta])
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
+    monkeypatch.setattr(server, "_arena_entries", lambda refresh=False: [])
+    monkeypatch.setattr(server, "_extra_score_models",
+                        lambda key, refresh=False: [])
+    real_cell = server._compare_cell
+
+    def fake_cell(m, key):
+        # simulate a rankable whose per-model value is present but unrenderable
+        return "-" if key == "gpqa" else real_cell(m, key)
+
+    monkeypatch.setattr(server, "_compare_cell", fake_cell)
+    out = server._compare(["alpha", "beta"], metrics="all")
+    assert "1 metric with no data hidden" in out.splitlines()[0]
+    assert "| GPQA" not in out

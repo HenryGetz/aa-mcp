@@ -324,9 +324,6 @@ def _metric_value(model: Model, key: str) -> float | None:
 #: The model-page value wins deterministically so one metric never renders two
 #: numbers for the same call (wave G, G1).
 _DUAL_SOURCE_KEYS = ("tps", "ttft", "ttfa", "e2e")
-#: display precision of a ``usd`` cell: catalog.format_value uses 2 decimals above
-#: $0.01, so a cost shown as ``$0.00`` is below this bound (G9).
-_ZERO_USD = 0.005
 
 
 def _value_of(model: Model, score_key: str) -> float | None:
@@ -938,7 +935,8 @@ def _trim(headers: Sequence[str], rows: Sequence[Sequence[str]]
 
 def _table_block(head: str, headers: Sequence[str], rows: Sequence[Sequence[str]],
                  *, trim: bool = True, empty: str = "no values to show",
-                 identity: Sequence[str] = ()) -> str:
+                 identity: Sequence[str] = (),
+                 page_only: Mapping[str, str] | None = None) -> str:
     """Header + a markdown table, bounded to :data:`MAX_RESPONSE`.
 
     ``trim`` drops all-null columns — but only for *default* column sets; an
@@ -966,6 +964,14 @@ def _table_block(head: str, headers: Sequence[str], rows: Sequence[Sequence[str]
                     and all(str(row[i]).strip() in ("", "-") for row in rows)]
         if all_null:
             head += f"\n— no data for: {', '.join(all_null)} (shown as -)"
+            if page_only:
+                on_page = [label for label in all_null if label in page_only]
+                if on_page:
+                    sections = ", ".join(dict.fromkeys(
+                        page_only[label] for label in on_page))
+                    head += (f"\n— {', '.join(on_page)} live on the model page, "
+                             f"not the leaderboard — read aa_model query=<slug> "
+                             f"sections={sections}")
     body = render.table(headers, rows)
     text = f"{head}\n{body}"
     if len(text) <= MAX_RESPONSE:
@@ -1315,8 +1321,9 @@ def _no_rank_text(key: str, label: str) -> str:
     if catalog.benchmark(key) is None:
         return (
             f"{label!r} has no values in the leaderboard — it lives on the "
-            "model page only.\n"
-            "— read it with aa_model <slug>."
+            "model page only, so it cannot be ranked across models.\n"
+            f"— read one model with aa_model query=<slug> sections=specs,benchmarks "
+            f"(e.g. aa_leaderboard name=<model> to find the slug)"
         )
     bench = catalog.BENCHMARKS.get(key)
     if bench is not None and bench.source_hint == "none":
@@ -1332,7 +1339,7 @@ def _no_rank_text(key: str, label: str) -> str:
         return (
             f"{label!r} is published only on individual model pages — AA exposes no "
             "cross-model column for it in the current source.\n"
-            "— read it with aa_model <slug>."
+            "— read one model with aa_model query=<slug> sections=benchmarks."
         )
     return (
         f"{label!r} has no per-model values in the current source — it is not in the "
@@ -2330,8 +2337,40 @@ _LB_COLS = [
     ("intelligence", "Intel"), ("cost_per_task", "$/Task"),
     ("tps", "tok/s"), ("ttft", "TTFT"), ("context_tokens", "Ctx"),
 ]
-#: fields accepted in `fields=` that are not leaderboard metrics (shown as `-`
+#: fields accepted in `fields=` that are not leaderboard metrics (shown as `-`)
 _LB_EXTRA = ("precision", "modalities_in", "modalities_out")
+#: leaderboard field -> the ``aa_model`` section that actually carries it. These
+#: values are never in the leaderboard payload, so an all-``-`` column must say
+#: where it lives instead of implying AA has no data (round-2 audit P2).
+_PAGE_ONLY_FIELD_SECTIONS = {
+    "params_b": "specs", "active_params_b": "specs", "license": "specs",
+    "license_url": "specs", "weights_url": "specs", "knowledge_cutoff": "specs",
+    "size_class": "specs", "modalities_in": "modalities",
+    "modalities_out": "modalities",
+}
+
+
+def _page_only_sections(key: str) -> str:
+    """The model-page section that carries ``key`` (``""`` when it is leaderboard-native)."""
+    section = _PAGE_ONLY_FIELD_SECTIONS.get(key)
+    if section:
+        return section
+    bench = catalog.BENCHMARKS.get(key)
+    if bench is not None and getattr(bench, "source_hint", "") == "rich":
+        return "benchmarks"
+    return ""
+
+
+def _page_only_map(cols: Sequence[tuple[str, str]]) -> dict[str, str]:
+    """``{column label: aa_model section}`` for requested page-only columns."""
+    out: dict[str, str] = {}
+    for key, label in cols:
+        section = _page_only_sections(key)
+        if section:
+            out[label] = section
+    return out
+
+
 #: identity columns always rendered, before any requested `fields=`
 _LB_IDENTITY = [("name", "Model"), ("slug", "Slug")]
 _BENCH_IDENTITY = [("name", "Model"), ("slug", "Slug")]
@@ -2509,7 +2548,8 @@ def _leaderboard(
             body = _table_block(
                 head, [label for _, label in cols],
                 [_model_cells(m, cols, None) for m in shown],
-                trim=_fields_trim(fields), identity=_identity_labels(cols))
+                trim=_fields_trim(fields), identity=_identity_labels(cols),
+                page_only=_page_only_map(cols))
             extra_notes = ([_unknown_field_note(unknown_fields)]
                            if unknown_fields else [])
             if modality_known:
@@ -2645,7 +2685,8 @@ def _leaderboard(
                    source_label=source_label)
     out = [_table_block(head, [label for _, label in cols],
                         [_model_cells(m, cols, value_of) for m in shown],
-                        trim=_fields_trim(fields), identity=_identity_labels(cols))]
+                        trim=_fields_trim(fields), identity=_identity_labels(cols),
+                        page_only=_page_only_map(cols))]
     footnotes = list(dict.fromkeys(footnotes))
     if footnotes:
         out.append(render.note(footnotes))
@@ -3088,12 +3129,79 @@ def _model_modalities(m: Model) -> str:
     return render.table(["Modalities", "Value"], rows)
 
 
+#: Numeric fields a leaderboard row owns. AA's derived variant slugs
+#: (``gpt-6-luna-high``) are real records, but ``/models/<variant>`` 308s to the
+#: base release page, whose record can be the *default* variant. The row is the
+#: only source that is guaranteed to describe the requested variant, so it wins.
+_LB_OWNED_FIELDS = ("intelligence", "cost_per_task", "context_tokens")
+_LB_OWNED_PRICING = ("price_in", "price_out")
+_LB_OWNED_SPEED = ("tps", "ttft")
+
+
+def _page_is_other_variant(record: Model | None, base: Model) -> bool:
+    """True when a loaded model page describes a different (the default) variant."""
+    if record is None:
+        return False
+    return record.slug != base.slug or record.name != base.name
+
+
+def _variant_model(base: Model, record: Model) -> tuple[Model, str]:
+    """Page for identity/benchmarks, leaderboard row for the variant's numerics.
+
+    A variant page that redirects to the release page may carry the default
+    variant's measurements. Keep the page's richer identity/benchmark data, but
+    never let it supply the numbers the requested variant's row owns — and say
+    which remaining values are page-level/default-variant.
+    """
+    model = normalize.merge(base, record)
+    if base.name:
+        model.name = base.name
+    if base.effort:
+        model.effort = base.effort
+    if base.release_date:
+        model.release_date = base.release_date
+    for name in _LB_OWNED_FIELDS:
+        setattr(model, name, getattr(base, name))
+    pricing = dict(model.pricing or {})
+    for key in _LB_OWNED_PRICING:
+        value = (base.pricing or {}).get(key)
+        if value is None:
+            pricing.pop(key, None)
+        else:
+            pricing[key] = value
+    model.pricing = pricing
+    speed = dict(model.speed or {})
+    for key in _LB_OWNED_SPEED:
+        value = (base.speed or {}).get(key)
+        if value is None:
+            speed.pop(key, None)
+        else:
+            speed[key] = value
+    model.speed = speed
+    note = (
+        f"page-level, default variant ({render.clean(record.name)}) — benchmarks "
+        "and cost breakdown come from the release page; intelligence, $/task, "
+        "tok/s, TTFT, context and input/output price come from this variant's "
+        f"leaderboard row (aa.{base.slug})")
+    return model, note
+
+
 def _model(query: str, sections: str = "", refresh: bool = False) -> str:
     models = _models(refresh)
     base = _resolve_slug(query, models)
     slug = base.slug
     record = _load(f"model_{slug}", loaders.model, slug, refresh=refresh).get(slug)
-    model = normalize.merge(base, record) if record is not None else base
+    page_other = _page_is_other_variant(record, base)
+    variant_note = ""
+    if page_other or (_EFFORT_SUFFIX_RE.search(slug) is not None
+                      and record is not None):
+        # a variant row's own numbers always win; only a page that describes a
+        # *different* variant needs the provenance label
+        model, variant_note = _variant_model(base, record)
+        if not page_other:
+            variant_note = ""
+    else:
+        model = normalize.merge(base, record) if record is not None else base
 
     chosen = _split(sections)
     if not chosen:
@@ -3126,6 +3234,8 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
             f"ranked tools hide it (page /models/{base.slug})")
     if name_notes:
         blocks.append(render.note(name_notes))
+    if variant_note:
+        blocks.append(render.note([variant_note]))
     if "indexes" in chosen:
         blocks.append("## Indices\n" + _model_indices(model))
         caps = _model_capabilities(model, refresh)
@@ -3139,9 +3249,8 @@ def _model(query: str, sections: str = "", refresh: bool = False) -> str:
         blocks.append("## Pricing\n" + _model_pricing(model))
     if "speed" in chosen:
         speed_block = "## Speed\n" + _model_speed(model)
-        if record is not None and any(
-            v is not None for v in (record.speed or {}).values()
-        ):
+        if (record is not None and not page_other
+                and any(v is not None for v in (record.speed or {}).values())):
             speed_block += (
                 "\n— speed from the model page (first-party measurement); "
                 "aa_leaderboard reports the leaderboard snapshot and may differ slightly"
@@ -3492,8 +3601,9 @@ def _zero_cost_note(key: str, cells: Sequence[tuple[str, float | None, bool]]) -
     """One footnote for cost/price cells that render ``$0.00`` (G9).
 
     ``cells`` is ``[(model name, value, is_open_weights)]``. A rendered ``$0.00``
-    means the cost is under $0.005 — a bare zero otherwise reads as a measured
-    price, and it silently wins every "cheapest" ranking.
+    is AA's **published** zero (the raw value is exactly ``0``), not a
+    below-threshold measurement — a bare zero otherwise reads as unknown and it
+    silently wins every "cheapest" ranking. A null cell keeps rendering ``-``.
     """
     zeros = [(name, value, ow) for name, value, ow in cells
              if value is not None and _axis_text(key, value) == "$0.00"]
@@ -3502,11 +3612,12 @@ def _zero_cost_note(key: str, cells: Sequence[tuple[str, float | None, bool]]) -
     names = ", ".join(name for name, _, _ in zeros[:3])
     if len(zeros) > 3:
         names += f" +{len(zeros) - 3} more"
-    note = f"$0.00 = measured under ${_ZERO_USD:g}{_zero_unit(key)} ({names}"
+    note = (f"$0.00 = published $0.00{_zero_unit(key)} for {names} "
+            "(raw value 0, not unknown)")
     if all(ow for _, _, ow in zeros):
         note += ("; AA publishes 0 for open-weights models — self-hosting cost is "
                  "not included")
-    return note + ")"
+    return note
 
 
 def _secondary_order(models: Sequence[Model]) -> list[Model]:
@@ -4245,7 +4356,9 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
                 raise ValueError(
                     f"queries[{index}] duplicates queries[{first}] — both "
                     f"resolve to {resolved.slug} ({resolved.name}); compare "
-                    "distinct models")
+                    "distinct models\n"
+                    "— use aa_search for the full variant name (e.g. "
+                    "\"GPT-6 Luna (High)\"), or name distinct releases")
             seen_inputs[resolved.slug] = index
             picked.append(resolved)
             resolved_pairs.append((raw, resolved))
@@ -4275,7 +4388,9 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
             first = seen_inputs[resolved.slug]
             raise ValueError(
                 f"queries[{index}] duplicates queries[{first}] — both resolve to "
-                f"{resolved.slug} ({resolved.name}); compare distinct models")
+                f"{resolved.slug} ({resolved.name}); compare distinct models\n"
+                "— use aa_search for the full variant name (e.g. "
+                "\"GPT-6 Luna (High)\"), or name distinct releases")
         seen_inputs[resolved.slug] = index
         picked.append(resolved)
         resolved_pairs.append((raw, resolved))
@@ -4392,10 +4507,20 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
                 else len(set(short)) != len(short) or len(models) > 6)
     shown_specs = list(row_specs)
     dropped_rows = 0
+    empty_all_rows = 0
     if metrics_arg and compact:
         shown_specs = [(k, lbl) for k, lbl in row_specs
                        if any(cell(m, k) != "-" for m in models)]
         dropped_rows = len(row_specs) - len(shown_specs)
+    if lower == "all":
+        # metrics=all sweeps every rankable key, so rows that resolve to "-" for
+        # every compared model are noise; drop them and say how many. A metric
+        # the caller named explicitly is always kept (even when empty).
+        kept = [(k, lbl) for k, lbl in row_specs
+                if any(cell(m, k) != "-" for m in models)]
+        empty_all_rows = len(row_specs) - len(kept)
+        shown_specs = kept
+        dropped_rows = 0
     rows: list[list[str]] = []
     if slug_row:
         rows.append(["Slug", *[m.slug for m in models]])
@@ -4420,7 +4545,11 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
 
     cache_name = _lb_cache()
     metric_count = (f"{len(shown_specs)} of {len(row_specs)} metrics"
-                    if dropped_rows else f"{len(shown_specs)} metrics")
+                    if (dropped_rows or empty_all_rows)
+                    else f"{len(shown_specs)} metrics")
+    if empty_all_rows:
+        plural = "metric" if empty_all_rows == 1 else "metrics"
+        metric_count += f" · {empty_all_rows} {plural} with no data hidden"
     count = f"{len(models)} models · {metric_count}"
     note = view_note
     head = _header(count=count, note=note, name=cache_name,
@@ -4908,12 +5037,31 @@ def _benchmark_leaderboard(
     if not fields and n > 15:
         cols = [c for c in cols if c[0] != "creator"]
 
-    deprecated_present = any(m.deprecated for m, _ in pairs)
-    if deprecated_present and not any(c[0] == "deprecated" for c in cols):
+    # A bool ``Model.deprecated`` cannot express "unknown": the leaderboard rows
+    # always carry a status (release array), but chart-set / panel rows do not.
+    # State the known count in the header and never print a column that is ``-``
+    # for every row while claiming deprecated rows were included.
+    depr_status = {m.slug: m.deprecated for m in lb_plain}
+    depr_known = sum(1 for m, _ in pairs if m.slug in depr_status)
+    deprecated_present = any(depr_status.get(m.slug) for m, _ in pairs)
+    requested_depr = any(str(k).strip().lower() in ("deprecated", "depr")
+                         for k in request_keys)
+    if depr_known == 0 and requested_depr:
+        cols = [c for c in cols if c[0] != "deprecated"]
+    elif (deprecated_present or depr_known) and not any(
+            c[0] == "deprecated" for c in cols):
         cols.append(("deprecated", "Depr"))
-    source_note += (" · deprecated rows included (include_deprecated=true; "
-                    "false hides them)") if include_deprecated else (
-                    " · deprecated rows hidden (include_deprecated=false)")
+    if include_deprecated:
+        source_note += (" · deprecated rows included (include_deprecated=true; "
+                        "false hides them")
+        source_note += (f"; deprecation status known for {depr_known} of "
+                        f"{len(pairs)} rows)" if depr_known else
+                        "; AA publishes no deprecation status for these rows — "
+                        "not the same as none deprecated)")
+    else:
+        source_note += " · deprecated rows hidden (include_deprecated=false"
+        source_note += (f"; deprecation status known for {depr_known} of "
+                        f"{len(pairs)} rows)" if depr_known else ")")
 
     # The ``*`` marks an AA-estimated value. Only the Intelligence Index carries
     # that flag today (``intelligenceIndexIsEstimated``), so a published Openness /
@@ -4934,7 +5082,8 @@ def _benchmark_leaderboard(
             elif col == "benchmark":
                 cells.append(bench.label)
             elif col == "deprecated":
-                cells.append("yes" if m.deprecated else "")
+                cells.append("yes" if depr_status.get(m.slug)
+                             else ("no" if m.slug in depr_status else ""))
             elif col in ("ci_lower", "ci_upper", "ci"):
                 if col == "ci":
                     cells.append("-" if lo is None and hi is None
@@ -4963,6 +5112,11 @@ def _benchmark_leaderboard(
         notes.append(tie_note)
     if unknown:
         notes.append(_unknown_field_note(unknown))
+    if requested_depr and depr_known == 0:
+        notes.append(
+            "deprecated: no row on this surface carries a deprecation status — "
+            "the column is omitted rather than shown as '-' (aa_leaderboard's "
+            "Depr column has the status where AA publishes it)")
     if key in _CAPABILITY_KEYS:
         notes.append(_capability_coverage_note(
             key, bench.label, lb, include_deprecated=True,
@@ -5121,15 +5275,19 @@ def _creator_map(refresh: bool = False) -> dict[str, str]:
     return {m.slug: str(m.creator) for m in _lb_rows(refresh) if m.creator}
 
 
-def _endpoint_cell(e, key: str, creators: dict[str, str] | None = None) -> str:
+def _endpoint_cell(e, key: str, creators: dict[str, str] | None = None,
+                   variant: str | None = None) -> str:
     """One provider cell. Identity keys resolve from the endpoint record (G2).
 
     ``fields=model`` (or ``name``/``slug``) resolves to the surface's own identity
     column, so the Model column can never blank while the payload carries the
-    model slug on every endpoint; ``creator`` comes from the model's record.
+    model slug on every endpoint; ``creator`` comes from the model's record and
+    ``variant`` from the release-family map.
     """
     if key in ("model_name", "name"):
         return _txt(e.model_name or e.model_slug)
+    if key == "variant":
+        return _txt(variant)
     if key in ("model_slug", "slug"):
         return _txt(e.model_slug)
     if key == "host":
@@ -5236,6 +5394,62 @@ def _no_endpoints_text(base: Model) -> str:
             "does publish)")
 
 
+_EFFORT_SUFFIX_RE = re.compile(
+    r"-(" + "|".join(re.escape(x) for x in sorted(_EFFORT_SUFFIXES,
+                                                  key=len, reverse=True)) + r")$")
+
+
+def _release_family(base: Model, pool: Sequence[Model]) -> list[Model]:
+    """The release and its effort siblings, whatever variant ``base`` resolved to.
+
+    ``aa_providers model=gemini-4-carbon`` resolves to the release's *default*
+    variant, but the provider board also carries its Medium/Low siblings — and a
+    cheaper sibling must never be invisible ("1 of 1 endpoints" was false).
+    """
+    by_slug = {m.slug: m for m in pool}
+    root = base
+    slug = base.slug
+    for _ in range(4):
+        match = _EFFORT_SUFFIX_RE.search(slug)
+        if not match or match.start() == 0:
+            break
+        slug = slug[: match.start()]
+        if slug in by_slug:
+            root = by_slug[slug]
+            break
+    family = [root] + [s for s in _effort_siblings(root, pool)
+                       if s.slug != root.slug]
+    if all(m.slug != base.slug for m in family):
+        family.append(base)
+    return family
+
+
+def _variant_slug_for(label: str, family: Sequence[Model]) -> str:
+    """The family slug whose variant label is ``label`` (falls back to the label)."""
+    norm = _norm_alias(label)
+    for m in family:
+        if _norm_alias(_variant_label(m)) == norm:
+            return m.slug
+    return label
+
+
+def _endpoint_variant(e, base: Model, family: Sequence[Model]) -> str:
+    """The release variant an endpoint row serves.
+
+    The provider board nests the *release* slug on every row and puts the variant
+    in the model name (``Claude Sonnet 5.5 (medium)``); the per-model page's row
+    is the release's default variant.
+    """
+    match = re.search(r"\(([^()]*)\)\s*$", str(e.model_name or ""))
+    if match and match.group(1).strip():
+        label = match.group(1).strip()
+        return label[:1].upper() + label[1:]
+    for m in family:
+        if m.slug == e.model_slug:
+            return _variant_label(m) or m.slug
+    return _variant_label(base) or base.slug
+
+
 def _providers(model: str = "", host: str = "", top: int = 15,
                sort: str = "cost_per_task", fields: str = "",
                open_weights: bool | None = None, min_context: int | None = None,
@@ -5244,52 +5458,120 @@ def _providers(model: str = "", host: str = "", top: int = 15,
     sort_key = _prov_sort_key(sort)
 
     if model:
-        base = _resolve_slug(model, _models(refresh))
+        pool = _models(refresh)
+        base = _resolve_slug(model, pool)
         try:
-            endpoints = _load(f"providers_{base.slug}",
-                              loaders.provider_endpoints, base.slug, refresh=refresh)
+            endpoints = list(_load(f"providers_{base.slug}",
+                                   loaders.provider_endpoints, base.slug,
+                                   refresh=refresh))
         except (ValueError, AAFetchError):
             if _publishes_no_endpoints(base.slug):
                 return _no_endpoints_text(base)
             raise
+        for e in endpoints:
+            if not e.model_slug:
+                e.model_slug = base.slug
+        # The model page describes one variant; the provider board also carries the
+        # release's effort siblings, which can be cheaper. Aggregate them so
+        # "cheapest provider" never misses an endpoint (round-2 audit P2).
+        family = _release_family(base, pool)
+        family_slugs = {m.slug for m in family}
+        base_label = _variant_label(base) or base.slug
+        family_used = False
+        if len(family) > 1:
+            try:
+                board = list(_load("providers_board", loaders.provider_board,
+                                   refresh=refresh))
+            except (AAFetchError, ValueError):
+                board = []
+            page_hosts = {e.host for e in endpoints}
+            seen = {(e.host, _norm_alias(base_label), e.precision)
+                    for e in endpoints}
+            for e in board:
+                if e.model_slug not in family_slugs:
+                    continue
+                label = _endpoint_variant(e, base, family)
+                norm = _norm_alias(label)
+                if norm == _norm_alias(base_label) and e.host in page_hosts:
+                    # the model page already carries this variant+host row
+                    continue
+                key = (e.host, norm, e.precision)
+                if key in seen:
+                    continue
+                seen.add(key)
+                endpoints.append(e)
+                family_used = True
+        if host:
+            hl = host.lower()
+            endpoints = [e for e in endpoints if hl in (e.host or "").lower()]
         # Endpoint payloads often omit the context window; fall back to the
         # model-level value rather than rendering a misleading "-".
         ctx_filled = False
-        if base.context_tokens:
-            for e in endpoints:
-                if e.context_tokens is None:
-                    e.context_tokens = base.context_tokens
+        by_slug = {m.slug: m for m in family}
+        for e in endpoints:
+            if e.context_tokens is None:
+                rec = by_slug.get(e.model_slug) or base
+                if rec.context_tokens:
+                    e.context_tokens = rec.context_tokens
                     ctx_filled = True
         if min_context is not None:
             endpoints = [e for e in endpoints
                          if e.context_tokens is not None and e.context_tokens >= min_context]
         endpoints = _endpoint_sort(endpoints, sort_key)
         if not endpoints:
+            if host:
+                return (f"# no provider endpoints for {base.name} "
+                        f"(aa.{base.slug}) match host~{render.clean(host, None)} "
+                        "— drop the host filter")
             return (f"# no provider endpoints recorded for {base.name} (aa.{base.slug}) "
                     "— the model-page providers array was empty or all filtered out")
         creators = _creator_map(refresh)
         unknown: list[str] = []
-        cols = _cols(_PROV_COLS_MODEL, fields, _PROV_EXTRA, _PROV_IDENTITY, unknown,
-                     _PROV_IDENTITY_MAP)
+        cols = _cols(_PROV_COLS_MODEL, fields,
+                     _PROV_EXTRA + (("variant",) if family_used else ()),
+                     _PROV_IDENTITY, unknown, _PROV_IDENTITY_MAP)
         if not fields:
             cols = _with_sort_col(cols, sort_key)
-        rows = [[_endpoint_cell(e, k, creators) for k, _ in cols]
-                for e in endpoints[:n]]
+            if family_used:
+                at = next((i + 1 for i, (k, _l) in enumerate(cols)
+                           if k == "model_name"), 1)
+                cols.insert(at, ("variant", "Variant"))
+        rows = []
+        for e in endpoints[:n]:
+            label = _endpoint_variant(e, base, family) if family_used else None
+            rows.append([_endpoint_cell(e, k, creators, label) for k, _ in cols])
         count = f"{len(rows)} of {len(endpoints)} endpoints"
-        head = _header(count=count,
-                       note=f"{base.name} (aa.{base.slug}), by {sort_key}",
+        note_text = f"{base.name} (aa.{base.slug}), by {sort_key}"
+        if host:
+            note_text = (f"{base.name} (aa.{base.slug}), "
+                         f"host~{render.clean(host, None)}, by {sort_key}")
+        if family_used:
+            note_text = (f"{base.name} + release family (aa.{base.slug}), "
+                         + (f"host~{render.clean(host, None)}, " if host else "")
+                         + f"by {sort_key}")
+        head = _header(count=count, note=note_text,
                        name=f"providers_{base.slug}")
         body = _table_block(head, [lbl for _, lbl in cols], rows, trim=_fields_trim(fields),
                             identity=_identity_labels(cols))
         notes = []
         if ctx_filled:
             notes.append("context is model-level, not per-endpoint")
+        if family_used:
+            shown_labels = list(dict.fromkeys(
+                _endpoint_variant(e, base, family) for e in endpoints))
+            labels = [lbl for lbl in shown_labels
+                      if _norm_alias(lbl) != _norm_alias(base_label)]
+            if labels:
+                names = ", ".join(f"{lbl} aa.{_variant_slug_for(lbl, family)}"
+                                  for lbl in labels)
+                notes.append(f"release family included: {names} — the model "
+                             "page describes the default variant only")
         if unknown:
             notes.append(_unknown_field_note(unknown))
         note = _zero_cost_note("cost_per_task", [
-            (base.name, min((e.cost_per_task for e in endpoints
-                             if e.cost_per_task is not None), default=None),
-             bool(base.is_open_weights))])
+            (e.model_name or e.model_slug, e.cost_per_task,
+             bool((by_slug.get(e.model_slug) or base).is_open_weights))
+            for e in endpoints[:n]])
         if note:
             notes.append(note)
         if notes:
@@ -6538,8 +6820,13 @@ def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
             f"kind={kind} needs a model — pass query=<name or slug> "
             "(aa_search resolves a name to a slug)"
         )
-    n = min(max(top if isinstance(top, int) else 1, 1), 5)
-    cap_note = ""
+    requested = top if isinstance(top, int) else 1
+    # The raw leaderboard is useful for scripted spot-checks, so it accepts a
+    # wider slice than the other kinds; either way the header states the cap and
+    # the requested count instead of silently returning fewer rows.
+    cap = 25 if kind == "leaderboard" else 5
+    n = min(max(requested, 1), cap)
+    cap_note = f" (cap {cap}; {requested} requested)" if requested > cap else ""
     head = ""
     keys = _split(fields)
     cache_name = ""
@@ -6553,7 +6840,11 @@ def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
         cache_name = f"model_{base.slug}"
     elif kind == "leaderboard":
         cache_name = _lb_cache()
-        payload = [_project(_to_plain(m), keys) for m in _lb_rows(refresh)[:n]]
+        rows = _lb_rows(refresh)
+        payload = [_project(_to_plain(m), keys) for m in rows[:n]]
+        head = _header(
+            count=f"raw leaderboard · top {len(payload)} of {len(rows)}{cap_note}",
+            note="JSON, token-expensive — prefer the table tools", name=cache_name)
     elif kind == "providers":
         base = _resolve_slug(query, _models(refresh))
         cache_name = f"providers_{base.slug}"
@@ -6616,7 +6907,7 @@ def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
                                   refresh=refresh)]
 
     if not head:
-        head = _header(count=f"raw {kind} · top {n}",
+        head = _header(count=f"raw {kind} · top {n}{cap_note}",
                        note="JSON, token-expensive — prefer the table tools",
                        name=cache_name)
     elif cache_name:
