@@ -531,7 +531,8 @@ def _clear_memos() -> None:
 # leaderboard / model pages
 # --------------------------------------------------------------------------- #
 
-_LEADERBOARD_REQUIRED = ("slug", "intelligenceIndex")
+_LEADERBOARD_REQUIRED = ("release", "intelligenceIndex")
+_LEADERBOARD_LEGACY_REQUIRED = ("slug", "intelligenceIndex")
 _CHART_REQUIRED = ("chartDefaultSelected", "releaseDate", "suffix")
 #: Other per-model array shapes a chart-set page may ship instead of
 #: ``initialModels``, tried in order: the Decision-Models table on
@@ -577,6 +578,37 @@ def _release_index(payload: str) -> dict[str, dict]:
     return index
 
 
+def _release_default(entry: dict) -> str | None:
+    """The display name of a release's default variant (``modelNames[0]``)."""
+    names = entry.get("modelNames")
+    if isinstance(names, list) and names and isinstance(names[0], str):
+        return names[0]
+    return None
+
+
+def _released_slug(rec: dict, index: dict[str, dict]) -> str | None:
+    """The variant slug a nested-release row should carry, when the release says.
+
+    AA's release array lists the default variant first in ``modelNames``; that
+    variant owns the bare release slug (``gemini-4-carbon`` is its *High* variant,
+    ``claude-opus-5-5`` its *Max*), exactly as the model pages publish it.  Rows
+    without a sibling entry keep the suffix-based derivation.
+    """
+    release = rec.get("release")
+    if not isinstance(release, dict) or not release.get("slug"):
+        return None
+    base = str(release["slug"])
+    entry = index.get(base)
+    if entry is None:
+        return None
+    default = _release_default(entry)
+    if default is None:
+        return None
+    if rec.get("name") == default:
+        return base
+    return normalize._qualified_slug(base, rec.get("suffix"))
+
+
 def _join_release(model: Model, index: dict[str, dict], by_length: list[str]) -> None:
     """Fill ``release_date``/``creator_slug`` on a leaderboard row from siblings."""
     entry = index.get(model.slug)
@@ -589,6 +621,8 @@ def _join_release(model: Model, index: dict[str, dict], by_length: list[str]) ->
         return
     if model.release_date is None:
         model.release_date = entry.get("releaseDate")
+    if entry.get("deprecated"):
+        model.deprecated = True
     if model.creator_slug is None:
         creator = entry.get("creator")
         if isinstance(creator, dict):
@@ -600,12 +634,48 @@ def parse_leaderboard(text: str) -> list[Model]:
 
     Rows are joined to the payload's sibling release array so ``release_date``
     and ``creator_slug`` are populated (the metrics array carries neither).
+    Two row shapes are accepted: the current one, where a row carries a nested
+    ``release`` object and only the *release* slug (the variant is derived from
+    its ``suffix``), and the legacy flat one with a top-level ``slug``.
+    ``intelligenceIndex`` is present on every row but may be ``null`` until the
+    model is scored, so the gate checks key presence, never a value.
     """
     payload = flight.payload(text)
-    records = flight.find_array(payload, _LEADERBOARD_REQUIRED)
+    records = None
+    for required in (_LEADERBOARD_REQUIRED, _LEADERBOARD_LEGACY_REQUIRED):
+        try:
+            records = flight.find_array(payload, required)
+            break
+        except LookupError:
+            continue
+    if records is None:
+        raise LookupError(
+            "no leaderboard row array in payload (expected rows carrying "
+            "'intelligenceIndex' plus a slug at the top level or under 'release')"
+        )
     index = _release_index(payload)
     by_length = sorted(index, key=len, reverse=True)
-    models = [normalize.from_leaderboard(rec) for rec in records if isinstance(rec, dict)]
+    dicts = [rec for rec in records if isinstance(rec, dict)]
+    models = [normalize.from_leaderboard(rec) for rec in dicts]
+    # The release array names each release's default variant first; that variant
+    # owns the bare release slug (the model pages publish it that way), so this
+    # corrects the suffix-only derivation used when the sibling is missing.
+    if index:
+        for rec, model in zip(dicts, models):
+            slug = _released_slug(rec, index)
+            if slug:
+                model.slug = slug
+    # Two rows can only collide if AA publishes the same release+variant twice,
+    # but a duplicate slug would silently merge rows in every slug-keyed map
+    # downstream.
+    seen: dict[str, int] = {}
+    for model in models:
+        if not model.slug:
+            continue
+        count = seen.get(model.slug, 0) + 1
+        seen[model.slug] = count
+        if count > 1:
+            model.slug = f"{model.slug}-{count}"
     if index:
         for model in models:
             _join_release(model, index, by_length)

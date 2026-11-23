@@ -315,6 +315,19 @@ def test_chart_reads_aa_published_time_per_task(chart_records):
     assert m.speed["time_per_task"] == pytest.approx(789.2354834132094)
 
 
+def test_chart_reads_flat_speed_scalars() -> None:
+    """The slimmer pool rows publish speed as bare numbers, not nested maps."""
+    m = normalize.from_chart({
+        "slug": "x", "name": "X",
+        "outputSpeed": 62.1, "timeToFirstToken": 12.59,
+        "timeToFirstAnswerToken": 12.59, "endToEndResponseTime": 30.0,
+    })
+    assert m.speed["tps"] == pytest.approx(62.1)
+    assert m.speed["ttft"] == pytest.approx(12.59)
+    assert m.speed["ttfa"] == pytest.approx(12.59)
+    assert m.speed["e2e"] == pytest.approx(30.0)
+
+
 def test_derived_time_per_task_is_the_per_eval_mean(chart_records):
     m = normalize.from_chart(chart_records["claude-opus-5-5"])
     times = [r["timePerTask"] for r in m.per_eval if r["timePerTask"] is not None]

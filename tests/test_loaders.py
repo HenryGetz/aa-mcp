@@ -50,6 +50,79 @@ def test_leaderboard_count() -> None:
     assert all(m.slug for m in models)
 
 
+def test_leaderboard_release_slug_shape() -> None:
+    """Current rows nest the slug under ``release``; the variant comes from suffix."""
+    models = loaders.parse_leaderboard(_text("leaderboard_release_v6.rsc"))
+    assert len(models) == 30
+    assert all(m.slug for m in models)
+    assert len({m.slug for m in models}) == len(models)  # slug-keyed maps stay 1:1
+    by_slug = {m.slug: m for m in models}
+    # AA's default Max variant carries the bare release slug, other efforts a suffix
+    assert by_slug["claude-sonnet-5-5"].intelligence == pytest.approx(54.54133407109)
+    assert by_slug["claude-sonnet-5-5-medium"].intelligence == pytest.approx(
+        30.8195522148431)
+    assert {"gemini-4-carbon", "gemini-4-carbon-medium",
+            "gemini-4-carbon-low"} <= set(by_slug)
+    # the release's first ``modelNames`` entry is its default variant, and that
+    # variant owns the bare release slug (Gemini 4 Carbon's default is High)
+    assert by_slug["gemini-4-carbon"].name == "Gemini 4 Carbon (High)"
+    # a variant without a suffix keeps the release slug
+    assert by_slug["jt-35b-flash"].intelligence is None
+    assert by_slug["apodex-1-1"].slug == "apodex-1-1"
+    # the sibling release array still supplies date / creator / deprecation
+    base = by_slug["claude-sonnet-5-5"]
+    assert base.release_date and base.creator_slug
+    assert by_slug["claude-sonnet-5-5-medium"].release_date == base.release_date
+    assert by_slug["mistral-large-4-medium"].deprecated is True
+    # the scores map and the renamed speed columns reach the row
+    assert by_slug["gemini-4-carbon"].evals["hleDiamond"] == pytest.approx(0.691)
+    assert base.speed["tps"] is not None and base.speed["ttft"] is not None
+    # no top-level slug anywhere in this shape; parsing must not fall back to blanks
+    assert not any(m.slug.startswith("-") for m in models)
+
+
+def test_null_index_rows_are_retained_but_unscored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = _text("leaderboard_release_v6.rsc")
+
+    def fake_get(url: str, name: str, **kwargs):
+        return fetch.Fetched(text=text, path=Path("/fake-cache/v6-leaderboard"),
+                             fetched_at=1_700_000_123.0, cached=False, stale=False)
+
+    monkeypatch.setattr(loaders.fetch, "get", fake_get)
+    models = loaders.leaderboard()
+    assert len(models) == 30
+    assert sum(1 for m in models if m.intelligence is not None) == 26
+    by_slug = {m.slug: m for m in models}
+    assert by_slug["jt-35b-flash"].intelligence is None
+    assert by_slug["jt-35b-flash"].name == "JT-35B-Flash"
+
+
+def test_nested_release_payload_below_the_scored_floor_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = [
+        {"release": {"slug": f"m{i}", "name": f"M{i}"}, "name": f"M{i}",
+         "suffix": None, "intelligenceIndex": 40.0 if i < 10 else None}
+        for i in range(40)
+    ]
+    path = _cache_fetch(monkeypatch, "0:" + json.dumps(records), "leaderboard.rsc")
+    monkeypatch.setattr(loaders, "_LEADERBOARD_MEMO", None)
+    with pytest.raises(fetch.AAFetchError) as ei:
+        loaders.leaderboard()
+    message = str(ei.value)
+    assert "10/40" in message and str(loaders._MIN_SCORED_MODELS) in message
+    assert ei.value.path == path
+
+
+def test_legacy_flat_leaderboard_shape_still_parses() -> None:
+    models = loaders.parse_leaderboard(_text("leaderboard.rsc"))
+    by_slug = {m.slug: m for m in models}
+    assert by_slug["claude-opus-5-5-high"].creator_slug == "anthropic"
+    assert by_slug["claude-opus-5-5-high"].speed["tps"] is not None
+
+
 def test_model_chart_set() -> None:
     models = loaders.parse_chart(_text("model_page_chart.rsc"))
     slugs = [m.slug for m in models]

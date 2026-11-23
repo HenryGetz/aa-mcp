@@ -29,13 +29,14 @@ task, and they are **not** interchangeable:
   across the 189 rich records carrying both, it differs by a median of −6.7 %
   (range −25.7 % … +10.6 %), so it must never be preferred.
 
-``time_per_task`` is ``None`` on surfaces that do not publish it (leaderboard
-rows, most legacy objects) and ``time_per_task_derived`` is ``None`` when no
-per-evaluation rows carry a ``timePerTask``.
+``time_per_task`` is ``None`` on surfaces that do not publish it (most legacy
+objects) and ``time_per_task_derived`` is ``None`` when no per-evaluation rows
+carry a ``timePerTask``.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, fields
 
 from aa_mcp import catalog
@@ -166,6 +167,66 @@ def _release(rec) -> tuple[str | None, str | None]:
     if isinstance(r, dict):
         return r.get("name"), r.get("deprecatedTo")
     return None, None
+
+
+#: AA's row ``suffix`` is the human variant label ("Medium, Default Fallback",
+#: "Non-reasoning", "High, Based on gpt-oss-120b").  The leaderboard used to ship
+#: a ready-made variant slug; since the v5.1 rollout the row only carries
+#: ``release.slug`` plus this suffix, so the variant slug is derived from the two.
+_DEFAULT_FALLBACK_RE = re.compile(r",\s*default\s+fallback\s*$", re.IGNORECASE)
+_BASED_ON_RE = re.compile(r",?\s*based\s+on\b.*$", re.IGNORECASE)
+
+
+def _suffix_slug(suffix) -> str:
+    """Normalize a row ``suffix`` into the slug fragment AA would publish."""
+    if not suffix:
+        return ""
+    text = _DEFAULT_FALLBACK_RE.sub("", str(suffix))
+    text = _BASED_ON_RE.sub("", text)
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+def _qualified_slug(base: str, suffix) -> str:
+    """``base`` plus the normalized suffix, even for the ``Max`` variant."""
+    base = str(base or "").strip()
+    text = _suffix_slug(suffix)
+    return f"{base}-{text}" if base and text else base
+
+
+def _variant_slug(base: str, suffix) -> str:
+    """Release slug plus a normalized variant suffix (``base`` when it is default).
+
+    Without the sibling release array this assumes AA's common default: the
+    ``Max`` variant carries the bare release slug (``claude-opus-5-5``) and every
+    other effort/reasoning mode is qualified (``claude-opus-5-5-high``,
+    ``qwen3-5-2b-non-reasoning``).  The trailing ", Default Fallback" marker and
+    ", Based on …" notes are qualifiers, not part of the identity.  The loader
+    corrects the default variant from the release's own ``modelNames`` order,
+    which is authoritative for releases whose default is not ``Max``.
+    """
+    base = str(base or "").strip()
+    if not base or not suffix:
+        return base
+    if _suffix_slug(suffix) in ("", "max"):
+        return base
+    return _qualified_slug(base, suffix)
+
+
+def _leaderboard_slug(rec) -> str:
+    """The variant slug of a leaderboard row (top-level ``slug`` or derived).
+
+    Legacy rows carry ``slug`` itself.  Current rows nest the release slug under
+    ``release`` and carry only a ``suffix`` for the variant.
+    """
+    slug = rec.get("slug")
+    if slug:
+        return str(slug)
+    release = rec.get("release")
+    if isinstance(release, dict):
+        base = release.get("slug")
+        if base:
+            return _variant_slug(str(base), rec.get("suffix"))
+    return ""
 
 
 _LEADER_EVAL_KEYS = (
@@ -362,8 +423,10 @@ def from_leaderboard(rec: dict) -> Model:
     """Build a :class:`Model` from a ``/leaderboards/models`` row."""
     if not isinstance(rec, dict):
         raise TypeError(f"from_leaderboard expects a mapping, got {type(rec).__name__}")
-    slug = rec.get("slug") or ""
+    slug = _leaderboard_slug(rec)
     name = rec.get("name") or slug
+    release = rec.get("release")
+    release = release if isinstance(release, dict) else {}
     creator, creator_slug = _creator(rec)
     evals = _evals(rec, _LEADER_EVAL_KEYS)
     # AA v5.0 ships per-eval values as one ``scores`` map keyed by eval slug
@@ -383,7 +446,8 @@ def from_leaderboard(rec: dict) -> Model:
         short_name=rec.get("shortName") or name,
         creator=creator,
         creator_slug=creator_slug,
-        release_date=rec.get("releaseDate"),
+        release_date=_get(rec, "releaseDate", "release_date")
+        or release.get("releaseDate"),
         deprecated=bool(rec.get("deprecated")),
         deprecated_to=None,
         is_reasoning=bool(rec.get("isReasoning")),
@@ -405,9 +469,13 @@ def from_leaderboard(rec: dict) -> Model:
         evals=evals,
         pricing=_pricing(rec),
         speed={
-            "tps": _num(rec.get("medianOutputTokensPerSecond")),
-            "ttft": _num(rec.get("medianTimeToFirstTokenSeconds")),
-            "ttfa": _num(rec.get("medianTimeToFirstAnswerTokenSeconds")),
+            # v5.1 renamed the median speed columns; the legacy names are still
+            # read first so cached/older payloads keep working.
+            "tps": _num(_get(rec, "medianOutputTokensPerSecond", "outputSpeed")),
+            "ttft": _num(_get(rec, "medianTimeToFirstTokenSeconds",
+                              "timeToFirstToken")),
+            "ttfa": _num(_get(rec, "medianTimeToFirstAnswerTokenSeconds",
+                              "timeToFirstAnswerToken")),
             "e2e": _num(rec.get("medianEndToEndResponseTimeSeconds")),
             "reasoning_s": _num(rec.get("medianReasoningTimeSeconds")),
             "out_tokens_per_task": None,
@@ -419,8 +487,9 @@ def from_leaderboard(rec: dict) -> Model:
             "ttft_q25": _num(rec.get("quartile25TimeToFirstTokenSeconds")),
             "ttft_q75": _num(rec.get("quartile75TimeToFirstTokenSeconds")),
             "ttft_p95": _num(rec.get("percentile95TimeToFirstTokenSeconds")),
-            # neither number exists on this surface (no chart data, no per-eval rows)
-            "time_per_task": None,
+            # AA's own aggregate where the row publishes it; the derived mean
+            # needs per-eval rows, which this surface does not carry.
+            "time_per_task": _num(rec.get("intelligenceIndexTimePerTask")),
             "time_per_task_derived": None,
         },
         cost_per_task=_num(rec.get("intelligenceIndexCostPerTask")),
@@ -486,17 +555,41 @@ def _mean_per_eval_time(per_eval: list[dict] | None) -> float | None:
     return sum(times) / len(times) if times else None
 
 
+def _flat_total(value) -> float | None:
+    """A total published either as ``{"total": x}`` or as a bare number."""
+    if isinstance(value, dict):
+        return _num(value.get("total"))
+    return _num(value)
+
+
+def _first_num(*values) -> float | None:
+    for value in values:
+        number = _num(value)
+        if number is not None:
+            return number
+    return None
+
+
 def _speed_chart(rec, per_eval: list[dict] | None = None) -> dict[str, float | None]:
-    ts = rec.get("timescaleData") or {}
-    e2e = rec.get("endToEndResponseTime") or {}
-    ttfa = rec.get("timeToFirstAnswerToken") or {}
+    ts = rec.get("timescaleData")
+    ts = ts if isinstance(ts, dict) else {}
+    e2e = rec.get("endToEndResponseTime")
+    e2e = e2e if isinstance(e2e, dict) else {}
     out_tokens = rec.get("intelligenceIndexOutputTokensPerTask")
     out_val = _num(out_tokens.get("output")) if isinstance(out_tokens, dict) else None
     return {
-        "tps": _num(ts.get("medianOutputSpeed")),
-        "ttft": _num(ts.get("medianTimeToFirstChunk")),
-        "ttfa": _num(ttfa.get("total")),
-        "e2e": _num(e2e.get("total")),
+        # the wide chart records nest these in ``timescaleData``; the slimmer
+        # per-model pool rows publish the same medians as flat scalars.
+        "tps": _first_num(ts.get("medianOutputSpeed"),
+                          rec.get("outputSpeed"),
+                          rec.get("medianOutputTokensPerSecond")),
+        "ttft": _first_num(ts.get("medianTimeToFirstChunk"),
+                           rec.get("timeToFirstToken"),
+                           rec.get("medianTimeToFirstTokenSeconds")),
+        "ttfa": _first_num(_flat_total(rec.get("timeToFirstAnswerToken")),
+                           rec.get("medianTimeToFirstAnswerTokenSeconds")),
+        "e2e": _first_num(_flat_total(rec.get("endToEndResponseTime")),
+                          rec.get("medianEndToEndResponseTimeSeconds")),
         "reasoning_s": _num(e2e.get("reasoning")),
         "out_tokens_per_task": out_val,
         "reasoning_tokens": _num(rec.get("reasoningTokens")),
