@@ -187,22 +187,75 @@ def _cache_file(name: str):
     return None
 
 
+_SHAPE_MARKERS = ("no JSON array of dicts containing keys",
+                  "no leaderboard row array in payload",
+                  "was missing from the embedded",
+                  "unexpected payload",
+                  "payload format changed",
+                  "no model records")
+
+
+def _shape_changed(message: str) -> bool:
+    """Whether a parse failure means the payload's shape changed (not a bad cache)."""
+    return any(marker in message for marker in _SHAPE_MARKERS)
+
+
 def _cache_aware(message: str, name: str) -> str:
     """Append cache-file guidance to a parse/load failure (A22/A25/A26).
 
-    A data-layer error that already names the cache file and ``refresh=true``
-    (wave A) is passed through unchanged.
+    Distinguishes a missing/unreadable cache (refresh helps) from a payload whose
+    shape changed (refresh refetches the same page and fails the same way — the
+    parser must be updated). ``AA_OFFLINE=1`` never suggests refresh.
     """
-    if "refresh=true" in message:
-        return message
+    head = message.split("\n", 1)[0]
     path = _cache_file(name)
+    offline = fetch._offline()
+    exists = path is not None and path.exists() and path.stat().st_size > 0
+    if _shape_changed(message):
+        if offline:
+            return (
+                f"{head}\n— AA_OFFLINE=1: the saved payload at {path} has a shape this "
+                "parser does not understand; refresh is unavailable offline — the "
+                "parser in loaders/normalize must be updated"
+            )
+        if exists:
+            return (
+                f"{head}\n— the cached payload at {path} exists but its shape changed "
+                "(this is not a missing or truncated download); refresh=true refetches "
+                "the same page and fails the same way — the parser in "
+                "loaders/normalize must be updated for the new shape"
+            )
+        return (
+            f"{head}\n— the live payload's shape changed; refresh=true fetches the "
+            "same page and fails the same way — the parser in loaders/normalize must "
+            "be updated for the new shape"
+        )
+    if "refresh=true" in message:
+        if not offline:
+            return message
+        kept = [line for line in message.splitlines()
+                if "refresh" not in line.lower()]
+        return "\n".join(kept) + (
+            "\n— AA_OFFLINE=1: refresh is unavailable; fix the cached payload at "
+            f"{path} by hand (or unset AA_OFFLINE for a live fetch)")
     if path is not None:
+        if offline:
+            return (
+                f"{message}\n"
+                f"— AA_OFFLINE=1: the cached payload {path} is missing or unreadable "
+                "and no network fetch is allowed; save a browser-rendered copy there "
+                "or unset AA_OFFLINE to download it"
+            )
         return (
             f"{message}\n"
-            f"— cached payload {path} looks wrong or truncated: retry with "
+            f"— cached payload {path} is missing or unreadable: retry with "
             "refresh=true to re-download it, or delete the file and retry; if you "
             "have a good copy saved there, AA_OFFLINE=1 uses it without a network call"
         )
+    if offline:
+        return (f"{message}\n— AA_OFFLINE=1: no cached payload for {name!r} under "
+                f"{fetch.cache_dir()} and no network fetch is allowed; save a "
+                "browser-rendered copy there or unset AA_OFFLINE")
     return (
         f"{message}\n"
         f"— no cached payload for {name!r} under {fetch.cache_dir()}: retry with "
@@ -592,6 +645,20 @@ def _fetch_text(exc: AAFetchError) -> str:
     """Fetch failure plus the loader's hint and the cache/refresh recovery path."""
     hint = getattr(exc, "hint", "")
     text = f"{exc}\n— {hint}" if hint else str(exc)
+    if _shape_changed(text):
+        head = text.split("\n", 1)[0]
+        if fetch._offline():
+            return (f"{head}\n— AA_OFFLINE=1: the saved payload has a shape this "
+                    "parser does not understand; refresh is unavailable offline — "
+                    "the parser in loaders/normalize must be updated")
+        return (f"{head}\n— the payload's shape changed; refresh=true fetches the "
+                "same page and fails the same way — the parser in loaders/normalize "
+                "must be updated for the new shape")
+    if fetch._offline():
+        kept = [line for line in text.splitlines() if "refresh" not in line.lower()]
+        return "\n".join(kept) + (
+            "\n— AA_OFFLINE=1: refresh is unavailable; check the cached file under "
+            f"{fetch.cache_dir()} or unset AA_OFFLINE for a live fetch")
     if "refresh=true" not in text:
         text += ("\n— retry with refresh=true to re-download it, or serve it from a "
                  "warm cache (AA_OFFLINE=1 uses an existing file without a network call)")
@@ -654,6 +721,28 @@ _ALL_FIELD_TOKENS = {"all", "*", "everything", "every", "allfields"}
 def _is_wildcard_field(name: str) -> bool:
     text = str(name).strip()
     return text in ("*", "**") or _norm_alias(text) in _ALL_FIELD_TOKENS
+
+
+def _ratio_key_for(name: str) -> str | None:
+    """The column key for a ``score/$`` alias (``intel/$``), else ``None``."""
+    try:
+        ratio = _ratio_metric(name)
+    except Exception:  # a malformed alias must never break column selection
+        return None
+    return ratio[0] if ratio else None
+
+
+def _ratio_columns(names: Sequence[str]) -> list[tuple[str, str]]:
+    """``[(key, label)]`` for every ratio alias in a ``fields=`` list."""
+    out: list[tuple[str, str]] = []
+    for name in names:
+        try:
+            ratio = _ratio_metric(name)
+        except Exception:
+            continue
+        if ratio:
+            out.append(ratio)
+    return out
 
 
 def _fields_trim(fields: Any) -> bool:
@@ -742,11 +831,15 @@ def _cols(default: Sequence[tuple[str, str]], fields: Any,
     surface += [(e, _col_label(e)) for e in extra]
     out: list[tuple[str, str]] = []
     keys: set[str] = set()
+    ratio_labels = {key: label for key, label in _ratio_columns(names)}
     for name in names:
         key = _identity_key(name, surface, identity_map)
         label = None
         if key is not None:
             label = next((lbl for k, lbl in surface if k == key), None)
+        elif _ratio_key_for(name):
+            key = _ratio_key_for(name)
+            label = ratio_labels.get(key)
         else:
             try:
                 key = _metric_key(name, "field")
@@ -778,7 +871,9 @@ def _model_cells(model: Model, cols: Sequence[tuple[str, str]],
         if key == "value" and value_of is not None:
             cells.append(render.num(value_of(model), 1))
         elif key == "value":
-            cells.append(render.num(select.lookup(model, key), 1))
+            cells.append(render.num(_value_of(model, "intelligence"), 1))
+        elif key.startswith("value:"):
+            cells.append(render.num(_value_of(model, key.split(":", 1)[1]), 1))
         else:
             cells.append(_fmt(key, select.lookup(model, key)))
     return cells
@@ -868,6 +963,9 @@ def _filter_desc(
     min_context: int | None,
     released_after: str,
     include_deprecated: bool,
+    max_price_in: float | None = None,
+    max_price_out: float | None = None,
+    vision: bool | None = None,
 ) -> str:
     parts = ["incl. deprecated" if include_deprecated else "active only"]
     if creator:
@@ -882,6 +980,12 @@ def _filter_desc(
         parts.append(f"intel>={min_intelligence:g}")
     if max_cost_per_task is not None:
         parts.append(f"$/task<={max_cost_per_task:g}")
+    if max_price_in is not None:
+        parts.append(f"in $/M<={max_price_in:g}")
+    if max_price_out is not None:
+        parts.append(f"out $/M<={max_price_out:g}")
+    if vision is not None:
+        parts.append("vision" if vision else "no vision")
     if min_speed is not None:
         parts.append(f"tok/s>={min_speed:g}")
     if max_ttft is not None:
@@ -891,6 +995,76 @@ def _filter_desc(
     if released_after:
         parts.append(f"released>={render.clean(released_after, None)}")
     return ", ".join(parts)
+
+
+#: How many per-model pages a modality join may read. AA publishes modality only
+#: per model page (the leaderboard row and provider-board `features` carry none),
+#: so a bounded fan-out is the cheapest honest source; one page's chart set already
+#: documents ~28 models (~20 leaderboard variants).
+_MODALITY_FANOUT = 6
+
+
+def _modality_map(models: Sequence[Model], refresh: bool = False) -> dict[
+        str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    """``slug -> (input, output) modalities`` from up to N model pages.
+
+    No bulk payload carries modality: the leaderboard row has no modality keys,
+    the provider board's ``features`` has none, and the eval chart pages carry
+    none. Each ``/models/<slug>`` chart set does carry ``inputModality*`` /
+    ``outputModality*`` for ~28 models, so the join reads a bounded number of
+    pages of the highest-value models (best Intelligence Index first) and reports
+    how many rows it covered.
+    """
+    known: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    ordered = sorted(models, key=lambda m: (
+        -(m.intelligence if m.intelligence is not None else -1.0), m.slug))
+    tried = 0
+    for m in ordered:
+        if tried >= _MODALITY_FANOUT:
+            break
+        if m.slug in known:
+            continue
+        try:
+            pages = _load(f"model_{m.slug}", loaders.model, m.slug, refresh=refresh)
+        except (AAFetchError, ValueError, LookupError):
+            continue
+        tried += 1
+        for page_model in pages.values():
+            if page_model.modalities_in or page_model.modalities_out:
+                known.setdefault(page_model.slug, (
+                    tuple(page_model.modalities_in),
+                    tuple(page_model.modalities_out)))
+    return known
+
+
+def _apply_modality(scope: Sequence[Model], known: Mapping[
+        str, tuple[tuple[str, ...], tuple[str, ...]]]) -> None:
+    """Attach known modalities to the models in ``scope`` (no-op when unknown)."""
+    for model in scope:
+        modalities = known.get(model.slug)
+        if modalities:
+            ins, outs = modalities
+            model.modalities_in = tuple(ins)
+            model.modalities_out = tuple(outs)
+
+
+def _modality_in(
+    known: Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]], slug: str
+) -> tuple[str, ...]:
+    """Input modalities for ``slug`` (empty when unknown)."""
+    pair = known.get(slug)
+    return pair[0] if pair else ()
+
+
+def _modality_note(known: Mapping[str, tuple[tuple[str, ...], tuple[str, ...]]],
+                   total: int, vision: bool | None = None) -> str:
+    """One honest coverage line for a modality join (`-` is unknown, not "no")."""
+    covered = sum(1 for m in known)
+    text = (f"modality known for {min(covered, total)} of {total} tracked rows "
+            f"(per-model pages; unknown rows are excluded from a modality filter)")
+    if vision is None:
+        text += " — '-' means unknown, not \"no vision\""
+    return text
 
 
 def _missing_notes(
@@ -1051,7 +1225,33 @@ def _is_index_key(key: str) -> bool:
     return key.startswith("capabilities.") or key in ("coding", "agentic")
 
 
+def _deprecated_only_text(key: str, label: str) -> str:
+    """Explain a metric AA publishes only on deprecated models — and name a live one."""
+    live = {
+        "math500": ("AIME 2025", "aime25"),
+        "mmluPro": ("GPQA Diamond", "gpqa"),
+    }.get(key)
+    text = (f"{label!r} is only published for deprecated models in the current "
+            "source — no active model carries it.")
+    if live:
+        text += (f"\n— use a live alternative instead: {live[0]} "
+                 f"(aa_leaderboard sort={live[1]})")
+    text += ("\n— include_deprecated=true ranks the deprecated rows (they are "
+             "clearly marked Depr in the reply)")
+    return text
+
+
 def _no_rank_text(key: str, label: str) -> str:
+    if key == "math500":
+        return (
+            "'Math-500' is deprecated-only in the current source: no active model "
+            "carries it, and the deprecated values the rich overlay used to hold "
+            "are no longer served on any free page.\n"
+            "— use the live math ranking instead: AIME 2025 "
+            "(aa_leaderboard sort=aime25; aa_benchmark_leaderboard benchmark=aime25)"
+        )
+    if key == "mmluPro":
+        return _deprecated_only_text(key, label)
     constituents = catalog.API_ONLY_INDEXES.get(key)
     if constituents:
         return (
@@ -1841,6 +2041,9 @@ def _pareto(
     name: str = "",
     reasoning: bool | None = None,
     max_cost_per_task: float | None = None,
+    max_price_in: float | None = None,
+    max_price_out: float | None = None,
+    vision: bool | None = None,
     min_speed: float | None = None,
     max_ttft: float | None = None,
     released_after: str = "",
@@ -1875,6 +2078,8 @@ def _pareto(
         reasoning=reasoning,
         min_intelligence=min_intelligence,
         max_cost_per_task=max_cost_per_task,
+        max_price_in=max_price_in,
+        max_price_out=max_price_out,
         min_speed=min_speed,
         max_ttft=max_ttft,
         min_context=min_context,
@@ -1886,6 +2091,7 @@ def _pareto(
         min_intelligence=min_intelligence, max_cost_per_task=max_cost_per_task,
         min_speed=min_speed, max_ttft=max_ttft, min_context=min_context,
         released_after=released_after, include_deprecated=include_deprecated,
+        max_price_in=max_price_in, max_price_out=max_price_out, vision=vision,
     )
     if not models:
         return f"# no models match {where} — drop one filter"
@@ -2015,8 +2221,8 @@ _LB_COLS = [
     ("intelligence", "Intel"), ("cost_per_task", "$/Task"),
     ("tps", "tok/s"), ("ttft", "TTFT"), ("context_tokens", "Ctx"),
 ]
-#: fields accepted in `fields=` that are not leaderboard metrics (shown as `-`)
-_LB_EXTRA = ("precision",)
+#: fields accepted in `fields=` that are not leaderboard metrics (shown as `-`
+_LB_EXTRA = ("precision", "modalities_in", "modalities_out")
 #: identity columns always rendered, before any requested `fields=`
 _LB_IDENTITY = [("name", "Model"), ("slug", "Slug")]
 _BENCH_IDENTITY = [("name", "Model"), ("slug", "Slug")]
@@ -2041,6 +2247,9 @@ def _leaderboard(
     reasoning: bool | None = None,
     min_intelligence: float | None = None,
     max_cost_per_task: float | None = None,
+    max_price_in: float | None = None,
+    max_price_out: float | None = None,
+    vision: bool | None = None,
     min_speed: float | None = None,
     max_ttft: float | None = None,
     min_context: int | None = None,
@@ -2073,6 +2282,7 @@ def _leaderboard(
             score=sort_key, x="cost_per_task", top=n, creator=creator, name=name,
             open_weights=open_weights, reasoning=reasoning,
             min_intelligence=min_intelligence, max_cost_per_task=max_cost_per_task,
+            max_price_in=max_price_in, max_price_out=max_price_out, vision=vision,
             min_speed=min_speed, max_ttft=max_ttft, min_context=min_context,
             released_after=released_after, include_deprecated=include_deprecated,
             refresh=refresh, fields=fields,
@@ -2117,6 +2327,8 @@ def _leaderboard(
         reasoning=reasoning,
         min_intelligence=min_intelligence,
         max_cost_per_task=max_cost_per_task,
+        max_price_in=max_price_in,
+        max_price_out=max_price_out,
         min_speed=min_speed,
         max_ttft=max_ttft,
         min_context=min_context,
@@ -2128,15 +2340,21 @@ def _leaderboard(
         min_intelligence=min_intelligence, max_cost_per_task=max_cost_per_task,
         min_speed=min_speed, max_ttft=max_ttft, min_context=min_context,
         released_after=released_after, include_deprecated=include_deprecated,
+        max_price_in=max_price_in, max_price_out=max_price_out, vision=vision,
     )
     cache_name = _lb_cache()
     explicit = any((creator, name, open_weights is not None, reasoning is not None,
                     min_intelligence is not None, max_cost_per_task is not None,
+                    max_price_in is not None, max_price_out is not None,
+                    vision is not None,
                     min_speed is not None, max_ttft is not None,
                     min_context is not None, released_after))
 
     if not models:
         out = f"# no models match {where} — drop one filter"
+        if modality_known:
+            out += "\n" + render.note([_modality_note(
+                modality_known, len(all_models), vision)])
         if sort_key in _CAPABILITY_KEYS:
             # the coverage describes the dataset, so it survives a filter that
             # matches nothing (the empty-result note alone would hide it)
@@ -2148,12 +2366,33 @@ def _leaderboard(
     # A sort key the merged source cannot supply must explain itself, never
     # silently reorder (the rich overlay already covers capability/Elo fields).
     if not any(select.lookup(m, sort_key) is not None for m in models):
+        if explicit:
+            # A name/filter matched rows (e.g. a deprecated release that only the
+            # release array names) but the sort key has no value for any of them:
+            # list the matches honestly instead of claiming the whole metric is
+            # absent.  Nothing is ranked, so the header says so.
+            unknown_fields: list[str] = []
+            cols = _cols(_LB_COLS, fields, _LB_EXTRA, _LB_IDENTITY, unknown_fields)
+            shown = models[:n]
+            head = _header(
+                count=f"{len(shown)} shown of {len(models)} matching "
+                      f"({tracked} tracked)",
+                note=f"{label} has no ranked values for these rows; listing "
+                     "identity only, " + where,
+                name=cache_name, source_label=_prov_label(rich_used))
+            body = _table_block(
+                head, [label for _, label in cols],
+                [_model_cells(m, cols, None) for m in shown],
+                trim=_fields_trim(fields), identity=_identity_labels(cols))
+            extra_notes = ([_unknown_field_note(unknown_fields)]
+                           if unknown_fields else [])
+            if modality_known:
+                extra_notes.append(_modality_note(
+                    modality_known, len(all_models), vision))
+            return body + ("\n" + render.note(extra_notes) if extra_notes else "")
         if (not include_deprecated
                 and any(select.lookup(m, sort_key) is not None for m in all_models)):
-            raise ValueError(
-                f"{label!r} is only published for deprecated models in the current "
-                "source.\n— re-run with include_deprecated=true to rank them."
-            )
+            raise ValueError(_deprecated_only_text(sort_key, label))
         raise ValueError(_no_rank_text(sort_key, label))
 
     footnotes: list[str] = _missing_notes(all_models, [
@@ -2163,6 +2402,8 @@ def _leaderboard(
         ("ttft", "TTFT", max_ttft is not None),
         ("context_tokens", "context window", min_context is not None),
     ])
+    if modality_known:
+        footnotes.append(_modality_note(modality_known, len(all_models), vision))
     value_of: Callable[[Model], float | None] | None = None
     unknown: list[str] = []
     if mode == "value":
@@ -2202,6 +2443,10 @@ def _leaderboard(
 
     if not fields and n > 15:
         cols = [c for c in cols if c[0] != "creator"]
+
+    # `cost` is $/task on this surface; keep the unit visible next to `out $/M`.
+    cols = [(key, "$/Task" if key == "cost_per_task" and label == "Cost" else label)
+            for key, label in cols]
 
     shown = models[:n]
     if sort_key in ("ttft", "ttfa", "e2e"):
@@ -2893,6 +3138,9 @@ def _ratio_metric(name: str) -> tuple[str, str] | None:
     silently read as the plain score (G4).
     """
     text = str(name).strip()
+    # a wildcard spelling (``intel/$*``) is the same ratio alias, not a miss
+    if text.endswith("*"):
+        text = text.rstrip("*").strip()
     low = text.lower()
     axis = ""
     if low.endswith("/$") or low.endswith("/usd"):
@@ -3673,6 +3921,12 @@ def _arena_compare(entries: Sequence[_ArenaEntry], metrics_arg: str, view: str,
             f"source: aa_media board={boards[0]}"
             + (" (and others)" if len(boards) > 1 else ""),
         ]
+    if (any(_is_board_metric_key(key) for key, _label in specs)
+            or any(_is_board_metric_key(key) for key in _split(metrics_arg))):
+        footnotes.insert(
+            0, "board rows are their own namespace (a TTS voice / STT host / search "
+               "API is not a language model) — these are the board's own columns, "
+               "not language-model scores")
     where_board = (_board_source(boards[0]) if board_kind
                    else f"aa_media board={boards[0]}")
     if filters:
@@ -3702,6 +3956,11 @@ def _arena_compare(entries: Sequence[_ArenaEntry], metrics_arg: str, view: str,
         )
     foot = render.note(footnotes)
     return _fit_compare(head, labels, rows, foot)
+
+
+def _is_board_metric_key(key: str) -> bool:
+    """Whether ``key`` is a speech/search board column (not a language-model score)."""
+    return key.startswith(("tts", "stt", "search")) and catalog.metric(key) is not None
 
 
 def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
@@ -3785,6 +4044,44 @@ def _compare(queries: list[str] = (), metrics: str = "", view: str = "table",
                 unknown_metrics.append(name)
     elif not metrics_arg:
         requested = list(_COMPARE_ROWS if compact else _COMPARE_FULL)
+    board_keys = [key for key, _label in requested if _is_board_metric_key(key)]
+    if board_keys:
+        # Speech/TTS/search columns are board rows, never language-model metrics.
+        # Route a board-metric comparison to the board's own table and refuse an
+        # unresolvable mix explicitly (board rows are their own namespace).
+        groups: list[list[_ArenaEntry]] = []
+        missing: list[str] = []
+        for raw in names:
+            _name_board, name = _arena_split_board(raw)
+            cands, _partial = _arena_candidates(name)
+            if cands:
+                groups.append(cands)
+            else:
+                missing.append(name)
+        labels = ", ".join(label for key, label in requested if key in board_keys)
+        if groups and not missing:
+            try:
+                picks, chosen, others = _arena_pick_board(groups, board_keys)
+                return _arena_compare(picks, metrics_arg, view_arg, filters,
+                                      chosen=chosen, other_boards=others)
+            except ValueError as exc:
+                route_note = str(exc)
+        else:
+            route_note = ("not every name is on a speech/search board: "
+                          + ", ".join(missing))
+        entry_boards = sorted({
+            e.board for e in _arena_entries()
+            for mk, _lbl, _mv, _u in e.metrics if mk in board_keys})
+        head = _header(count=f"{len(names)} names · board metrics {labels}")
+        return head + "\n" + render.note([
+            "board rows are their own namespace (a TTS voice / STT host / search "
+            "API is not a language model) — a board column is compared only with "
+            "rows from the same board, never against language models",
+            f"{labels} live on: {', '.join(entry_boards) or 'the speech/search boards'}"
+            " — list a board with aa_media board=<key>, or compare two names that "
+            "both appear on it",
+            route_note,
+        ])
     # The first-party model-page value wins for the dual-sourced speed metrics, so
     # `ttft` and `time_to_first_token` — and `all` — can never disagree (G1).
     rich = (lower in ("all", "benchmarks")
@@ -4172,7 +4469,11 @@ def _rankable_coverage(r: Any, lb: Sequence[Model], merged: Sequence[Model]) -> 
     rich = sum(1 for m in merged if _rankable_value(m, key) is not None)
     if rich:
         return f"rich dataset ({rich}/{len(merged)})"
-    extra = _extra_score_models(key)
+    try:
+        extra = _extra_score_models(key)
+    except (AAFetchError, LookupError, ValueError):
+        # a static catalog must still render when a live source is unreachable
+        extra = []
     if extra:
         source, joined, published = _index_page_meta(key)
         if not source:
@@ -4234,8 +4535,15 @@ def _benchmarks(query: str = "", domain: str = "", tag: str = "",
             f"({len(rows_all)}), or try domain=<name>"
         )
 
-    lb = _lb_rows()
-    merged = _models_state(rich=True)[0]
+    static_note = ""
+    try:
+        lb = _lb_rows()
+        merged = _models_state(rich=True)[0]
+    except (AAFetchError, LookupError, ValueError) as exc:
+        # This is a static catalog; an unparseable live pool must not hide it.
+        lb, merged = [], []
+        static_note = (f"live model pool unavailable ({str(exc).splitlines()[0]}) — "
+                       "coverage below is the static catalog only")
     show_measures = verbose or len(entries) <= 10
     headers = ["Thing", "Kind", "Unit", "Coverage", "How to query"]
     if show_measures:
@@ -4257,6 +4565,8 @@ def _benchmarks(query: str = "", domain: str = "", tag: str = "",
         f"domain={render.clean(domain, None)}" if domain else "",
         f"tag={render.clean(tag, None)}" if tag else "") if part)
     count = f"{len(table_rows)} of {len(rows_all)} rankables"
+    if static_note:
+        note = " · ".join(part for part in (note, static_note) if part)
     head = _header(count=count, note=note, name=cache_name)
     body = _table_block(head, headers, table_rows)
     if not show_measures:
@@ -4310,6 +4620,8 @@ def _benchmark_leaderboard(
             return False
         if min_intelligence is not None and (m.intelligence is None
                                              or m.intelligence < min_intelligence):
+            return False
+        if m.deprecated and not include_deprecated:
             return False
         return not (not include_estimates and m.estimated)
 
@@ -4445,6 +4757,13 @@ def _benchmark_leaderboard(
     if not fields and n > 15:
         cols = [c for c in cols if c[0] != "creator"]
 
+    deprecated_present = any(m.deprecated for m, _ in pairs)
+    if deprecated_present and not any(c[0] == "deprecated" for c in cols):
+        cols.append(("deprecated", "Depr"))
+    source_note += (" · deprecated rows included (include_deprecated=true; "
+                    "false hides them)") if include_deprecated else (
+                    " · deprecated rows hidden (include_deprecated=false)")
+
     # The ``*`` marks an AA-estimated value. Only the Intelligence Index carries
     # that flag today (``intelligenceIndexIsEstimated``), so a published Openness /
     # capability / benchmark score must never inherit it from the model's
@@ -4463,6 +4782,8 @@ def _benchmark_leaderboard(
                              + ("*" if starred and m.estimated else ""))
             elif col == "benchmark":
                 cells.append(bench.label)
+            elif col == "deprecated":
+                cells.append("yes" if m.deprecated else "")
             elif col in ("ci_lower", "ci_upper", "ci"):
                 if col == "ci":
                     cells.append("-" if lo is None and hi is None
@@ -5774,11 +6095,27 @@ def _project(obj: Any, keys: Sequence[str]) -> Any:
     return {k: v for k, v in obj.items() if k in keys}
 
 
+def _provider_board_matches(rows: Sequence[Any], query: str) -> list[Any]:
+    """Rows of the provider board whose model name/slug matches every query token."""
+    tokens = [t for t in re.split(r"[^a-z0-9]+", query.lower()) if t]
+    if not tokens:
+        return list(rows)
+    out = []
+    for row in rows:
+        hay = _norm_alias(f"{getattr(row, 'model_slug', '')} "
+                          f"{getattr(row, 'model_name', '')}")
+        if all(t in hay for t in tokens):
+            out.append(row)
+    return out
+
+
 def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
          refresh: bool = False) -> str:
     if kind not in _RAW_KINDS:
         raise ValueError(f"unknown kind {_q(kind)} — valid: {', '.join(_RAW_KINDS)}")
     n = min(max(top if isinstance(top, int) else 1, 1), 5)
+    cap_note = ""
+    head = ""
     keys = _split(fields)
     cache_name = ""
     payload: Any
@@ -5801,9 +6138,27 @@ def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
                                   refresh=refresh)[:n]]
     elif kind == "providers_board":
         cache_name = "providers_board"
-        payload = [_project(_to_plain(e), keys)
-                   for e in _load("providers_board", loaders.provider_board,
-                                  refresh=refresh)[:n]]
+        rows = list(_load("providers_board", loaders.provider_board,
+                          refresh=refresh))
+        matched = rows
+        label = ""
+        if str(query).strip():
+            matched = _provider_board_matches(rows, str(query))
+            if not matched:
+                known = sorted({e.model_slug for e in rows if e.model_slug})
+                hint = ", ".join(known[:5]) or "none"
+                raise ValueError(
+                    f"no provider-board row matches {_q(query)} — the board nests "
+                    "the variant slug under release; known examples: " + hint +
+                    "\n— resolve the model name with aa_search first")
+            label = f" · {render.clean(query, None)}"
+        cap = 25
+        n = min(max(top if isinstance(top, int) else 1, 1), cap)
+        if top > cap:
+            cap_note = f" (cap {cap}; {top} requested)"
+        payload = [_project(_to_plain(e), keys) for e in matched[:n]]
+        head = (f"# raw providers_board{label} · top {len(payload)} of "
+                f"{len(matched)} matching{cap_note}")
     elif kind == "media":
         board = _norm_board(query or "text_to_image")
         if board not in loaders.MEDIA_BOARDS:
@@ -5835,9 +6190,12 @@ def _raw(kind: str, query: str = "", fields: str = "", top: int = 1,
                    for c in _load("eval_catalog", loaders.eval_catalog,
                                   refresh=refresh)]
 
-    head = _header(count=f"raw {kind} · top {n}",
-                   note="JSON, token-expensive — prefer the table tools",
-                   name=cache_name)
+    if not head:
+        head = _header(count=f"raw {kind} · top {n}",
+                       note="JSON, token-expensive — prefer the table tools",
+                       name=cache_name)
+    elif cache_name:
+        head += f"\n- cache: `{cache_name}`"
     return _fit_json(head, payload)
 
 
@@ -5924,6 +6282,9 @@ def aa_leaderboard(
     reasoning: bool | None = None,
     min_intelligence: float | None = None,
     max_cost_per_task: float | None = None,
+    max_price_in: float | None = None,
+    max_price_out: float | None = None,
+    vision: bool | None = None,
     min_speed: float | None = None,
     max_ttft: float | None = None,
     min_context: int | None = None,
@@ -5936,13 +6297,17 @@ def aa_leaderboard(
     The tool for "smartest / cheapest / fastest / best value right now".
     mode=rank | value (intelligence per $/task) | frontier (Pareto curve with its
     knee, same as aa_pareto). sort=<metric alias or benchmark key>; fields=<comma
-    list> for exact columns. refresh=true bypasses the cache. Resolve uncertain
-    names with aa_search first. The header labels coverage and ties.
+    list> for exact columns; max_price_in/max_price_out cap $/1M input/output
+    tokens; vision=true keeps models whose modality is known to include image and
+    states the coverage (unknown rows are excluded, never treated as "no vision").
+    refresh=true bypasses the cache. Resolve uncertain names with aa_search first.
+    The header labels coverage and ties.
     """
     return _leaderboard(
         mode=mode, sort=sort, fields=fields, top=top, creator=creator, name=name,
         open_weights=open_weights, reasoning=reasoning,
         min_intelligence=min_intelligence, max_cost_per_task=max_cost_per_task,
+        max_price_in=max_price_in, max_price_out=max_price_out, vision=vision,
         min_speed=min_speed, max_ttft=max_ttft, min_context=min_context,
         released_after=released_after, include_deprecated=include_deprecated,
         refresh=refresh,
@@ -6043,7 +6408,8 @@ def aa_benchmark_leaderboard(
     homepage panel); the header says which and warns when it is not a full
     leaderboard (chart sets cover ~5-32 models). fields=<comma list> for exact
     columns; include_estimates=false drops AA-estimated (``*``) scores;
-    refresh=true bypasses the cache.
+    include_deprecated=false hides deprecated rows (the default keeps them and
+    adds a Depr column + header note); refresh=true bypasses the cache.
     """
     return _benchmark_leaderboard(
         benchmark, top=top, fields=fields, creator=creator,

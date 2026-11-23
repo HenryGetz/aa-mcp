@@ -605,8 +605,9 @@ def test_leaderboard_v5_omniscience_columns_land_on_their_own_keys(
         _OMNI_NON_HALLUCINATION)
     # the index is the row's own ``omniscience`` field, not a scores-map key
     assert m.indices["omniscience"] == pytest.approx(41.2)
-    # the leaderboard scores map has no hallucination-rate key: it stays absent
-    assert "omniscienceHallucinationRate" not in m.evals
+    # v5 dropped the published rate but ships its complement; the rate is derived
+    assert m.evals["omniscienceHallucinationRate"] == pytest.approx(
+        1 - _OMNI_NON_HALLUCINATION)
 
 
 def test_leaderboard_v5_non_hallucination_is_the_complement_not_the_rate():

@@ -440,6 +440,11 @@ def from_leaderboard(rec: dict) -> Model:
             value = _num(raw_value)
             if key is not None and value is not None:
                 evals.setdefault(key, value)
+    # v5 dropped the hallucination-rate column but still publishes its complement
+    # (`omniscience-non-hallucination`). Derive the rate instead of reporting no data.
+    non_hallucination = evals.get("omniscienceNonHallucination")
+    if non_hallucination is not None:
+        evals.setdefault("omniscienceHallucinationRate", 1.0 - non_hallucination)
     return Model(
         slug=slug,
         name=name,

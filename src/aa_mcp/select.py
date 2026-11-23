@@ -101,6 +101,8 @@ def filter_models(
     reasoning=None,
     min_intelligence=None,
     max_cost_per_task=None,
+    max_price_in=None,
+    max_price_out=None,
     min_speed=None,
     max_ttft=None,
     min_context=None,
@@ -114,6 +116,8 @@ def filter_models(
         for key, value in (
             ("min_intelligence", min_intelligence),
             ("max_cost_per_task", max_cost_per_task),
+            ("max_price_in", max_price_in),
+            ("max_price_out", max_price_out),
             ("min_speed", min_speed),
             ("max_ttft", max_ttft),
             ("min_context", min_context),
@@ -122,6 +126,8 @@ def filter_models(
     }
     min_intelligence = numeric["min_intelligence"]
     max_cost_per_task = numeric["max_cost_per_task"]
+    max_price_in = numeric["max_price_in"]
+    max_price_out = numeric["max_price_out"]
     min_speed = numeric["min_speed"]
     max_ttft = numeric["max_ttft"]
     min_context = numeric["min_context"]
@@ -159,6 +165,14 @@ def filter_models(
             m.cost_per_task is None or m.cost_per_task > max_cost_per_task
         ):
             continue
+        if max_price_in is not None:
+            v = m.pricing.get("in")
+            if v is None or v > max_price_in:
+                continue
+        if max_price_out is not None:
+            v = m.pricing.get("out")
+            if v is None or v > max_price_out:
+                continue
         if min_speed is not None:
             v = m.speed.get("tps")
             if v is None or v < min_speed:

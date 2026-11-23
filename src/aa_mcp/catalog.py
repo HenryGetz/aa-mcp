@@ -680,7 +680,9 @@ _SOURCE_HINTS: dict[str, str] = {
     "gdpvalNormalized": "none",
     "livecodebench": "rich",
     "mlcrOverall": "rich",
-    "omniscienceHallucinationRate": "rich",
+    # derived on the leaderboard row: 1 - omniscienceNonHallucination (v5.0 dropped
+    # the published rate, the non-hallucination column still ships)
+    "omniscienceHallucinationRate": "leaderboard",
     "openness": "rich",
     "terminalBenchScience": "rich",
     "capabilities.financeAndAccounting": "rich",

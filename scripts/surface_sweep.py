@@ -92,21 +92,45 @@ class Panel(NamedTuple):
 
 
 def _deprecated_slug(refresh: bool = False) -> str:
-    """The best-scoring model AA marks deprecated.
+    """The best-scoring model AA marks deprecated that still has a page.
 
-    The leaderboard's metrics array carries only active rows (every row has a
-    ``deprecated`` key and every one is false today); the deprecated ones live in
-    the chart-shaped rich dataset, which is also where the chart-backed rankings
-    read them from.
+    The metrics array carries only active rows; the deprecated ones live in the
+    leaderboard payload's sibling **release** array (335 releases on 2026-11-23)
+    and, when AA serves it, the rich dataset. v5 no longer serves the rich
+    dataset, so the release array is the fallback that keeps this panel honest.
     """
+    candidates: list = []
     try:
-        rows = loaders.rich_dataset(refresh=refresh)
+        candidates = [m for m in loaders.rich_dataset(refresh=refresh)
+                      if m.deprecated and m.intelligence is not None]
     except Exception as exc:  # a live-source hiccup must not stop the sweep
-        print(f"panel: no deprecated slug ({type(exc).__name__}: {exc})",
+        print(f"panel: rich dataset unavailable ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+    if candidates:
+        return max(candidates, key=lambda m: (m.intelligence, m.slug)).slug
+    try:
+        releases = [m for m in loaders.deprecated_releases(refresh=refresh)
+                    if m.slug]
+    except Exception as exc:
+        print(f"panel: no deprecated release list ({type(exc).__name__}: {exc})",
               file=sys.stderr)
         return ""
-    deprecated = [m for m in rows if m.deprecated and m.intelligence is not None]
-    return max(deprecated, key=lambda m: (m.intelligence, m.slug)).slug if deprecated else ""
+    # Prefer a release whose detail page still renders; probe only a few so a
+    # long list of retired pages does not stall the sweep.
+    releases.sort(key=lambda m: (m.release_date or "", m.slug), reverse=True)
+    for model in releases[:8]:
+        if _legacy_page(model.slug) or _page_served(model.slug):
+            return model.slug
+    return releases[0].slug if releases else ""
+
+
+def _page_served(slug: str) -> bool:
+    """Whether ``/models/<slug>`` parses as a model page (chart set or currentModel)."""
+    try:
+        loaders.model(slug)
+    except Exception:
+        return False
+    return True
 
 
 def _legacy_page(slug: str) -> bool:
@@ -614,6 +638,34 @@ EXPECTED_FAILURES: dict[tuple[str, str], str] = {
     ("aa_benchmark_leaderboard", '{"benchmark": "harveyLabBreakdown"}'):
         "Harvey Breakdown is a container benchmark: same honest error naming "
         "harveyCriteriaPass (E2)",
+    # v5 dropped the rich dataset these five probes only ever read. They are
+    # genuinely gone from every live surface (all six _KNOWN_RICH probes fail),
+    # so the calls explain the absence instead of faking coverage; see
+    # tests/test_server.py::test_truly_gone_fields_are_documented_as_needing_the_rich_overlay
+    ("aa_leaderboard", '{"sort": "e2e", "top": 2}'):
+        "end-to-end response time was rich-dataset only; the live leaderboard "
+        "snapshot ships no e2e column, so the tool names the model-page path",
+    ("aa_leaderboard", '{"sort": "params_b", "top": 2}'):
+        "parameter count was rich-dataset only; no live leaderboard column or "
+        "model page in the current payload publishes it",
+    ("aa_leaderboard", '{"sort": "when2call", "top": 2}'):
+        "When2Call lived in the rich dataset / decision chart set; both are gone "
+        "in v5 and the eval chart set carries no per-model value",
+    ("aa_pareto", '{"x": "index_total_cost", "top": 3}'):
+        "the whole-index cost was rich-dataset only (per-model cost breakdown); "
+        "the live model pages no longer carry it",
+    ("aa_pareto", '{"x": "out_tokens_per_task", "top": 3}'):
+        "output tokens per index task was rich-dataset only; the live payloads "
+        "carry no such column",
+    ("aa_pareto", '{"x": "params_b", "top": 3}'):
+        "parameter count was rich-dataset only; absent from the live sources",
+    ("aa_pareto", '{"x": "index_total_cost", "include_all": true}'):
+        "same as index_total_cost: the rich-dataset cost breakdown is not served",
+    ("aa_pareto", '{"x": "out_tokens_per_task", "creator": "openai", "top": 2}'):
+        "same as out_tokens_per_task: not published on any live surface",
+    ("aa_pareto", '{"x": "Cost to Run the Intelligence Index", "top": 2}'):
+        "the human label resolves to index_total_cost, whose rich-dataset source "
+        "is gone",
 }
 
 
@@ -717,10 +769,14 @@ def _expand_obj(value, slots: dict[str, str]):
 
 
 def _expand(mapping, panel: Panel):
-    """Expand every placeholder in a ``{(tool, args-json): value}`` table."""
+    """Expand every placeholder in a ``{(tool, args-json): value}`` table.
+
+    Keys are re-serialised with ``sort_keys=True`` so they compare equal to
+    ``_case_key`` regardless of the hand-written key order in the tables above.
+    """
     slots = _slots(panel)
-    return {(tool, _expand_arg(args, slots)): value
-            for (tool, args), value in mapping.items()}
+    return {(tool, json.dumps(json.loads(_expand_arg(args, slots)), sort_keys=True)):
+            value for (tool, args), value in mapping.items()}
 
 
 def _result_text(result) -> str:

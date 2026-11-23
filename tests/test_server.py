@@ -2731,3 +2731,164 @@ def test_server_main_entrypoint_guard(monkeypatch, capsys):
     assert out == ""
     assert "aa-mcp-cli" in err
     assert "stdio MCP server" in err
+
+
+# --------------------------------------------------------------------------- #
+# data-truthfulness regressions (round 8 live audit)
+# --------------------------------------------------------------------------- #
+
+def test_leaderboard_price_filters_and_ratio_fields(fake, monkeypatch):
+    """price caps are real filters; ``intel/$`` is a column; Cost keeps its unit."""
+    monkeypatch.setattr(
+        server, "_modality_map",
+        lambda models, refresh=False: {
+            "alpha": (("text", "image"), ("text",)),
+            "beta": (("text",), ("text",)),
+        })
+    filtered = server._leaderboard(max_price_out=2.5, top=5)
+    assert "Alpha One" in filtered
+    assert "Gamma Three" not in filtered
+
+    fields = server._leaderboard(fields="name,creator,intel,cost,intel/$", top=5)
+    assert "Intel/$" in fields
+    assert "$/Task" in fields
+
+    vision = server._leaderboard(vision=True, top=5)
+    assert "Alpha One" in vision and "Beta Two" not in vision
+    assert "modality known for" in vision
+
+
+def test_raw_providers_board_honours_query_and_top(fake, monkeypatch):
+    import dataclasses
+
+    def endpoint(slug: str, name: str):
+        kwargs = {f.name: None for f in dataclasses.fields(loaders.Endpoint)}
+        kwargs.update(model_slug=slug, model_name=name, host="h",
+                      function_calling=False, json_mode=False,
+                      source="providers_board")
+        return loaders.Endpoint(**kwargs)
+
+    rows = [endpoint("gemini-4-carbon", "Gemini 4 Carbon"), endpoint(
+        "gemini-4-carbon", "Gemini 4 Carbon (high)"), endpoint("qwen-3", "Qwen 3")]
+    monkeypatch.setattr(server, "_load", lambda *a, **k: rows)
+
+    out = server._raw("providers_board", query="gemini-4-carbon", top=10)
+    assert "top 2 of 2 matching" in out
+    assert "Qwen 3" not in out
+
+    with pytest.raises(ValueError, match="no provider-board row"):
+        server._raw("providers_board", query="not-a-model")
+
+
+def test_benchmark_leaderboard_marks_and_optionally_hides_deprecated(monkeypatch):
+    dep = _model("old-model", "Old Model", deprecated=True, evals={"gpqa": 0.9})
+    act = _model("new-model", "New Model", evals={"gpqa": 0.5})
+    for name in ("_lb_rows", "_rich_models"):
+        monkeypatch.setattr(server, name, lambda refresh=False: [act, dep])
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: ([act, dep], rich))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
+
+    shown = server._benchmark_leaderboard("gpqa", top=5)
+    assert "| Depr |" in shown and "deprecated rows included" in shown
+
+    hidden = server._benchmark_leaderboard("gpqa", top=5, include_deprecated=False)
+    assert "deprecated rows hidden" in hidden
+    assert "Old Model" not in hidden
+
+
+def test_deprecated_only_math_error_names_aime(monkeypatch):
+    dep = _model("old-model", "Old Model", deprecated=True, evals={"math500": 0.9})
+    act = _model("new-model", "New Model", evals={"gpqa": 0.8})
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: [act, dep])
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: ([act, dep], rich))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
+    with pytest.raises(ValueError) as exc:
+        server._leaderboard(sort="math500", top=5)
+    msg = str(exc.value)
+    assert "AIME 2025" in msg and "deprecated" in msg.lower()
+
+
+def test_explicit_filter_lists_matches_with_no_ranked_value(monkeypatch):
+    """A named deprecated release still gets listed, not a misleading 'no data'."""
+    dep = _model("old-model", "Old Model", deprecated=True, evals={"math500": 0.9})
+    act = _model("new-model", "New Model", intelligence=50.0)
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: [act, dep])
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: ([act, dep], rich))
+    monkeypatch.setattr(server, "_include_deprecated_rows",
+                        lambda rows, refresh=False: list(rows))
+    monkeypatch.setattr(server, "_lb_cache", lambda: "leaderboard")
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
+    out = server._leaderboard(name="old-model", include_deprecated=True, top=2)
+    assert "Old Model" in out
+    assert "no ranked values" in out
+
+
+def test_model_digest_survives_flat_speed_rows(monkeypatch):
+    """``sections=specs,benchmarks`` must not assume nested speed/chart dicts."""
+    m = _model("alpha", "Alpha One", speed={"tps": 84.6, "ttft": 1.2})
+    monkeypatch.setattr(server, "_models", lambda refresh=False: [m])
+    monkeypatch.setattr(server, "_models_state",
+                        lambda refresh=False, rich=True: ([m], rich))
+    monkeypatch.setattr(server, "_lb_rows", lambda refresh=False: [m])
+    monkeypatch.setattr(server, "_load", lambda name, fn, *a, **k: {})
+    monkeypatch.setattr(server, "_fresh", lambda name: (None, False))
+    monkeypatch.setattr(server, "_source_key", lambda: "rsc")
+    out = server.aa_model(query="alpha", sections="specs,benchmarks")
+    assert "Alpha One" in out
+
+
+def test_compare_all_flat_rows_does_not_crash(fake):
+    out = server._compare(["alpha", "beta"], metrics="all")
+    assert "Metric" in out
+
+
+def test_parse_error_text_tells_shape_change_from_bad_cache(tmp_path, monkeypatch):
+    path = tmp_path / "leaderboard.rsc"
+    path.write_text("{}")
+    monkeypatch.setattr(server, "_cache_file", lambda name: path)
+    monkeypatch.setattr(server.fetch, "_offline", lambda: False)
+    text = server._cache_aware(
+        "no JSON array of dicts containing keys ['intelligenceIndex'] in payload",
+        "leaderboard")
+    assert "must be updated" in text and "refresh=true refetches" in text
+
+    monkeypatch.setattr(server.fetch, "_offline", lambda: True)
+    offline = server._cache_aware(
+        "no JSON array of dicts containing keys ['intelligenceIndex'] in payload",
+        "leaderboard")
+    assert "AA_OFFLINE=1" in offline and "refresh=true" not in offline
+
+
+def test_benchmarks_works_without_a_parseable_model_pool(monkeypatch):
+    def boom(*a, **k):
+        raise server.AAFetchError("no leaderboard row array in payload")
+
+    monkeypatch.setattr(server, "_lb_rows", boom)
+    monkeypatch.setattr(server, "_cache_file", lambda name: None)
+    out = server._benchmarks()
+    assert "rankables" in out
+    assert "static catalog only" in out
+
+
+def test_truly_gone_fields_are_documented_as_needing_the_rich_overlay():
+    """The 11 sweep probes that only the retired rich overlay carried."""
+    import pathlib
+    script = (pathlib.Path(__file__).parent.parent / "scripts" /
+              "surface_sweep.py").read_text()
+    gone = ("e2e", "params_b", "when2call", "index_total_cost",
+            "out_tokens_per_task")
+    for key in gone:
+        if key in ("index_total_cost", "out_tokens_per_task"):
+            assert key in server._PARETO_AXES
+            assert key in server._OVERLAY_AXES or f'"{key}"' in script
+            continue
+        # documented in the sweep's EXPECTED bucket with the live reason
+        assert f'"{key}"' in script and "rich-dataset" in script

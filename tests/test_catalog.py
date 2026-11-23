@@ -230,7 +230,7 @@ def test_source_hint_values_are_known_and_counted():
 
     hints = Counter(b.source_hint for b in catalog.BENCHMARKS.values())
     assert set(hints) <= {"leaderboard", "rich", "api", "chart", "none"}
-    assert hints["leaderboard"] == 19
+    assert hints["leaderboard"] == 20  # + omniscienceHallucinationRate (derived in v5)
     # "none" = AA publishes the composite only through its paid data API, or
     # stopped publishing the metric (gdpvalNormalized since Intelligence Index v5.0)
     assert hints["none"] == 3

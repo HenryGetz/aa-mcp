@@ -1262,25 +1262,67 @@ def leaderboard(refresh: bool = False) -> list[Model]:
     return _leaderboard_rsc(refresh=refresh)
 
 
+def deprecated_releases(refresh: bool = False) -> list[Model]:
+    """Deprecated releases from the leaderboard payload's sibling release array.
+
+    v5 stops publishing the rich dataset, so the only free record of the 335
+    deprecated sibling releases is the leaderboard's release array (``slug``,
+    ``releaseDate``, ``deprecated``, ``creator``). The metrics array carries only
+    active variants, so these rows have no scores — they exist for name/slug
+    resolution and the deprecation marker, never for ranking.
+    """
+    try:
+        got = fetch.get(url(SOURCE_URLS["leaderboard"]), "leaderboard",
+                        refresh=refresh)
+        index = _release_index(flight.payload(got.text))
+    except (AAFetchError, LookupError, ValueError):
+        return []
+    out: list[Model] = []
+    for slug, entry in index.items():
+        if not entry.get("deprecated") or not slug:
+            continue
+        creator = entry.get("creator")
+        creator_name = creator.get("name") if isinstance(creator, dict) else None
+        creator_slug = creator.get("slug") if isinstance(creator, dict) else None
+        out.append(Model(
+            slug=slug, name=slug, short_name=slug, creator=creator_name,
+            creator_slug=creator_slug, release_date=entry.get("releaseDate"),
+            deprecated=True, deprecated_to=entry.get("deprecatedTo"),
+            is_reasoning=False, is_open_weights=False, effort=None, params_b=None,
+            active_params_b=None, context_tokens=None, license=None, license_url=None,
+            weights_url=None, knowledge_cutoff=None, size_class=None,
+            modalities_in=(), modalities_out=(), intelligence=None, estimated=False,
+            indices={}, evals={}, pricing={}, speed={}, cost_per_task=None,
+            cost_breakdown=None, per_eval_cost=None, source="release-list",
+        ))
+    return out
+
+
 def model_pool(refresh: bool = False) -> list[Model]:
-    """Every model AA publishes a page for: active rows plus the rich dataset.
+    """Every model AA publishes a page for: active rows plus deprecated releases.
 
     The leaderboard snapshot tracks the **active** variants only (275 rows, none
-    deprecated), while the ~719-record rich dataset embedded in model pages also
-    carries the deprecated ones (444 on 2026-10-31).  A name query must resolve
-    against the union, otherwise a deprecated slug is unreachable even though its
-    page still renders (audit D3).
+    deprecated) and the rich dataset is gone, so the deprecated releases come
+    from the payload's sibling release array (``deprecated_releases``). A name
+    query must resolve against the union, otherwise a deprecated slug is
+    unreachable even though its page still renders (audit D3).
 
-    Shared fields take the leaderboard value (the live snapshot); the rich record
-    fills in everything else.  Active rows keep leaderboard order, rich-only rows
-    follow.  Callers that must hide deprecated models filter the resolved result
-    (``include_deprecated=false`` is a presentation choice, never a resolution
-    restriction).
+    Shared fields take the leaderboard value (the live snapshot); the rich record,
+    when present, fills in everything else. Active rows keep leaderboard order,
+    deprecated and rich-only rows follow. Callers that must hide deprecated models
+    filter the resolved result (``include_deprecated=false`` is a presentation
+    choice, never a resolution restriction).
     """
     lb = leaderboard(refresh)
     rich = rich_dataset(refresh)
     if not rich:
-        return list(lb)
+        out = list(lb)
+        seen = {m.slug for m in out}
+        for model in deprecated_releases(refresh):
+            if model.slug not in seen:
+                out.append(model)
+                seen.add(model.slug)
+        return out
     overlay = {m.slug: m for m in rich}
     out: list[Model] = []
     seen: set[str] = set()
@@ -1295,16 +1337,72 @@ def model_pool(refresh: bool = False) -> list[Model]:
     return out
 
 
+_VARIANT_SUFFIXES = ("-reasoning", "-xhigh", "-x-high", "-high", "-medium",
+                     "-low", "-max", "-minimal", "-thinking", "-non-reasoning")
+
+
+def _page_slug_candidates(slug: str) -> list[str]:
+    """Page slugs to try for a variant slug, exact first, then stripped qualifiers.
+
+    AA publishes variant rows (``gemma-4-31b-reasoning``) whose detail page lives
+    at the base release slug (``/models/gemma-4-31b``). Strip the known effort /
+    reasoning qualifiers and numeric duplicate suffixes one at a time; the last
+    candidate is the base release slug. The exact slug is always first, so a real
+    page slug never changes behaviour, and the caller's error still names it.
+    """
+    out = [slug]
+    current = slug
+    for _ in range(4):
+        changed = False
+        for suffix in _VARIANT_SUFFIXES:
+            if current.endswith(suffix) and len(current) > len(suffix):
+                current = current[: -len(suffix)]
+                if current and current not in out:
+                    out.append(current)
+                changed = True
+                break
+        if not changed:
+            match = re.search(r"-\d+$", current)
+            if match and match.start() > 0:
+                current = current[: match.start()]
+                if current not in out:
+                    out.append(current)
+                changed = True
+        if not changed:
+            break
+    return out
+
+
 def model(slug: str, refresh: bool = False) -> dict[str, Model]:
     """Chart set embedded in ``/models/<slug>`` as ``{slug: Model}``.
 
     The page's ``initialModels`` chart set is used, falling back to the legacy
-    ``currentModel`` object, and the requested slug is always a key.
+    ``currentModel`` object, and the requested slug is always a key. A variant
+    slug whose own page 404s falls back to the base release page (see
+    :func:`_page_slug_candidates`).
     """
-    path = SOURCE_URLS["model"].format(slug=slug)
-    name = f"model_{slug}"
+    candidates = _page_slug_candidates(slug)
+    first_error: BaseException | None = None
+    for candidate in candidates:
+        path = SOURCE_URLS["model"].format(slug=candidate)
+        name = f"model_{candidate}"
+        try:
+            got = fetch.get(url(path), name, refresh=refresh)
+        except AAFetchError as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+        out = _parse_model_page(slug, candidate, got, path, refresh)
+        if out is not None:
+            return out
+    if first_error is not None:
+        raise first_error
+    raise ValueError(f"no model page for {slug!r}")
 
-    got = fetch.get(url(path), name, refresh=refresh)
+
+def _parse_model_page(slug: str, candidate: str, got, path: str,
+                      refresh: bool = False) -> dict[str, Model] | None:
+    """Parse one fetched model page; ``None`` when it does not carry the model."""
     key = (str(got.path), got.fetched_at)
     if not refresh:
         memo = _MODEL_MEMO.get(key)
@@ -1319,17 +1417,17 @@ def model(slug: str, refresh: bool = False) -> dict[str, Model]:
     _validate(chart, path=got.path, url=url(path))
     for record in chart:
         out.setdefault(record.slug, record)
-    if slug not in out:
+    if candidate not in out:
         legacy = parse_legacy_model(got.text)
         if legacy is not None:
             _validate([legacy], path=got.path, url=url(path))
             out.setdefault(legacy.slug, legacy)
+    if candidate not in out:
+        return None
+    # The requested variant slug is always a key (the page's own record stands in
+    # for it), so callers keyed on the leaderboard row still find a record.
     if slug not in out:
-        raise ValueError(
-            f"{url(path)}: model {slug!r} was missing from the embedded chart set "
-            f"({len(out)} records) and the page carried no matching 'currentModel' "
-            f"object (legacy/deprecated page). {_refresh_note(got.path, url(path))}"
-        )
+        out[slug] = out[candidate]
     _MODEL_MEMO.put(key, out)
     return out
 
@@ -1353,13 +1451,34 @@ def _pick_name(*candidates) -> str | None:
     return None
 
 
+def _pick_num(*values) -> float | None:
+    """First finite number in any of the supported shapes (flat or ``{"median": …}``)."""
+    for value in values:
+        if isinstance(value, dict):
+            value = (value.get("median") if value.get("median") is not None
+                     else value.get("total") if value.get("total") is not None
+                     else value.get("totalTime"))
+        number = _num(value)
+        if number is not None:
+            return number
+    return None
+
+
 def _endpoint(rec: dict, source: str) -> Endpoint:
     host = _as_dict(rec.get("host"))
     model = _as_dict(rec.get("model"))
     pricing = _as_dict(rec.get("pricing"))
     perf = _as_dict(rec.get("performance"))
     features = _as_dict(rec.get("features"))
-    model_slug = _clean(model.get("slug")) or ""
+    # The per-model providers page (2026-11) publishes the endpoint measurements
+    # flat on the record under `headline`, not under `performance`.
+    headline = _as_dict(rec.get("headline"))
+    # The provider *board* nests the model's release slug (``model.release.slug``)
+    # while the per-model providers array publishes ``model.slug``; accept both so
+    # a board row can be joined back to a model (audit: every board row shipped "").
+    release = _as_dict(model.get("release"))
+    model_slug = (_clean(model.get("slug")) or _clean(release.get("slug"))
+                  or _clean(rec.get("modelSlug")) or "")
     model_name = (
         _pick_name(
             rec.get("label"),
@@ -1389,33 +1508,42 @@ def _endpoint(rec: dict, source: str) -> Endpoint:
         cache_read=_num(pricing.get("cacheHitPrice")),
         cache_write=_num(pricing.get("cacheWritePrice")),
         cache_hit_discount=_num(pricing.get("cacheHitDiscountPercent")),
-        cost_per_task=_cost_per_task(perf),
-        tps=_num(
-            perf.get("medianOutputTokensPerSecond")
-            if perf.get("medianOutputTokensPerSecond") is not None
-            else _dig(perf, "outputSpeed", "median")
-        ),
-        ttft=_num(
-            perf.get("medianTimeToFirstTokenSeconds")
-            if perf.get("medianTimeToFirstTokenSeconds") is not None
-            else _dig(perf, "timeToFirstToken", "median")
-        ),
-        e2e=_num(
-            perf.get("medianEndToEndResponseTimeSeconds")
-            if perf.get("medianEndToEndResponseTimeSeconds") is not None
-            else _dig(perf, "endToEndResponseTime", "totalTime")
-        ),
+        # The per-model providers array publishes `performance.intelligenceIndexCostPerTask`;
+        # the board publishes the same quantity as `pricing.costPerTask`. Read both.
+        cost_per_task=next(
+            (value for value in (_cost_per_task(perf),
+                                 _cost_per_task(rec),
+                                 _num(pricing.get("costPerTask")),
+                                 _num(perf.get("costPerTask")))
+             if value is not None), None),
+        # The board publishes these as flat scalars (`performance.outputSpeed`,
+        # `timeToFirstToken`); the per-model array nests them under `.median`,
+        # and the current providers page puts them under `headline`.
+        tps=_pick_num(perf.get("medianOutputTokensPerSecond"),
+                      perf.get("outputSpeed"),
+                      headline.get("outputSpeed")),
+        ttft=_pick_num(perf.get("medianTimeToFirstTokenSeconds"),
+                       perf.get("timeToFirstToken"),
+                       headline.get("timeToFirstToken")),
+        e2e=_pick_num(perf.get("medianEndToEndResponseTimeSeconds"),
+                      perf.get("endToEndResponseTime"),
+                      headline.get("endToEndResponseTime")),
         function_calling=bool(
             rec.get("functionCalling", features.get("functionCalling"))
         ),
         json_mode=bool(rec.get("jsonMode", features.get("jsonMode"))),
-        openai_compatible=_opt_bool(features.get("openaiCompatible")),
+        openai_compatible=_opt_bool(features.get("openaiCompatible")
+                                    if features.get("openaiCompatible") is not None
+                                    else host.get("openaiCompatible")),
         context_tokens=_int(
-            features.get("contextWindowTokens")
-            if features.get("contextWindowTokens") is not None
-            else model.get("contextWindowTokens")
+            next((value for value in (
+                features.get("contextWindowTokens"),
+                model.get("contextWindowTokens"),
+                rec.get("contextWindowTokens")) if value is not None), None)
         ),
-        intelligence=_num(model.get("intelligenceIndex")),
+        intelligence=_num(model.get("intelligenceIndex")
+                          if model.get("intelligenceIndex") is not None
+                          else rec.get("intelligenceIndex")),
         source=source,
     )
 
@@ -1449,21 +1577,36 @@ def parse_provider_board(text: str) -> list[Endpoint]:
 
 
 def provider_endpoints(slug: str, refresh: bool = False) -> list[Endpoint]:
-    """All serving endpoints for one model, cheapest ``cost_per_task`` first."""
-    path = SOURCE_URLS["model_providers"].format(slug=slug)
-    source_url = url(path)
-    got = fetch.get(source_url, f"providers_{slug}", refresh=refresh)
-    key = (str(got.path), got.fetched_at)
-    if not refresh:
-        memo = _PROVIDER_ENDPOINTS_MEMO.get(key)
-        if memo is not _MISS:
-            return memo
-    try:
-        endpoints = parse_provider_endpoints(got.text)
-    except LookupError as exc:
-        raise _parse_error(exc, got.path, source_url) from exc
-    _PROVIDER_ENDPOINTS_MEMO.put(key, endpoints)
-    return endpoints
+    """All serving endpoints for one model, cheapest ``cost_per_task`` first.
+
+    A variant slug whose own providers page 404s falls back to the base release
+    page (``gemma-4-31b-reasoning`` -> ``gemma-4-31b``) via
+    :func:`_page_slug_candidates`.
+    """
+    first_error: BaseException | None = None
+    for candidate in _page_slug_candidates(slug):
+        path = SOURCE_URLS["model_providers"].format(slug=candidate)
+        source_url = url(path)
+        try:
+            got = fetch.get(source_url, f"providers_{candidate}", refresh=refresh)
+        except AAFetchError as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+        key = (str(got.path), got.fetched_at)
+        if not refresh:
+            memo = _PROVIDER_ENDPOINTS_MEMO.get(key)
+            if memo is not _MISS:
+                return memo
+        try:
+            endpoints = parse_provider_endpoints(got.text)
+        except LookupError as exc:
+            raise _parse_error(exc, got.path, source_url) from exc
+        _PROVIDER_ENDPOINTS_MEMO.put(key, endpoints)
+        return endpoints
+    if first_error is not None:
+        raise first_error
+    raise ValueError(f"no providers page for {slug!r}")
 
 
 def provider_board(refresh: bool = False) -> list[Endpoint]:
